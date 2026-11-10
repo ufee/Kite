@@ -1,5 +1,7 @@
 # Kite
 
+**English** · [Русский](README.ru.md)
+
 SSH and SFTP in one window: two file panes and a terminal side by side, for people who keep a lot of servers.
 
 > **Status:** early development. The interface runs on a built-in mock backend with demo servers; the real SSH core is not wired in yet.
