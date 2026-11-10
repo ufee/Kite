@@ -6,8 +6,9 @@
  */
 import type {
   AgentStatus, Backend, BackendError, BatchReport, ConflictPolicy, Endpoint, Entry, HostKeyRequest, LogRow,
-  Server, ServerConfig, ServerDraft, ServerId, SessionState, Src, TestResult, TextFile, TransferItem, Unlisten,
+  Server, ServerConfig, ServerDraft, ServerId, SessionState, Src, StateDoc, TestResult, TextFile, TransferItem, Unlisten,
 } from '../types';
+import type { Store } from '../store';
 import { isBackendError } from '../types';
 import { fmtSize, MB, objs, sleep } from '../../util/format';
 import { baseName, childOf, homeOf, isLocal, LOCAL_WIN, parentOf, within } from '../../util/paths';
@@ -74,14 +75,14 @@ export class MockBackend implements Backend {
   private ptys = new Map<number, Pty>();
   private ptyId = 0;
 
-  constructor() {
+  /** Storage is real: the Tauri core in the window, localStorage in a browser tab. */
+  constructor(private store: Store) {
     for (const s of DEMO_SERVERS) {
       this.servers.set(s.id, s);
       this.demo.set(s.id, s);
       const k = hostKey(s.host, s.port);
       this.known.set(k, s.hostKeyChanged ? fingerprint('old|' + k) : actualFp(s.host, s.port));
     }
-    this.seedDemo();
   }
 
   /* ---------- Events ---------- */
@@ -109,14 +110,28 @@ export class MockBackend implements Backend {
   async logTail() { return this.log.map(r => ({ ...r })); }
 
   private groups = [...DEMO_GROUPS];
+  /** The saved list wins; without one the demo servers stand in until the first save. */
   async serversLoad(): Promise<ServerConfig> {
+    const saved = await this.store.serversLoad();
+    if (saved) this.useServers(saved);
     return { servers: [...this.servers.values()].map(copyServer), groups: [...this.groups] };
   }
   async serversSave(cfg: ServerConfig) {
+    this.useServers(cfg);
+    await this.store.serversSave({ servers: [...this.servers.values()].map(copyServer), groups: [...this.groups] });
+  }
+  private useServers(cfg: ServerConfig) {
     this.servers = new Map(cfg.servers.map(s => [s.id, copyServer(s)]));
     this.groups = [...cfg.groups];
     for (const id of [...this.demo.keys()]) if (!this.servers.has(id)) this.demo.delete(id);
   }
+
+  /* ---------- App data files ---------- */
+  stateLoad(doc: StateDoc) { return this.store.load(doc); }
+  stateSave(doc: StateDoc, data: unknown) { return this.store.save(doc, data); }
+  termLoad(id: number) { return this.store.termLoad(id); }
+  termSave(id: number, data: string) { return this.store.termSave(id, data); }
+  termPrune(keep: number[]) { return this.store.termPrune(keep); }
 
   /* ---------- Log ---------- */
   private label(src: Src | 'ext') {
@@ -551,6 +566,21 @@ export class MockBackend implements Backend {
   }
 
   private job(id: number) { return this.jobs.find(j => j.id === id); }
+  transferRestore(items: TransferItem[]) {
+    for (const q of items) {
+      if (q.state === 'done' || this.job(q.id)) continue;
+      const found = q.from.src === 'ext' ? undefined : this.fs.find(q.from.src, childOf(q.from.src, q.from.path, q.name));
+      const entry: Entry = found ? { ...found } : { name: q.name, dir: q.dir, size: q.size, mtime: Date.now(), perm: '', owner: '', group: '' };
+      // Nothing heavy restarts on its own: running and waiting items come back paused.
+      const state = q.state === 'err' ? 'err' : 'pause';
+      this.jobs.push({ ...q, from: { ...q.from }, to: { ...q.to }, state, speed: 0, entry, row: null, connecting: false, countTicks: 0 });
+      this.jobId = Math.max(this.jobId, q.id);
+      this.batchId = Math.max(this.batchId, q.batch);
+    }
+    // A batch with only errors left was reported before the restart.
+    for (const b of new Set(this.jobs.map(j => j.batch))) if (this.jobs.every(j => j.batch !== b || j.state === 'err')) this.reported.add(b);
+    this.push();
+  }
   transferPause(id: number) {
     const j = this.job(id);
     if (j && ['wait', 'count', 'run'].includes(j.state)) { j.state = 'pause'; j.speed = 0; this.push(); }
@@ -649,8 +679,8 @@ export class MockBackend implements Backend {
   ptyResize() { /* the mock shell does not wrap lines itself */ }
   ptyClose(id: number) { this.ptys.delete(id); }
 
-  /* ---------- Demo state on launch ---------- */
-  private seedDemo() {
+  /* ---------- Demo state on the first launch ---------- */
+  seedDemo() {
     const web = DEMO_SERVERS[0], db = DEMO_SERVERS[4];
     for (const s of [web, db]) {
       this.sessions.set(skey(s.id, 'root'), 'live');

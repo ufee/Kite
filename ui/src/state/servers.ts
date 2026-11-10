@@ -40,6 +40,24 @@ export function saveServers() {
   return backend.serversSave({ servers: servers.map(s => ({ ...s, users: s.users.map(u => ({ ...u })) })), groups: [...groupOrder] });
 }
 
+/** Recent servers and folders for session.json. */
+export interface RecentState { recent: ServerId[]; lastUsed: Record<ServerId, number>; useTick: number; recentDirs: { src: Src; user: string; path: string }[] }
+export function recentSnapshot(): RecentState {
+  const keep = (src: Src) => isLocal(src) || !!srvBy(src);
+  return {
+    recent: recent.filter(keep),
+    lastUsed: Object.fromEntries(Object.entries(lastUsed).filter(([id]) => keep(id))),
+    useTick,
+    recentDirs: recentDirs.filter(d => keep(d.src)).map(d => ({ ...d })),
+  };
+}
+export function restoreRecent(r: Partial<RecentState>) {
+  recent.splice(0, recent.length, ...(r.recent ?? []).filter(id => srvBy(id)));
+  Object.assign(lastUsed, r.lastUsed ?? {});
+  useTick = Math.max(useTick, r.useTick ?? 0);
+  recentDirs.splice(0, recentDirs.length, ...(r.recentDirs ?? []).filter(d => isLocal(d.src) || srvBy(d.src)));
+}
+
 export function touchRecent(id: ServerId) {
   const k = recent.indexOf(id);
   if (k >= 0) recent.splice(k, 1);

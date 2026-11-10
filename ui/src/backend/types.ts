@@ -227,7 +227,22 @@ export interface Backend {
   // Server list: the core owns the config file, the UI edits a copy and saves it whole
   serversLoad(): Promise<ServerConfig>;
   serversSave(cfg: ServerConfig): Promise<void>;
+
+  // Files of the app data folder: settings and session are the UI's own JSON, the core only stores them
+  stateLoad(doc: StateDoc): Promise<unknown | null>;
+  stateSave(doc: StateDoc, data: unknown): Promise<void>;
+  /** Terminal history by tab id, ANSI from addon-serialize. */
+  termLoad(id: number): Promise<string | null>;
+  termSave(id: number, data: string): Promise<void>;
+  /** Deletes the history of every tab not in `keep`. */
+  termPrune(keep: number[]): Promise<void>;
+  /** Unfinished transfers from the last run: they come back paused and wait for the user. */
+  transferRestore(items: TransferItem[]): void;
+  /** Mock only: the demo workspace (live sessions, a running download) on the very first launch. */
+  seedDemo?(): void;
 }
+
+export type StateDoc = 'settings' | 'session';
 
 export interface ServerConfig {
   servers: Server[];

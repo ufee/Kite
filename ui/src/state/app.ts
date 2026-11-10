@@ -1,4 +1,4 @@
-/* Start-up: subscriptions first, then the state the core already holds, then the first panes. */
+/* Start-up: subscriptions first, then the state the core already holds, then the last session or the first panes. */
 import { watch } from 'vue';
 import { backend, type HostKeyRequest } from '../backend';
 import { settings, ui } from './prefs';
@@ -8,6 +8,7 @@ import { initServers, loadServers, sessions } from './servers';
 import { initPanes, panes, setSource } from './panes';
 import { initQueue } from './queue';
 import { initTerms } from './terms';
+import { restoreLog, restoreSession, startPersist, type SessionFile } from './persist';
 
 function initHostkeys() {
   backend.onHostkey((req: HostKeyRequest) => {
@@ -21,22 +22,8 @@ function syncSettings() {
   watch(() => settings.keepTime, v => backend.transferKeepTime(v), { immediate: true });
 }
 
-export async function initApp() {
-  backend.onLogRow(logPush);
-  backend.onLogUpdate(logUpdate);
-  initServers();
-  initHostkeys();
-  initPanes();
-  syncSettings();
-  await loadServers();
-  const [tail, live] = await Promise.all([backend.logTail(), backend.sshSessions()]);
-  const have = new Set(log.map(r => r.id));
-  log.unshift(...tail.filter(r => !have.has(r.id))); // rows that came as events meanwhile are newer
-  for (const s of live) sessions[s.server + '|' + s.user] = s.state;
-  await initQueue();
-
-  // Stage 1 always runs on the mock: open the demo workspace.
-  const demo = backend.kind === 'mock';
+/** The very first launch: the mock opens its demo workspace, the real core two local panes. */
+async function firstPanes(demo: boolean) {
   await Promise.all([
     setSource(0, 'local').then(() => {
       if (!demo || !panes[0].list.some(e => e.name === 'site.zip')) return;
@@ -45,5 +32,30 @@ export async function initApp() {
     demo ? setSource(1, 'demo-01', 'root').then(() => { panes[1].cur = 'app'; }) : setSource(1, 'local'),
   ]);
   if (demo) ui.focus = 1; // the server pane is the one in use
-  await initTerms(demo);
+}
+
+export async function initApp(session: SessionFile | null) {
+  backend.onLogRow(logPush);
+  backend.onLogUpdate(logUpdate);
+  initServers();
+  initHostkeys();
+  initPanes();
+  syncSettings();
+  await loadServers();
+  const demo = backend.kind === 'mock' && !session;
+  if (demo) backend.seedDemo?.();
+  const [tail, live] = await Promise.all([backend.logTail(), backend.sshSessions()]);
+  const have = new Set(log.map(r => r.id));
+  log.unshift(...tail.filter(r => !have.has(r.id))); // rows that came as events meanwhile are newer
+  if (session) restoreLog(session);
+  for (const s of live) sessions[s.server + '|' + s.user] = s.state;
+  await initQueue();
+  if (session) {
+    await initTerms(false);
+    await restoreSession(session);
+  } else {
+    await firstPanes(demo);
+    await initTerms(demo); // the demo terminals open next to the demo panes
+  }
+  startPersist();
 }

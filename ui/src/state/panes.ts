@@ -3,7 +3,7 @@ import { computed, markRaw, nextTick, reactive } from 'vue';
 import { backend, isBackendError, type BackendError, type Entry, type Src } from '../backend';
 import { tr } from '../i18n';
 import { collator, copyText, fmtSize, objs } from '../util/format';
-import { baseName, childOf, homeOf, isLocal, parentOf, within } from '../util/paths';
+import { baseName, childOf, homeOf, isLocal, parentOf, rootOf, within } from '../util/paths';
 import { settings, ui, type ColKey } from './prefs';
 import { ask, closeDlg, confirmBox, dlg, openMenu, toast } from './overlay';
 import { label, srvBy, touchDir, touchRecent } from './servers';
@@ -31,6 +31,8 @@ export interface Pane {
   nav: number;
 }
 interface Saved { path: string; sel: string[]; cur: string | null; anchor: string | null; back: string[]; sort: Pane['sort']; scroll: number }
+/** What one pane remembers: the last user per source and the last state per source + user. */
+export interface PaneMem { last: Record<string, string>; states: Record<string, Saved> }
 
 const newPane = (src: Src, user: string, path: string): Pane => ({
   src, user, path, input: path, list: markRaw([]), sel: [], cur: null, anchor: null, back: [],
@@ -38,8 +40,7 @@ const newPane = (src: Src, user: string, path: string): Pane => ({
   sort: { key: 'name', dir: 1 }, token: 0, nav: 0,
 });
 export const panes = reactive<Pane[]>([newPane('local', '', ''), newPane('local', '', '')]);
-// Per pane: the last user on each source and the last state per source + user.
-const mem: { last: Record<string, string>; states: Record<string, Saved> }[] = [{ last: {}, states: {} }, { last: {}, states: {} }];
+const mem: PaneMem[] = [{ last: {}, states: {} }, { last: {}, states: {} }];
 export const other = (i: number) => 1 - i;
 
 /** Hooks the virtual list registers, so the state can scroll and read the scroll offset. */
@@ -113,6 +114,18 @@ function paneSave(i: number) {
     scroll: listApi[i].scrollTop?.() ?? 0,
   };
 }
+/** Both panes' memory for session.json, with the current places saved first. Removed servers drop out. */
+export function paneMemory(): PaneMem[] {
+  panes.forEach((_, i) => paneSave(i));
+  const keep = (src: string) => isLocal(src) || !!srvBy(src);
+  return mem.map(m => ({
+    last: Object.fromEntries(Object.entries(m.last).filter(([src]) => keep(src))),
+    states: Object.fromEntries(Object.entries(m.states).filter(([k]) => keep(k.slice(0, k.indexOf('|'))))),
+  }));
+}
+export function setPaneMemory(saved: PaneMem[]) {
+  saved.slice(0, 2).forEach((m, i) => { mem[i] = { last: { ...m.last }, states: { ...m.states } }; });
+}
 // This pane's own memory first, then whatever the other pane remembers about the same server.
 const paneState = (i: number, src: Src, user: string) => mem[i].states[src + '|' + user] || mem[other(i)].states[src + '|' + user] || null;
 function paneUser(i: number, id: string) {
@@ -143,7 +156,10 @@ export async function setSource(i: number, src: Src, user?: string, path?: strin
     Object.assign(p, { src, user: '', state: 'ok', msg: null });
     const saved = paneState(i, 'local', '');
     const home = await backend.fsHome('local', '');
-    if (!(await go(i, path || saved?.path || home, false, !path)) && !path) await go(i, home, false);
+    // A folder that is gone falls back to the home folder, then to the root of its drive.
+    if (!(await go(i, path || saved?.path || home, false, !path)) && p.token === token) {
+      if (!(await go(i, home, false, true)) && p.token === token) await go(i, rootOf('local', home), false);
+    }
     if (p.token === token) paneRestore(i, saved);
     return;
   }
