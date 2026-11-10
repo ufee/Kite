@@ -39,7 +39,7 @@
         "form-action": "'none'"
       },
       "dangerousDisableAssetCspModification": ["style-src"],
-      "freezePrototype": true
+      "freezePrototype": false
     }
   },
   "bundle": {
