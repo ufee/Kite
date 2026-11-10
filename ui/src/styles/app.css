@@ -116,12 +116,11 @@ svg { flex: none; display: block; }
 .handle-v { position: absolute; top: 0; right: -3px; width: 6px; height: 100%; cursor: col-resize; z-index: 6; }
 .handle-v::after { content: ''; position: absolute; top: 0; bottom: 0; left: 2px; width: 2px; background: var(--ac); opacity: 0; transition: opacity .15s ease-out; }
 .handle-v:hover::after, .app.drag-side .handle-v::after { opacity: 1; }
-.side-top { display: flex; align-items: center; gap: 4px; padding: 6px 8px; }
-/* Header buttons match the search field's height, icons scale with them. The row is as tall as a
-   pane header (44px) and centred like it, so the search sits on one line with the pane controls. */
-.side-top .ibtn { width: 32px; height: 32px; }
+.side-top { display: flex; align-items: center; gap: 4px; padding: 8px; }
+/* The search field is as tall as the header buttons, which keep large icons. The row is as tall as
+   a pane header (44px) and centred like it, so the search sits on one line with the pane controls. */
 .side-top .ibtn .ic { width: 18px; height: 18px; }
-.search { flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px; height: 32px; padding: 0 8px 0 10px; border-radius: 8px; background: var(--hover); color: var(--tx3); border: 1px solid transparent; transition: border-color .12s ease-out; }
+.search { flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px; height: 28px; padding: 0 8px 0 10px; border-radius: 8px; background: var(--hover); color: var(--tx3); border: 1px solid transparent; transition: border-color .12s ease-out; }
 .search:focus-within { border-color: var(--acln); }
 .search input { flex: 1; min-width: 0; border: 0; outline: 0; background: none; color: var(--tx); }
 .search input::placeholder { color: var(--tx3); }
