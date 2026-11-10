@@ -102,7 +102,7 @@ export async function saveServer(d: Card) {
   const was = srvBy(d.id);
   // The keychain keeps the password of the default user: another default user needs its own.
   const wasUser = was?.defaultUser ?? '';
-  if (was?.authPass && !d.install && !d.pass && wasUser !== d.defUser) {
+  if (was?.authPass && !d.pass && wasUser !== d.defUser) {
     d.errs = { pass: tr('Нужен пароль для {u}', { u: d.defUser }) };
     return;
   }
@@ -116,20 +116,26 @@ export async function saveServer(d: Card) {
     defaultUser: d.defUser, keyMode: d.keyMode, keyFile: d.keyFile, authPass,
     startDir: d.startDir.trim(), keepalive: Math.max(0, +d.keepalive || 0),
   };
-  let id: ServerId;
+  const id: ServerId = was?.id ?? newServerId();
+  // A password-only server keeps its password in the OS keychain; key login drops it. The keychain
+  // goes first: if it fails, the list stays as it was and the card stays open with the error.
+  if (authPass && d.pass) {
+    try {
+      await backend.secretSet(id, d.defUser, d.pass);
+    } catch (e) {
+      d.errs = { pass: isBackendError(e) ? e.title : String(e) };
+      return;
+    }
+  }
   if (was) {
     // The old address keeps its known_hosts record: the file is shared with ssh and git, and
     // other servers may point there. The new address is checked on its own.
     Object.assign(was, fields);
-    id = was.id;
     toast(tr('{c} сохранён', { c: d.code }), 'ok');
   } else {
-    id = newServerId();
     servers.push({ id, ...fields });
     toast(tr('{c} добавлен в {g}', { c: d.code, g: fields.group }), 'ok', { label: 'Открыть', run: () => setSource(ui.focus, id) });
   }
-  // A password-only server keeps its password in the OS keychain; key login drops it.
-  if (authPass && d.pass) await backend.secretSet(id, d.defUser, d.pass);
   if (was?.authPass && (!authPass || wasUser !== d.defUser)) await backend.secretDelete(id, wasUser).catch(() => undefined);
   d.pass = '';
   await saveServers();

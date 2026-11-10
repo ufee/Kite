@@ -100,7 +100,7 @@ impl Target {
     }
 
     fn who(&self) -> Who<'_> {
-        Who { server: &self.server, code: &self.code, user: &self.user, permit: None, prompted: None }
+        Who { server: &self.server, code: &self.code, user: &self.user, permit: None, waited: None }
     }
 }
 
@@ -153,8 +153,8 @@ struct Shake {
     seen: Mutex<HostSeen>,
     /// The host key dialog was shown.
     asked: AtomicBool,
-    /// The passphrase dialog was shown.
-    prompted: AtomicBool,
+    /// The login waited for a passphrase dialog, its own or another connection's.
+    waited: AtomicBool,
     first_kex: AtomicBool,
     dropped: watch::Sender<bool>,
 }
@@ -460,7 +460,7 @@ impl Ssh {
             permit: tokio::sync::Mutex::new(Some(permit)),
             seen: Mutex::new(HostSeen::None),
             asked: AtomicBool::new(false),
-            prompted: AtomicBool::new(false),
+            waited: AtomicBool::new(false),
             first_kex: AtomicBool::new(true),
             dropped,
         });
@@ -488,15 +488,15 @@ impl Ssh {
         if let (HostSeen::Unverified(_), Method::Password(_)) = (&seen, method) {
             return Ok(Shaken { handle, seen, dropped });
         }
-        let who = auth::Who { permit: Some(&shake.permit), prompted: Some(&shake.prompted), ..t.who() };
+        let who = auth::Who { permit: Some(&shake.permit), waited: Some(&shake.waited), ..t.who() };
         let res = auth::login(self, &mut handle, &who, method).await;
         drop(shake.permit.lock().await.take());
         match res {
             Ok(()) => Ok(Shaken { handle, seen, dropped }),
             Err(e) => {
-                // This connection's passphrase took longer than LoginGraceTime: the key is open now,
+                // A passphrase dialog took longer than LoginGraceTime: the key is open now,
                 // try once more. A password is never sent twice.
-                let retry = shake.prompted.load(Ordering::Relaxed)
+                let retry = shake.waited.load(Ordering::Relaxed)
                     && *dropped.borrow()
                     && matches!(method, Method::Keys(_))
                     && matches!(e, Error::Disconnected | Error::AuthKey { .. });
@@ -671,7 +671,7 @@ impl Ssh {
                     break;
                 }
                 // A login or host key problem will not fix itself by waiting.
-                Err(Error::Timeout { .. } | Error::Net { .. } | Error::Disconnected | Error::Ssh { .. }) => continue,
+                Err(Error::Timeout { .. } | Error::Net { .. } | Error::Disconnected | Error::Dropped { .. } | Error::Ssh { .. }) => continue,
                 Err(_) => break,
             }
         }

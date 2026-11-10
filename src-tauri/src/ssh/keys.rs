@@ -134,7 +134,14 @@ pub struct Unlocked {
     /// Public halves learnt by decrypting, for files that carry none (encrypted PEM without `.pub`).
     publics: Mutex<HashMap<PathBuf, PublicKey>>,
     /// One passphrase dialog per key file: connections that need the same key wait for it.
-    gates: Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
+    gates: Mutex<HashMap<PathBuf, Arc<Gate>>>,
+}
+
+#[derive(Default)]
+pub struct Gate {
+    pub turn: tokio::sync::Mutex<()>,
+    /// Bumped when the user cancels the dialog: the connections that waited for it give up too.
+    pub cancels: std::sync::atomic::AtomicU64,
 }
 
 impl Unlocked {
@@ -158,7 +165,7 @@ impl Unlocked {
         self.publics.lock().unwrap_or_else(|e| e.into_inner()).get(path).cloned()
     }
 
-    pub fn gate(&self, path: &Path) -> Arc<tokio::sync::Mutex<()>> {
+    pub fn gate(&self, path: &Path) -> Arc<Gate> {
         self.gates.lock().unwrap_or_else(|e| e.into_inner()).entry(path.into()).or_default().clone()
     }
 }
@@ -217,25 +224,25 @@ async fn agent_add_once(key: &PrivateKey, comment: &str) -> std::io::Result<()> 
     if reply[0] == SUCCESS { Ok(()) } else { Err(std::io::Error::other("the agent refused the key")) }
 }
 
-pub async fn agent_keys<S>(agent: &mut AgentClient<S>) -> Vec<PublicKey>
+/// `None` when the agent did not answer in time or failed: the client may hold half a reply and
+/// must not be used again.
+pub async fn agent_keys<S>(agent: &mut AgentClient<S>) -> Option<Vec<PublicKey>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    tokio::time::timeout(AGENT_TIMEOUT, agent.request_identities())
-        .await
-        .ok()
-        .and_then(|r| r.ok())
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|id| match id {
-            // The agent keeps the comment beside the key blob; `label` reads it from the key.
-            AgentIdentity::PublicKey { mut key, comment } => {
-                key.set_comment(comment);
-                Some(key)
-            }
-            _ => None,
-        })
-        .collect()
+    let ids = tokio::time::timeout(AGENT_TIMEOUT, agent.request_identities()).await.ok()?.ok()?;
+    Some(
+        ids.into_iter()
+            .filter_map(|id| match id {
+                // The agent keeps the comment beside the key blob; `label` reads it from the key.
+                AgentIdentity::PublicKey { mut key, comment } => {
+                    key.set_comment(comment);
+                    Some(key)
+                }
+                _ => None,
+            })
+            .collect(),
+    )
 }
 
 /// How a key shows up in the settings: the file name from its comment, else the fingerprint.

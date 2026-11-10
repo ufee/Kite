@@ -53,13 +53,16 @@ pub struct Who<'a> {
     pub user: &'a str,
     /// The handshake slot, given back while the passphrase dialog waits for the user.
     pub permit: Option<&'a tokio::sync::Mutex<Option<tokio::sync::OwnedSemaphorePermit>>>,
-    /// Set when this connection showed the passphrase dialog.
-    pub prompted: Option<&'a AtomicBool>,
+    /// Set when the login waited for a passphrase dialog: the server may have dropped us meanwhile.
+    pub waited: Option<&'a AtomicBool>,
 }
 
 impl Who<'_> {
     /// Gives the handshake slot back while waiting for the user: other servers keep connecting.
     async fn pause(&self) {
+        if let Some(w) = self.waited {
+            w.store(true, Ordering::Relaxed);
+        }
         if let Some(p) = self.permit {
             p.lock().await.take();
         }
@@ -196,12 +199,23 @@ impl Attempt {
     }
 }
 
-/// A server that drops us after too many keys (MaxAuthTries) means none of them was accepted.
-fn key_error(e: russh::Error, who: &Who<'_>) -> Error {
+/// A server that drops us after several keys (MaxAuthTries) means none of them was accepted.
+/// After the first key it is just a closed connection, which reconnect may retry.
+fn key_error(e: russh::Error, who: &Who<'_>, a: &Attempt) -> Error {
     match Error::from(e) {
-        Error::Disconnected => Error::AuthKey { user: who.user.into(), server: who.code.into() },
+        Error::Disconnected if a.tried.len() > 1 => Error::AuthKey { user: who.user.into(), server: who.code.into() },
         e => e,
     }
+}
+
+/// The keys the agent holds. An agent that fails or hangs is dropped for the rest of the login.
+async fn listed(agent: &mut Option<Agent>) -> Vec<PublicKey> {
+    let Some(ag) = agent.as_mut() else { return Vec::new() };
+    let keys = keys::agent_keys(ag).await;
+    if keys.is_none() {
+        *agent = None;
+    }
+    keys.unwrap_or_default()
 }
 
 async fn with_agent(ssh: &Ssh, h: &mut Handle<Client>, who: &Who<'_>, a: &mut Attempt, agent: &mut Agent, key: PublicKey, how: &str) -> Result<bool> {
@@ -209,7 +223,7 @@ async fn with_agent(ssh: &Ssh, h: &mut Handle<Client>, who: &Who<'_>, a: &mut At
     let hash = key.algorithm().is_rsa().then_some(a.rsa).flatten();
     a.tried.push(key.clone());
     let res = h.authenticate_publickey_with(who.user, key, hash, agent).await.map_err(|e| match e {
-        russh::AgentAuthError::Send(_) => key_error(russh::Error::SendError, who),
+        russh::AgentAuthError::Send(_) => key_error(russh::Error::SendError, who, a),
         russh::AgentAuthError::Key(e) => Error::ssh(format!("agent: {e}")),
     });
     finish(ssh, row, res)
@@ -221,7 +235,7 @@ async fn with_key(ssh: &Ssh, h: &mut Handle<Client>, who: &Who<'_>, a: &mut Atte
     let hash = public.algorithm().is_rsa().then_some(a.rsa).flatten();
     a.tried.push(public);
     let res = h.authenticate_publickey(who.user, PrivateKeyWithHashAlg::new(key, hash)).await;
-    finish(ssh, row, res.map_err(|e| key_error(e, who)))
+    finish(ssh, row, res.map_err(|e| key_error(e, who, a)))
 }
 
 fn finish(ssh: &Ssh, row: u64, res: Result<AuthResult>) -> Result<bool> {
@@ -249,10 +263,7 @@ async fn keys_login(ssh: &Ssh, h: &mut Handle<Client>, who: &Who<'_>, src: &KeyS
     let rsa = h.best_supported_rsa_hash().await?.flatten();
     let mut a = Attempt { rsa, tried: Vec::new() };
     let mut agent = keys::agent().await;
-    let in_agent = match agent.as_mut() {
-        Some(ag) => keys::agent_keys(ag).await,
-        None => Vec::new(),
-    };
+    let in_agent = listed(&mut agent).await;
     let fail = || Error::AuthKey { user: who.user.into(), server: who.code.into() };
 
     match src {
@@ -317,18 +328,24 @@ async fn file_login(
             // in the agent (asked again, the list above is stale) or in this run's memory.
             who.pause().await;
             let gate = ssh.unlocked.gate(&kf.path);
-            let turn = gate.lock().await;
-            let now_in_agent = match agent.as_mut() {
-                Some(ag) => keys::agent_keys(ag).await,
-                None => Vec::new(),
-            };
+            let cancels = gate.cancels.load(Ordering::Acquire);
+            let turn = gate.turn.lock().await;
+            if agent.is_none() {
+                *agent = keys::agent().await;
+            }
+            let now_in_agent = listed(agent).await;
             let r = match ready(ssh, &kf, &now_in_agent) {
-                Some(r) => Ok(r),
-                None => unlock(ssh, who, &kf, agent).await.map(Ready::Key),
+                Some(r) => r,
+                // The user cancelled the dialog this connection waited for: no second one.
+                None if gate.cancels.load(Ordering::Acquire) != cancels => {
+                    ssh.log.err(who.code, "KEY", msg!("Ключ {k} не открыт", k = name), "отменено");
+                    return Err(Error::Cancelled);
+                }
+                None => Ready::Key(unlock(ssh, who, &kf, agent, &gate).await?),
             };
             drop(turn);
             who.resume(ssh).await;
-            r?
+            r
         }
     };
     match ready {
@@ -360,7 +377,7 @@ fn ready(ssh: &Ssh, kf: &KeyFile, in_agent: &[PublicKey]) -> Option<Ready> {
 
 /// Asks for the passphrase until it opens the key or the user cancels. The phrase is wiped as soon
 /// as the key is decrypted; the key goes to the agent or stays in memory until Kite closes.
-async fn unlock(ssh: &Ssh, who: &Who<'_>, kf: &KeyFile, agent: &mut Option<Agent>) -> Result<Arc<PrivateKey>> {
+async fn unlock(ssh: &Ssh, who: &Who<'_>, kf: &KeyFile, agent: &mut Option<Agent>, gate: &keys::Gate) -> Result<Arc<PrivateKey>> {
     let name = kf.name();
     let req = PassphraseRequest {
         req_id: 0,
@@ -372,12 +389,11 @@ async fn unlock(ssh: &Ssh, who: &Who<'_>, kf: &KeyFile, agent: &mut Option<Agent
     };
     ssh.log.ok(who.code, "KEY", msg!("Ключ {k} защищён паролем", k = name));
     let Some((id, mut rx)) = ssh.prompts.passphrase(&ssh.app, req) else { return Err(Error::Cancelled) };
-    if let Some(p) = who.prompted {
-        p.store(true, Ordering::Relaxed);
-    }
     let result = loop {
+        // A closed channel is this connection going away, not the user's answer: the waiters ask.
         let Some(answer) = rx.recv().await else { break Err(Error::Cancelled) };
         let Some(phrase) = answer.phrase else {
+            gate.cancels.fetch_add(1, Ordering::Release);
             let _ = answer.reply.send(Ok(()));
             ssh.log.err(who.code, "KEY", msg!("Ключ {k} не открыт", k = name), "отменено");
             break Err(Error::Cancelled);
@@ -429,7 +445,7 @@ pub async fn public_to_install(src: &KeySource) -> Result<(PublicKey, KeySource)
         return Ok((key, KeySource::File(path)));
     }
     if let Some(mut ag) = keys::agent().await
-        && let Some(key) = keys::agent_keys(&mut ag).await.into_iter().find(|k| k.algorithm() == russh::keys::Algorithm::Ed25519)
+        && let Some(key) = keys::agent_keys(&mut ag).await.unwrap_or_default().into_iter().find(|k| k.algorithm() == russh::keys::Algorithm::Ed25519)
     {
         return Ok((key.clone(), KeySource::AgentKey(key)));
     }

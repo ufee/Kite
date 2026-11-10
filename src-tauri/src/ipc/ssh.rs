@@ -118,7 +118,7 @@ pub struct AgentStatus {
 #[tauri::command]
 pub async fn agent_status() -> AgentStatus {
     match keys::agent().await {
-        Some(mut agent) => AgentStatus { running: true, keys: keys::agent_keys(&mut agent).await.iter().map(keys::label).collect() },
+        Some(mut agent) => AgentStatus { running: true, keys: keys::agent_keys(&mut agent).await.unwrap_or_default().iter().map(keys::label).collect() },
         None => AgentStatus { running: false, keys: Vec::new() },
     }
 }
