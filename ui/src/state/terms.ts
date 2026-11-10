@@ -3,10 +3,11 @@ import { computed, nextTick, reactive, watch } from 'vue';
 import { Terminal, type ITheme } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { WebglAddon } from '@xterm/addon-webgl';
+import { SerializeAddon } from '@xterm/addon-serialize';
 import { backend, isBackendError, type Src } from '../backend';
 import { tr } from '../i18n';
-import { copyText } from '../util/format';
-import { childOf, isLocal, parentOf } from '../util/paths';
+import { copyText, sleep } from '../util/format';
+import { childOf, isLocal, LOCAL_WIN, parentOf } from '../util/paths';
 import { settings, theme, ui } from './prefs';
 import { toast } from './overlay';
 import { label, srvBy } from './servers';
@@ -24,9 +25,21 @@ export interface Term {
 interface View {
   xt: Terminal;
   fit: FitAddon;
+  serial: SerializeAddon;
   el: HTMLDivElement;
   opened: boolean;
+  /** The command typed but not sent yet; null once the shell edits the line itself (arrows, Tab, history). */
+  line: string | null;
+  /** The shell asked for a password: what is typed now is never remembered. */
+  secret: boolean;
+  /** Output since the last history save. */
+  dirty: boolean;
+  lastOut: number;
 }
+/** A tab as session.json keeps it. */
+export interface SavedTerm { id: number; src: Src; user: string; cwd: string; input: string; dead: boolean }
+/** Saved history per tab, as the setting caps it. */
+const HISTORY_LINES = 1000;
 
 export const terms = reactive<Term[]>([]);
 const views = new Map<number, View>();
@@ -63,8 +76,11 @@ function makeView(t: Term): View {
     scrollback: 5000, allowProposedApi: false, theme: xtTheme(), drawBoldTextInBrightColors: false,
     macOptionIsMeta: true, rightClickSelectsWord: false,
   });
-  const fit = new FitAddon();
+  const fit = new FitAddon(), serial = new SerializeAddon();
   xt.loadAddon(fit);
+  xt.loadAddon(serial);
+  // OSC 7 reports the shell's folder: a reconnect and the next launch start there.
+  xt.parser.registerOscHandler(7, data => { const p = osc7Path(t, data); if (p) t.cwd = p; return true; });
   const el = document.createElement('div');
   el.className = 'xterm-host';
   xt.attachCustomKeyEventHandler(e => {
@@ -90,7 +106,45 @@ function makeView(t: Term): View {
     if (text) xt.paste(text);
     xt.focus();
   });
-  return { xt, fit, el, opened: false };
+  return { xt, fit, serial, el, opened: false, line: '', secret: false, dirty: false, lastOut: 0 };
+}
+
+/**
+ * `file://host/path` from OSC 7. A local tab takes only local folders: after `ssh` inside it the
+ * remote shell may report its own, which is not where this tab starts next time.
+ */
+function osc7Path(t: Term, data: string): string | null {
+  const m = data.match(/^file:\/\/([^/]*)(\/.*)$/);
+  if (!m) return null;
+  let path: string;
+  try { path = decodeURIComponent(m[2]); } catch { return null; }
+  if (!isLocal(t.src)) return path;
+  if (LOCAL_WIN) return /^\/[A-Za-z]:\//.test(path) ? path.slice(1).replace(/\//g, '\\') : null;
+  return !m[1] || m[1] === 'localhost' ? path : null;
+}
+
+/** Follows what is typed, so an unsent command survives a restart. Best effort: unknown edits give up. */
+function trackLine(v: View, d: string) {
+  d = d.replace(/\x1b\[20[01]~/g, ''); // bracketed paste markers
+  const k = d.lastIndexOf('\r');
+  if (k >= 0) { v.line = ''; v.secret = false; d = d.slice(k + 1); }
+  if (!d || v.secret || v.line === null) return;
+  if (d === '\x7f' || d === '\b') v.line = [...v.line].slice(0, -1).join('');
+  else if (d === '\x03' || d === '\x15') v.line = '';
+  else if (/[\x00-\x1f\x7f]/.test(d)) v.line = null;
+  else v.line += d;
+}
+const ASKS_SECRET = /(password|passphrase|пароль)[^\r\n]*:\s*$/i;
+function output(v: View, d: string) {
+  v.xt.write(d);
+  v.dirty = true;
+  v.lastOut = performance.now();
+  if (ASKS_SECRET.test(d.slice(-120))) { v.secret = true; v.line = ''; }
+}
+/** The shell is ready once it has printed something and then stayed quiet for a moment. */
+async function shellReady(v: View) {
+  const until = performance.now() + 5000;
+  while (performance.now() < until && (!v.lastOut || performance.now() - v.lastOut < 250)) await sleep(100);
 }
 
 /** Opens the instance in its host the first time it becomes visible: xterm measures the font on open. */
@@ -126,29 +180,33 @@ function input(t: Term, d: string) {
     if (d === '\r' && !isLocal(t.src)) connect(t);
     return;
   }
-  if (t.pty && !t.busy) backend.ptyWrite(t.pty, d);
+  if (!t.pty || t.busy) return;
+  trackLine(views.get(t.id)!, d);
+  backend.ptyWrite(t.pty, d);
 }
 
-async function connect(t: Term, quiet = false) {
+async function connect(t: Term, quiet = false): Promise<boolean> {
   const v = views.get(t.id)!;
   t.busy = true; t.dead = false;
   if (!isLocal(t.src)) {
     const s = srvBy(t.src);
-    if (!s) { v.xt.write(RED(tr('Сервер удалён из списка'))); t.dead = true; t.busy = false; return; }
+    if (!s) { v.xt.write(RED(tr('Сервер удалён из списка'))); t.dead = true; t.busy = false; return false; }
     v.xt.write(DIM(tr('Подключение к {who} ({host})…', { who: `${t.user}@${s.code}`, host: s.host })));
   }
+  v.line = ''; v.secret = false; v.lastOut = 0;
   try {
-    t.pty = await backend.ptyOpen(t.src, t.user, t.cwd, v.xt.cols, v.xt.rows, d => v.xt.write(d));
+    t.pty = await backend.ptyOpen(t.src, t.user, t.cwd, v.xt.cols, v.xt.rows, d => output(v, d));
   } catch (e) {
     const err = isBackendError(e) ? e : { title: String(e), text: '' };
     v.xt.write(RED(`${err.title}.${err.text ? ' ' + err.text : ''}`) + DIM(tr('Enter: подключиться снова')));
     t.busy = false; t.dead = true; t.pty = null;
     if (!quiet) focusTerm();
-    return;
+    return false;
   }
   t.busy = false;
   fitTerm(t);
   if (!quiet) focusTerm();
+  return true;
 }
 
 export async function openTerm(src: Src, user?: string, cwd?: string, quiet = false): Promise<Term | null> {
@@ -176,6 +234,7 @@ export function closeTerm(id: number) {
   views.delete(id);
   if (ui.term === id) ui.term = (terms[k] || terms[k - 1])?.id ?? null;
   if (ui.term) focusTerm();
+  pruneHistory();
 }
 export function selectTerm(id: number) { ui.term = id; focusTerm(); }
 export function focusTerm() { nextTick(() => setTimeout(() => { const t = curTerm.value; if (t) views.get(t.id)?.xt.focus(); }, 30)); }
@@ -183,6 +242,53 @@ export function newTermHere() { const p = panes[ui.focus]; openTerm(p.src, p.use
 export function termHere(i: number, name?: string) {
   const p = panes[i];
   openTerm(p.src, p.user, name ? childOf(p.src, p.path, name) : p.path);
+}
+
+/* ---------- Session: tabs, unsent command, folder, history ---------- */
+export function termsSnapshot(): SavedTerm[] {
+  return terms.map(t => {
+    const v = views.get(t.id);
+    return { id: t.id, src: t.src, user: t.user, cwd: t.cwd, input: (!v?.secret && v?.line) || '', dead: t.dead };
+  });
+}
+
+/** Tabs come back in order; every live one opens a new session, the unsent command waits for the prompt. */
+export async function restoreTerms(saved: SavedTerm[], active: number | null) {
+  const keepHistory = settings.saveTermHistory;
+  const history = await Promise.all(saved.map(s => (keepHistory ? backend.termLoad(s.id).catch(() => null) : null)));
+  saved.forEach((s, k) => {
+    const t = reactive<Term>({ id: s.id, src: s.src, user: s.user, cwd: s.cwd, pty: null, dead: s.dead, busy: !s.dead });
+    termId = Math.max(termId, s.id);
+    const v = makeView(t);
+    views.set(t.id, v);
+    terms.push(t);
+    const hist = history[k];
+    if (hist) v.xt.write(hist + '\r\n');
+    if (s.dead) { v.xt.write(DIM(tr('Enter: подключиться снова'))); return; }
+    v.xt.write(DIM(tr(hist ? 'Новая сессия, история выше' : 'Новая сессия')));
+    void connect(t, true).then(async ok => {
+      if (!ok || !s.input) return;
+      await shellReady(v);
+      if (t.pty && !t.dead) input(t, s.input);
+    });
+  });
+  ui.term = terms.some(t => t.id === active) ? active : terms[0]?.id ?? null;
+  pruneHistory();
+}
+
+/** Saves the history of tabs with new output; with the setting off nothing is written. */
+export async function saveHistory() {
+  if (!settings.saveTermHistory) return;
+  const jobs: Promise<void>[] = [];
+  for (const [id, v] of views) {
+    if (!v.dirty) continue;
+    v.dirty = false;
+    jobs.push(backend.termSave(id, v.serial.serialize({ scrollback: HISTORY_LINES })).catch(() => { v.dirty = true; }));
+  }
+  await Promise.all(jobs);
+}
+function pruneHistory() {
+  backend.termPrune(settings.saveTermHistory ? terms.map(t => t.id) : []).catch(() => undefined);
 }
 
 export async function initTerms(demo: boolean) {
@@ -196,6 +302,11 @@ export async function initTerms(demo: boolean) {
   });
   watch(() => settings.termFont, n => { for (const [, v] of views) v.xt.options.fontSize = n; nextTick(() => fitTerm()); });
   watch(theme, () => nextTick(() => { const th = xtTheme(); for (const [, v] of views) v.xt.options.theme = th; }));
+  // Turning history on saves what is on screen now; turning it off deletes the files.
+  watch(() => settings.saveTermHistory, on => {
+    if (on) for (const [, v] of views) v.dirty = true;
+    pruneHistory();
+  });
   await document.fonts.load(`${settings.termFont}px "JetBrains Mono Variable"`).catch(() => undefined);
   if (!demo) return;
   // Demo: two terminals with some history, like after a working day.

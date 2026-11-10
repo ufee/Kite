@@ -33,4 +33,6 @@ export function baseName(src: Src, path: string): string {
 export function within(src: Src, outer: string, inner: string): boolean {
   return inner === outer || inner.startsWith(outer.replace(/[\\/]$/, '') + sepOf(src));
 }
+/** The drive root on Windows, `/` elsewhere. */
+export const rootOf = (src: Src, path: string) => splitPath(src, path).root;
 export const homeOf = (user: string) => (user === 'root' ? '/root' : '/home/' + user);

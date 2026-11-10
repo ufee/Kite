@@ -76,7 +76,11 @@ const VIEW_SHORT = { files: 'Файлы', both: 'Оба', term: 'Термина�
           <span class="muted">{{ tr('Локальная оболочка') }}</span>
           <div><select v-model="settings.shell" class="fld" style="width:220px"><option value="pwsh">PowerShell 7</option><option value="powershell">Windows PowerShell</option><option value="cmd">{{ tr('Командная строка') }}</option></select></div>
         </div>
-        <label class="chk" style="margin-top:12px"><input v-model="settings.copyOnSelect" type="checkbox" class="cb">{{ tr('Копировать выделенное') }}</label>
+        <div style="display:flex;flex-direction:column;gap:10px;margin-top:12px">
+          <label class="chk"><input v-model="settings.copyOnSelect" type="checkbox" class="cb">{{ tr('Копировать выделенное') }}</label>
+          <label class="chk"><input v-model="settings.saveTermHistory" type="checkbox" class="cb">{{ tr('Сохранять историю терминала') }}</label>
+          <div class="faint" style="font-size:12px;margin:-6px 0 0 24px">{{ tr('Последние 1000 строк каждой вкладки, только на этом ПК') }}</div>
+        </div>
       </div>
     </div>
     <div class="dlg-f"><button class="textbtn" style="margin-left:-10px" @click="openKeys"><Icon n="keyboard" s="s" />{{ tr('Горячие клавиши') }}</button><div class="grow"></div><button class="btn pri" @click="closeDlg(null)">{{ tr('Готово') }}</button></div>

@@ -1,9 +1,11 @@
 /* The frameless window: caption buttons, close confirmation, showing the window once painted. */
 import { isTauri } from '@tauri-apps/api/core';
 import { getCurrentWindow } from '@tauri-apps/api/window';
+import { saveWindowState, StateFlags } from '@tauri-apps/plugin-window-state';
 import { tr } from '../i18n';
 import { confirmBox, toast } from '../state/overlay';
 import { active } from '../state/queue';
+import { flush } from '../state/persist';
 
 export const inTauri = isTauri();
 const win = () => getCurrentWindow();
@@ -11,6 +13,15 @@ const win = () => getCurrentWindow();
 async function confirmClose(): Promise<boolean> {
   if (!active.value.length) return true;
   return !!(await confirmBox('Закрыть Kite?', tr('Идут передачи: {n}. Они прервутся.', { n: active.value.length }), 'Закрыть', true));
+}
+/**
+ * The session is written before the window goes: a failed write must not keep the app open.
+ * `destroy` skips CloseRequested, where the window-state plugin would note "maximized", so it is saved here.
+ */
+async function closeNow() {
+  const place = saveWindowState(StateFlags.ALL & ~StateFlags.VISIBLE).catch(() => undefined);
+  await Promise.race([Promise.all([flush().catch(() => undefined), place]), new Promise(r => setTimeout(r, 2000))]);
+  await win().destroy();
 }
 
 export async function windowBtn(kind: 'min' | 'max' | 'close') {
@@ -22,7 +33,7 @@ export async function windowBtn(kind: 'min' | 'max' | 'close') {
   }
   if (kind === 'min') await win().minimize();
   else if (kind === 'max') await win().toggleMaximize();
-  else if (await confirmClose()) await win().destroy();
+  else if (await confirmClose()) await closeNow();
 }
 
 export async function initWindow() {
@@ -30,7 +41,7 @@ export async function initWindow() {
   // Alt+F4 and the taskbar close go through the same question as the caption button.
   await win().onCloseRequested(async e => {
     e.preventDefault();
-    if (await confirmClose()) await win().destroy();
+    if (await confirmClose()) await closeNow();
   });
   // The window starts hidden: it appears after the first paint, without a white flash.
   requestAnimationFrame(() => requestAnimationFrame(() => { win().show(); win().setFocus(); }));

@@ -40,6 +40,7 @@ export const EN: Record<string, string> = {
   'Подключение к {who} ({host})…': 'Connecting to {who} ({host})…',
   'Enter: подключиться снова': 'Enter: reconnect',
   'Новая сессия, история выше': 'New session, history above',
+  'Новая сессия': 'New session',
   'Открываю {who} в новой вкладке': 'Opening {who} in a new tab',
 
   // Status bar, queue, debug
@@ -120,6 +121,8 @@ export const EN: Record<string, string> = {
   'Не менять дату файлов при копировании': 'Keep file dates when copying', 'Редактор': 'Editor', 'Программа': 'App', 'Системный': 'System default',
   'Сразу загружать правки на сервер': 'Upload edits right away', 'Локальная оболочка': 'Local shell', 'Командная строка': 'Command Prompt',
   'Копировать выделенное': 'Copy on select', 'Горячие клавиши': 'Keyboard shortcuts', 'Готово': 'Done',
+  'Сохранять историю терминала': 'Save terminal history',
+  'Последние 1000 строк каждой вкладки, только на этом ПК': 'The last 1000 lines of each tab, on this PC only',
 
   'Переместить': 'Move', 'Папок нет': 'No folders', 'Переместить сюда': 'Move here', 'Копировать сюда': 'Copy here',
   'Открыть в редакторе': 'Open in editor', 'Нет прав на запись': 'No write access',

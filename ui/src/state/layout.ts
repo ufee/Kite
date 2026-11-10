@@ -1,7 +1,7 @@
 /* Layout: view mode, resizable parts and the floating windows (log, queue). */
-import { computed, nextTick, reactive, watch } from 'vue';
+import { computed, nextTick, reactive } from 'vue';
 import { clamp } from '../util/format';
-import { store, ui, type View } from './prefs';
+import { ui, type View } from './prefs';
 import { closeMenu } from './overlay';
 import { focusList, panes } from './panes';
 import { focusTerm, openTerm, terms } from './terms';
@@ -64,12 +64,11 @@ export type WinKey = 'log' | 'queue';
 export const WIN_EDGES = ['n', 's', 'e', 'w', 'ne', 'nw', 'se', 'sw'];
 const WIN_MIN: Record<WinKey, { w: number; h: number }> = { log: { w: 300, h: 120 }, queue: { w: 340, h: 120 } };
 // x/y stay null until the user moves something: the log docks bottom-right, the queue to its left.
-type WinState = { x: number | null; y: number | null; w: number; h: number; z: number };
-export const wins = reactive<Record<WinKey, WinState>>(store.get('wins', {
+export type WinState = { x: number | null; y: number | null; w: number; h: number; z: number };
+export const wins = reactive<Record<WinKey, WinState>>({
   log: { x: null, y: null, w: 480, h: 220, z: 56 },
   queue: { x: null, y: null, w: 360, h: 220, z: 55 },
-}));
-watch(wins, v => store.set('wins', v), { deep: true });
+});
 
 function winBox(k: WinKey): { x: number; y: number; w: number; h: number } {
   const s = wins[k], w = Math.min(s.w, ui.vw), h = Math.min(s.h, ui.vh);

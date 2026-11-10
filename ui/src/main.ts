@@ -7,8 +7,12 @@ import App from './App.vue';
 import { guardWebviewKeys } from './platform/keys';
 import { initWindow } from './platform/window';
 import { initApp } from './state/app';
+import { loadState } from './state/persist';
 
 guardWebviewKeys();
-createApp(App).mount('#app');
-initApp().catch(e => console.error('init failed', e));
-initWindow();
+// Settings first: the first frame already has the saved theme and layout.
+loadState().then(session => {
+  createApp(App).mount('#app');
+  initWindow();
+  return initApp(session);
+}).catch(e => console.error('init failed', e));
