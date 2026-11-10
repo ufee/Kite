@@ -28,7 +28,7 @@ export function dropToast(id: number) {
  * A stack: the top one is visible, the ones below wait. A host key request that arrives
  * while another one is shown goes under it, so requests are answered in arrival order.
  */
-export type DlgKind = 'confirm' | 'conflict' | 'hostkey' | 'server' | 'import' | 'chmod' | 'settings' | 'dest' | 'file' | 'keys';
+export type DlgKind = 'confirm' | 'conflict' | 'hostkey' | 'server' | 'import' | 'chmod' | 'settings' | 'dest' | 'file' | 'keys' | 'passphrase';
 interface Dlg {
   id: number;
   kind: DlgKind;
@@ -58,6 +58,8 @@ export function closeDlg(result: unknown = null, which: Dlg | null = dlg.value) 
   if (k >= 0) stack.splice(k, 1);
   which.resolve(result);
 }
+/** The open dialog that renders this data, wherever it is in the stack. */
+export const dlgOf = (data: Record<string, any>) => stack.find(d => d.data === data) ?? null;
 /** Closes every dialog of a kind, used when what they ask about is gone. */
 export function dropDialogs(kind: DlgKind, match: (data: Record<string, any>) => boolean) {
   for (const d of [...stack]) if (d.kind === kind && match(d.data)) closeDlg(null, d);

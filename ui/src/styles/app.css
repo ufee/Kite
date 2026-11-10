@@ -116,8 +116,11 @@ svg { flex: none; display: block; }
 .handle-v { position: absolute; top: 0; right: -3px; width: 6px; height: 100%; cursor: col-resize; z-index: 6; }
 .handle-v::after { content: ''; position: absolute; top: 0; bottom: 0; left: 2px; width: 2px; background: var(--ac); opacity: 0; transition: opacity .15s ease-out; }
 .handle-v:hover::after, .app.drag-side .handle-v::after { opacity: 1; }
-.side-top { display: flex; gap: 4px; padding: 8px 8px 4px; }
-.search { flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px; height: 32px; padding: 0 8px 0 10px; border-radius: 8px; background: var(--hover); color: var(--tx3); border: 1px solid transparent; transition: border-color .12s ease-out; }
+.side-top { display: flex; align-items: center; gap: 4px; padding: 8px; }
+/* The search field is as tall as the header buttons, which keep large icons. The row is as tall as
+   a pane header (44px) and centred like it, so the search sits on one line with the pane controls. */
+.side-top .ibtn .ic { width: 18px; height: 18px; }
+.search { flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px; height: 28px; padding: 0 8px 0 10px; border-radius: 8px; background: var(--hover); color: var(--tx3); border: 1px solid transparent; transition: border-color .12s ease-out; }
 .search:focus-within { border-color: var(--acln); }
 .search input { flex: 1; min-width: 0; border: 0; outline: 0; background: none; color: var(--tx); }
 .search input::placeholder { color: var(--tx3); }
@@ -187,7 +190,11 @@ svg { flex: none; display: block; }
 .side.docked .side-add { border-top-color: var(--line); background: var(--bg); }
 .side.docked .srv-add { background: none; }
 .side.docked .srv-add:hover { background: var(--hover); }
-.srv-add .srv-name { padding-bottom: 2px; font-weight: 400; }
+/* No servers yet: the same layout as an empty pane, a little above the centre to look centred. */
+.side-empty { flex: 1; min-height: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; padding: 0 16px 48px; color: var(--tx2); text-align: center; animation: fade .15s ease-out; }
+.side-empty-ico { width: 22px; height: 22px; color: var(--tx3); }
+.side-empty-t { font-weight: 600; color: var(--tx); }
+.side-empty .btn { margin-top: 6px; }
 .srv.mini.srv-add { justify-content: center; padding: 0; }
 /* Bottom row: lift text 1px so the x-height sits on the strip's centre; icons stay put. */
 .status > span, .status > .textbtn { padding-bottom: 2px; }

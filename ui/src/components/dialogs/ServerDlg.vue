@@ -52,7 +52,7 @@ const testColor = () => ({ bad: 'var(--bad)', ok: 'var(--ok)' } as Record<string
         <h3 class="h3">{{ tr('Пароль') }}</h3>
         <div class="row2" style="align-items:center">
           <input v-model="d.pass" class="fld pass-in" :class="{ err: d.errs.pass }" type="password" :placeholder="d.hasPass ? tr('Пароль сохранён') : ''" autocomplete="new-password" spellcheck="false" @input="d.errs.pass = ''" @keydown.enter.prevent="saveServer(d)">
-          <label class="chk" :class="{ off: !d.pass && !d.hasPass }"><input v-model="d.install" type="checkbox" class="cb" :disabled="!d.pass && !d.hasPass">{{ tr('Добавить мой SSH-ключ') }}</label>
+          <label class="chk" :class="{ off: (!d.pass && !d.hasPass) || d.noStore }"><input v-model="d.install" type="checkbox" class="cb" :disabled="(!d.pass && !d.hasPass) || d.noStore">{{ tr('Добавить мой SSH-ключ') }}</label>
         </div>
         <div v-if="d.errs.pass" style="color:var(--bad);font-size:12px;margin-top:6px">{{ d.errs.pass }}</div>
         <div v-else class="faint" style="font-size:12px;margin-top:6px">{{ passHint(d) }}</div>

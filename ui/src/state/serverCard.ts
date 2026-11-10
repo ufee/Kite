@@ -2,7 +2,7 @@
 import { nextTick } from 'vue';
 import { backend, isBackendError, type Server, type ServerDraft, type ServerId } from '../backend';
 import { tr } from '../i18n';
-import { ask, closeDlg, confirmBox, dlg, toast } from './overlay';
+import { ask, closeDlg, confirmBox, dlg, dlgOf, toast } from './overlay';
 import { groupOrder, newServerId, recent, saveServers, servers, sessions, srvBy } from './servers';
 import { panes, setSource } from './panes';
 import { terms } from './terms';
@@ -28,7 +28,9 @@ export async function openServer(id: ServerId | null, focusNewUser = false) {
   ask('server', d);
   const live = dlg.value!.data; // the reactive copy the dialog renders
   nextTick(() => document.querySelector<HTMLInputElement>(focusNewUser ? '.urow:last-child input' : '.dlg input')?.focus());
-  if (s) live.fp = await backend.hostkeyKnown(s.host, s.port);
+  // Linux without a Secret Service: no password-only servers, the key always goes on the server.
+  backend.secretsAvailable().then(ok => { if (!ok) { live.noStore = true; live.install = true; } }, () => undefined);
+  if (s) live.fp = await backend.hostkeyKnown(s.host, s.port).catch(() => null);
 }
 
 export function addUser(d: Card) {
@@ -42,7 +44,7 @@ export function removeUser(d: Card, k: number) {
 
 const draftOf = (d: Card): ServerDraft => ({
   id: d.id, code: d.code.trim(), host: d.host.trim(), port: +d.port, user: d.defUser || 'root',
-  keyMode: d.keyMode, keyFile: d.keyFile, password: d.pass,
+  keyMode: d.keyMode, keyFile: d.keyFile, password: d.pass, authPass: !!srvBy(d.id)?.authPass,
 });
 
 export async function testServer(d: Card) {
@@ -56,6 +58,7 @@ export async function chooseKeyFile(d: Card) {
 }
 export function passHint(d: Card) {
   if (!d.pass && !d.hasPass) return tr('Если ключ уже на сервере, пароль не нужен');
+  if (d.noStore) return tr('В системе нет хранилища паролей');
   if (!d.install) return tr('Вход только по паролю. Он хранится в системном хранилище');
   return tr(d.hasPass ? 'Войдём как {u} один раз, добавим ключ и удалим пароль' : 'Войдём как {u} один раз и добавим ключ. Пароль не сохраняем', { u: d.defUser });
 }
@@ -65,7 +68,7 @@ export function passHint(d: Card) {
  * A host key question lands above the card in the dialog stack. Returns false if the card must stay open.
  */
 async function firstLogin(d: Card): Promise<boolean> {
-  d.busy = true; d.errs = {};
+  d.errs = {};
   d.test = { state: 'run', text: tr(d.install ? 'Добавляем ключ…' : 'Проверяем пароль…') };
   try {
     await backend.sshFirstLogin(draftOf(d), d.install);
@@ -78,12 +81,21 @@ async function firstLogin(d: Card): Promise<boolean> {
     } else if (err && err.code !== 'HOSTKEY_REJECTED') d.errs = { pass: err.title };
     return false;
   } finally {
-    d.busy = false; d.test = null;
+    d.test = null;
   }
 }
 
 export async function saveServer(d: Card) {
   if (d.busy) return;
+  d.busy = true;
+  try {
+    await save(d);
+  } finally {
+    d.busy = false;
+  }
+}
+
+async function save(d: Card) {
   const errs: Record<string, string> = {};
   d.code = d.code.trim(); d.host = d.host.trim();
   if (!/^[a-z0-9][a-z0-9-]*$/i.test(d.code)) errs.code = tr('Латиница, цифры и дефис');
@@ -97,9 +109,15 @@ export async function saveServer(d: Card) {
   if (!d.users.some((u: { name: string }) => u.name === d.defUser)) d.defUser = d.users[0].name;
 
   const was = srvBy(d.id);
+  // The keychain keeps the password of the default user: another default user needs its own.
+  const wasUser = was?.defaultUser ?? '';
+  if (was?.authPass && !d.pass && wasUser !== d.defUser) {
+    d.errs = { pass: tr('Нужен пароль для {u}', { u: d.defUser }) };
+    return;
+  }
   const login = !!d.pass || (!!was?.authPass && d.install);
   if (login && !(await firstLogin(d))) return;
-  if (dlg.value?.data !== d) return; // the card was closed while logging in
+  if (!dlgOf(d)) return; // the card was closed while logging in
   const authPass = !d.install && (!!d.pass || !!was?.authPass);
   const fields: Omit<Server, 'id'> = {
     code: d.code, group: d.group.trim() || tr('Без группы'), description: d.desc.trim(), host: d.host, port: +d.port,
@@ -107,23 +125,32 @@ export async function saveServer(d: Card) {
     defaultUser: d.defUser, keyMode: d.keyMode, keyFile: d.keyFile, authPass,
     startDir: d.startDir.trim(), keepalive: Math.max(0, +d.keepalive || 0),
   };
-  let id: ServerId;
+  const id: ServerId = was?.id ?? newServerId();
+  // A password-only server keeps its password in the OS keychain; key login drops it. The keychain
+  // goes first: if it fails, the list stays as it was and the card stays open with the error.
+  if (authPass && d.pass) {
+    try {
+      await backend.secretSet(id, d.defUser, d.pass);
+    } catch (e) {
+      d.errs = { pass: isBackendError(e) ? e.title : String(e) };
+      return;
+    }
+  }
   if (was) {
-    if (was.host !== fields.host || was.port !== fields.port) await backend.hostkeyForget(was.host, was.port).catch(() => undefined);
+    // The old address keeps its known_hosts record: the file is shared with ssh and git, and
+    // other servers may point there. The new address is checked on its own.
     Object.assign(was, fields);
-    id = was.id;
     toast(tr('{c} сохранён', { c: d.code }), 'ok');
   } else {
-    id = newServerId();
     servers.push({ id, ...fields });
     toast(tr('{c} добавлен в {g}', { c: d.code, g: fields.group }), 'ok', { label: 'Открыть', run: () => setSource(ui.focus, id) });
   }
-  // A password-only server keeps its password in the OS keychain; key login drops it.
-  if (authPass && d.pass) await backend.secretSet(id, d.defUser, d.pass);
-  else if (!authPass && was?.authPass) await backend.secretDelete(id, d.defUser);
+  if (was?.authPass && (!authPass || wasUser !== d.defUser)) await backend.secretDelete(id, wasUser).catch(() => undefined);
   d.pass = '';
+  // Past the keychain the save goes through even if the card was closed meanwhile; only the card
+  // itself is closed, never a dialog that opened above it.
   await saveServers();
-  closeDlg(true);
+  closeDlg(true, dlgOf(d));
 }
 
 export async function deleteServer(id: ServerId) {
@@ -139,6 +166,8 @@ export async function dropServer(id: ServerId) {
   const k = servers.findIndex(s => s.id === id);
   if (k < 0) return;
   await backend.sshDisconnect(id).catch(() => undefined);
+  const s = servers[k];
+  if (s.authPass) await backend.secretDelete(id, s.defaultUser).catch(() => undefined);
   servers.splice(k, 1);
   for (const key of Object.keys(sessions)) if (key.startsWith(id + '|')) delete sessions[key];
   panes.forEach((p, i) => { if (p.src === id) setSource(i, 'local'); });

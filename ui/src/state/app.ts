@@ -1,8 +1,8 @@
 /* Start-up: subscriptions first, then the state the core already holds, then the last session or the first panes. */
 import { watch } from 'vue';
-import { backend, type HostKeyRequest } from '../backend';
+import { backend, type HostKeyRequest, type PassphraseRequest } from '../backend';
 import { settings, ui } from './prefs';
-import { ask } from './overlay';
+import { ask, dropDialogs } from './overlay';
 import { logPush, logUpdate, log } from './log';
 import { initServers, loadServers, sessions } from './servers';
 import { initPanes, panes, setSource } from './panes';
@@ -13,6 +13,18 @@ import { restoreLog, restoreSession, startPersist, type SessionFile } from './pe
 function initHostkeys() {
   backend.onHostkey((req: HostKeyRequest) => {
     ask<string>('hostkey', { ...req }).then(r => backend.hostkeyRespond(req.reqId, r === 'trust'));
+  });
+  // The dialog answers the phrase itself; closing it any other way cancels the key.
+  backend.onPassphrase((req: PassphraseRequest) => {
+    const name = req.file.split(/[\\/]/).pop() || req.file;
+    ask<string>('passphrase', { ...req, name, phrase: '', add: req.agent, err: '', busy: false }).then(r => {
+      if (r !== 'ok') backend.passphraseRespond(req.reqId, null, false).catch(() => undefined);
+    });
+  });
+  backend.onPromptGone(ids => {
+    const gone = (d: Record<string, any>) => ids.includes(d.reqId);
+    dropDialogs('hostkey', gone);
+    dropDialogs('passphrase', gone);
   });
 }
 

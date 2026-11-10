@@ -47,7 +47,10 @@ export interface Entry {
 
 export type ErrCode =
   | 'ENOENT' | 'ENOTDIR' | 'EACCES' | 'EEXIST' | 'EINVAL'
-  | 'TIMEOUT' | 'AUTH_KEY' | 'AUTH_PASS' | 'NO_SECRET' | 'HOSTKEY_REJECTED' | 'CANCELLED' | 'DISCONNECTED';
+  | 'TIMEOUT' | 'NET' | 'DROPPED' |'AUTH_KEY' | 'AUTH_PASS' | 'NO_SECRET' | 'AUTH_MULTI' | 'AUTH_METHODS' | 'HOSTKEY_REJECTED' | 'HOSTKEY_CHANGED'
+  | 'KEY_FILE' | 'NO_PUBKEY' | 'KEY_CHECK' | 'PASSPHRASE' | 'KEYCHAIN' | 'SSH' | 'CANCELLED' | 'DISCONNECTED'
+  /** The operation arrives in a later stage. */
+  | 'NOT_YET';
 
 /** Every failure crossing the boundary. `title` and `text` are ready for the UI. */
 export interface BackendError {
@@ -67,8 +70,24 @@ export interface HostKeyRequest {
   code: string;
   host: string;
   port: number;
+  /** ED25519, ECDSA, RSA: the server's file to compare with is ssh_host_<lowercase>_key.pub. */
+  algo: string;
   fp: string;
   old?: string;
+  /** A new host whose address already has a key of another type on record. */
+  others: boolean;
+}
+
+/** A key file with a passphrase and not in the agent. A wrong phrase rejects the reply; the dialog stays. */
+export interface PassphraseRequest {
+  reqId: number;
+  server: ServerId;
+  code: string;
+  user: string;
+  /** Key file as the user knows it: ~/.ssh/work_ed25519 */
+  file: string;
+  /** The OpenSSH agent runs: the "add to agent" box is available. */
+  agent: boolean;
 }
 
 export interface LogRow {
@@ -139,6 +158,8 @@ export interface ServerDraft {
   keyMode: 'auto' | 'file';
   keyFile: string;
   password: string;
+  /** The saved server logs in by password: without a new one the core takes the stored password. */
+  authPass: boolean;
 }
 
 export interface TestResult {
@@ -157,6 +178,8 @@ export interface Backend {
   sshDisconnect(server: ServerId, user?: string): Promise<void>;
   sshTest(draft: ServerDraft): Promise<TestResult>;
   hostkeyRespond(reqId: number, trust: boolean): void;
+  /** `phrase` null cancels. Rejects with PASSPHRASE when the phrase does not open the key. */
+  passphraseRespond(reqId: number, phrase: string | null, addToAgent: boolean): Promise<void>;
   /** Logs in with a password before the server is saved; with `installKey` adds our key and checks key login. */
   sshFirstLogin(draft: ServerDraft, installKey: boolean): Promise<void>;
   /** Host key state for the card: fingerprint if trusted, null otherwise. */
@@ -168,6 +191,8 @@ export interface Backend {
   // Secrets and keys
   secretSet(server: ServerId, user: string, password: string): Promise<void>;
   secretDelete(server: ServerId, user: string): Promise<void>;
+  /** False on Linux without a Secret Service: no password-only servers there. */
+  secretsAvailable(): Promise<boolean>;
   agentStatus(): Promise<AgentStatus>;
   keysList(): Promise<string[]>;
   pickKeyFile(): Promise<string | null>;
@@ -214,6 +239,9 @@ export interface Backend {
   // Events
   onSshStatus(cb: (server: ServerId, user: string, state: SessionState | null) => void): Unlisten;
   onHostkey(cb: (req: HostKeyRequest) => void): Unlisten;
+  onPassphrase(cb: (req: PassphraseRequest) => void): Unlisten;
+  /** Host key or passphrase requests nobody will answer any more (server disconnected): close their dialogs. */
+  onPromptGone(cb: (reqIds: number[]) => void): Unlisten;
   onTransferState(cb: (items: TransferItem[]) => void): Unlisten;
   onTransferBatch(cb: (r: BatchReport) => void): Unlisten;
   onPtyExit(cb: (id: number, reason: string) => void): Unlisten;

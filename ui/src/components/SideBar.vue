@@ -1,10 +1,10 @@
 <script setup lang="ts">
-import { onBeforeUnmount, ref } from 'vue';
+import { nextTick, onBeforeUnmount, ref, watch } from 'vue';
 import type { ServerId } from '../backend';
-import { tr } from '../i18n';
+import { lang, tr } from '../i18n';
 import { ui } from '../state/prefs';
 import { openMenu } from '../state/overlay';
-import { sideGroups, srvState, srvTitle, toggleGroup } from '../state/servers';
+import { servers, sideGroups, srvState, srvTitle, toggleGroup } from '../state/servers';
 import { other, panes, setSource } from '../state/panes';
 import { openTerm } from '../state/terms';
 import { sideWidth, startSideDrag, toggleSide } from '../state/layout';
@@ -27,7 +27,31 @@ function sideKey(ev: KeyboardEvent) {
   } else if (ev.key === 'Escape') { ui.search = ''; el.blur(); }
 }
 
-/* The add button docks into the bottom once the servers no longer fit.
+/* The search placeholder disappears before it would be cut: a clipped word reads worse than none. */
+const PH_SPARE = 4;
+const phFits = ref(true);
+let searchEl: HTMLInputElement | null = null;
+const measure = document.createElement('canvas').getContext('2d');
+function checkPh() {
+  if (!searchEl || !measure) return;
+  const cs = getComputedStyle(searchEl);
+  measure.font = `${cs.fontWeight} ${cs.fontSize} ${cs.fontFamily}`;
+  const room = searchEl.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
+  phFits.value = measure.measureText(tr('Сервер')).width + PH_SPARE <= room;
+}
+const phRo = new ResizeObserver(checkPh);
+function searchRef(el: unknown) {
+  const e = el as HTMLInputElement | null;
+  if (!e || e === searchEl) return;
+  if (searchEl) phRo.unobserve(searchEl);
+  searchEl = e;
+  phRo.observe(e);
+}
+watch(lang, () => nextTick(checkPh));
+document.fonts.ready.then(checkPh);
+onBeforeUnmount(() => phRo.disconnect());
+
+/* Collapsed: the add button docks into the bottom once the servers no longer fit.
    Any content change resizes the list until it overflows, so observing the list is enough. */
 let listEl: HTMLElement | null = null;
 const ro = new ResizeObserver(([en]) => {
@@ -91,11 +115,18 @@ function startThumbDrag(e: MouseEvent) {
   <aside class="side" :class="{ docked: ui.sideDocked }" :style="{ width: sideWidth + 'px' }">
     <template v-if="!ui.collapsed">
       <div class="side-top">
-        <label class="search"><Icon n="search" s="s" /><input v-model="ui.search" :placeholder="tr('Серверы') + ' · Ctrl P'" spellcheck="false" @keydown="sideKey"></label>
+        <label class="search" :title="tr('Поиск серверов') + ' · Ctrl P'"><Icon n="search" s="s" /><input :ref="searchRef" v-model="ui.search" :placeholder="phFits ? tr('Сервер') : ''" spellcheck="false" @keydown="sideKey"></label>
+        <button class="ibtn" :title="tr('Добавить сервер')" @click="openServer(null)"><Icon n="plus" /></button>
         <button class="ibtn" :title="tr('Сортировка и группы')" @click="openMenu('sort', $event, {}, 'right')"><Icon n="sort" /></button>
         <button class="ibtn" :title="tr('Скрыть серверы') + ' · Ctrl B'" @click="toggleSide"><Icon n="panel" /></button>
       </div>
-      <div :ref="listRef" class="side-list scroll" @scroll.passive="showThumb">
+      <div v-if="!servers.length && !ui.search" class="side-empty">
+        <Icon n="server" class="side-empty-ico" />
+        <div class="side-empty-t">{{ tr('Серверов пока нет') }}</div>
+        <div class="faint">{{ tr('Добавь первый, чтобы подключиться') }}</div>
+        <button class="btn pri" @click="openServer(null)"><Icon n="plus" s="s" />{{ tr('Добавить сервер') }}</button>
+      </div>
+      <div v-else :ref="listRef" class="side-list scroll" @scroll.passive="showThumb">
         <template v-for="g in sideGroups" :key="g.name">
           <button class="grp" :class="{ closed: g.closed }" :title="tr(g.closed ? 'Развернуть группу' : 'Свернуть группу')" @click="toggleGroup(g.name)">
             <Icon n="chev" s="xs" class="chev" /><span class="grp-name">{{ g.name }}</span>
@@ -115,7 +146,6 @@ function startThumbDrag(e: MouseEvent) {
         </template>
         <div v-if="!sideGroups.length" class="empty-note">{{ tr('Ничего не найдено') }}</div>
       </div>
-      <div class="side-add"><button class="srv srv-add" :title="tr('Новый сервер')" @click="openServer(null)"><span class="lead"><Icon n="plus" s="s" class="srv-ico" /></span><span class="srv-name">{{ tr('Добавить') }}</span></button></div>
     </template>
     <template v-else>
       <div class="side-top" style="justify-content:center">
@@ -132,7 +162,7 @@ function startThumbDrag(e: MouseEvent) {
         </template>
         <div class="grp-line"></div>
       </div>
-      <div class="side-add"><button class="srv mini srv-add" :title="tr('Новый сервер')" @click="openServer(null)"><Icon n="plus" s="l" class="srv-ico" /></button></div>
+      <div class="side-add"><button class="srv mini srv-add" :title="tr('Добавить сервер')" @click="openServer(null)"><Icon n="plus" s="l" class="srv-ico" /></button></div>
     </template>
     <div ref="thumb" class="side-thumb" @mousedown.prevent="startThumbDrag"></div>
     <div class="handle-v" :title="tr('Изменить ширину · двойной щелчок: свернуть')" @mousedown.prevent="startSideDrag" @dblclick="toggleSide"></div>

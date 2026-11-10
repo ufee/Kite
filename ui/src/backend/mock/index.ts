@@ -5,7 +5,7 @@
  * a transfer engine, external editing and pretend shells.
  */
 import type {
-  AgentStatus, Backend, BackendError, BatchReport, ConflictPolicy, Endpoint, Entry, HostKeyRequest, LogRow,
+  AgentStatus, Backend, BackendError, BatchReport, ConflictPolicy, Endpoint, Entry, HostKeyRequest, LogRow, PassphraseRequest,
   Server, ServerConfig, ServerDraft, ServerId, SessionState, Src, StateDoc, TestResult, TextFile, TransferItem, Unlisten,
 } from '../types';
 import type { Store } from '../store';
@@ -46,12 +46,12 @@ const copyServer = (s: Server): Server => ({
 });
 
 export class MockBackend implements Backend {
-  readonly kind = 'mock' as const;
+  readonly kind: 'mock' | 'tauri' = 'mock';
   readonly platform = LOCAL_WIN ? ('windows' as const) : ('linux' as const);
 
   private fs = new MockFs();
   private listeners = new Map<string, Set<Listener>>();
-  private servers = new Map<ServerId, Server>();
+  protected servers = new Map<ServerId, Server>();
   /** Demo-only facts the real core learns from the network: offline hosts, demo accounts. */
   private demo = new Map<ServerId, DemoServer>();
   private known = new Map<string, string>();
@@ -76,7 +76,7 @@ export class MockBackend implements Backend {
   private ptyId = 0;
 
   /** Storage is real: the Tauri core in the window, localStorage in a browser tab. */
-  constructor(private store: Store) {
+  constructor(protected store: Store) {
     for (const s of DEMO_SERVERS) {
       this.servers.set(s.id, s);
       this.demo.set(s.id, s);
@@ -92,11 +92,13 @@ export class MockBackend implements Backend {
     set.add(cb);
     return () => set.delete(cb);
   }
-  private emit(name: string, ...args: unknown[]) {
+  protected emit(name: string, ...args: unknown[]) {
     for (const cb of this.listeners.get(name) ?? []) (cb as (...a: unknown[]) => void)(...args);
   }
   onSshStatus(cb: (server: ServerId, user: string, state: SessionState | null) => void) { return this.on('ssh', cb); }
   onHostkey(cb: (req: HostKeyRequest) => void) { return this.on('hostkey', cb); }
+  onPassphrase(cb: (req: PassphraseRequest) => void) { return this.on('passphrase', cb); }
+  onPromptGone(cb: (reqIds: number[]) => void) { return this.on('promptGone', cb); }
   onTransferState(cb: (items: TransferItem[]) => void) { return this.on('transfer', cb); }
   onTransferBatch(cb: (r: BatchReport) => void) { return this.on('batch', cb); }
   onPtyExit(cb: (id: number, reason: string) => void) { return this.on('ptyExit', cb); }
@@ -109,7 +111,7 @@ export class MockBackend implements Backend {
   async transferList() { return this.jobs.map(j => this.view(j)); }
   async logTail() { return this.log.map(r => ({ ...r })); }
 
-  private groups = [...DEMO_GROUPS];
+  protected groups = [...DEMO_GROUPS];
   /** The saved list wins; without one the demo servers stand in until the first save. */
   async serversLoad(): Promise<ServerConfig> {
     const saved = await this.store.serversLoad();
@@ -120,7 +122,7 @@ export class MockBackend implements Backend {
     this.useServers(cfg);
     await this.store.serversSave({ servers: [...this.servers.values()].map(copyServer), groups: [...this.groups] });
   }
-  private useServers(cfg: ServerConfig) {
+  protected useServers(cfg: ServerConfig) {
     this.servers = new Map(cfg.servers.map(s => [s.id, copyServer(s)]));
     this.groups = [...cfg.groups];
     for (const id of [...this.demo.keys()]) if (!this.servers.has(id)) this.demo.delete(id);
@@ -192,7 +194,7 @@ export class MockBackend implements Backend {
       this.add(code, 'KEY', tr('Ключ хоста не проверяется'), tr('проверка выключена'), 'ok', true);
       return Promise.resolve(true);
     }
-    const req: HostKeyRequest = { reqId: ++this.reqId, mode: old ? 'changed' : 'tofu', server, code, host, port, fp, ...(old ? { old } : {}) };
+    const req: HostKeyRequest = { reqId: ++this.reqId, mode: old ? 'changed' : 'tofu', server, code, host, port, algo: 'ED25519', fp, others: false, ...(old ? { old } : {}) };
     return new Promise(res => {
       this.hostReqs.set(req.reqId, trust => {
         if (trust) this.known.set(k, fp);
@@ -206,6 +208,8 @@ export class MockBackend implements Backend {
     this.hostReqs.delete(reqId);
     r?.(trust);
   }
+  /** The demo keys have no passphrase: the mock never asks. */
+  async passphraseRespond(_reqId: number, _phrase: string | null, _addToAgent: boolean) { /* nothing pending */ }
 
   sshConnect(server: Server, user: string): Promise<void> {
     const k = skey(server.id, user);
@@ -321,9 +325,10 @@ export class MockBackend implements Backend {
   /* ---------- Secrets and keys ---------- */
   async secretSet(server: ServerId, user: string, password: string) { this.secrets.set(skey(server, user), password); }
   async secretDelete(server: ServerId, user: string) { this.secrets.delete(skey(server, user)); }
+  async secretsAvailable() { return true; }
   async agentStatus(): Promise<AgentStatus> { return { running: true, keys: [...DEMO_AGENT_KEYS] }; }
   async keysList() { return [...DEMO_KEYS]; }
-  async pickKeyFile() { await sleep(300); return LOCAL_WIN ? '%USERPROFILE%\\.ssh\\work_ed25519' : '~/.ssh/work_ed25519'; }
+  async pickKeyFile(): Promise<string | null> { await sleep(300); return LOCAL_WIN ? '%USERPROFILE%\\.ssh\\work_ed25519' : '~/.ssh/work_ed25519'; }
 
   /* ---------- Files ---------- */
   private live(src: Src, user: string) {
