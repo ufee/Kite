@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { onBeforeUnmount, ref } from 'vue';
+import { nextTick, onBeforeUnmount, ref, watch } from 'vue';
 import type { ServerId } from '../backend';
-import { tr } from '../i18n';
+import { lang, tr } from '../i18n';
 import { ui } from '../state/prefs';
 import { openMenu } from '../state/overlay';
 import { servers, sideGroups, srvState, srvTitle, toggleGroup } from '../state/servers';
@@ -26,6 +26,30 @@ function sideKey(ev: KeyboardEvent) {
     if (s) { pickServer(s.id); ui.search = ''; el.blur(); }
   } else if (ev.key === 'Escape') { ui.search = ''; el.blur(); }
 }
+
+/* The search placeholder disappears before it would be cut: a clipped word reads worse than none. */
+const PH_SPARE = 4;
+const phFits = ref(true);
+let searchEl: HTMLInputElement | null = null;
+const measure = document.createElement('canvas').getContext('2d');
+function checkPh() {
+  if (!searchEl || !measure) return;
+  const cs = getComputedStyle(searchEl);
+  measure.font = `${cs.fontWeight} ${cs.fontSize} ${cs.fontFamily}`;
+  const room = searchEl.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
+  phFits.value = measure.measureText(tr('Сервер')).width + PH_SPARE <= room;
+}
+const phRo = new ResizeObserver(checkPh);
+function searchRef(el: unknown) {
+  const e = el as HTMLInputElement | null;
+  if (!e || e === searchEl) return;
+  if (searchEl) phRo.unobserve(searchEl);
+  searchEl = e;
+  phRo.observe(e);
+}
+watch(lang, () => nextTick(checkPh));
+document.fonts.ready.then(checkPh);
+onBeforeUnmount(() => phRo.disconnect());
 
 /* Collapsed: the add button docks into the bottom once the servers no longer fit.
    Any content change resizes the list until it overflows, so observing the list is enough. */
@@ -91,7 +115,7 @@ function startThumbDrag(e: MouseEvent) {
   <aside class="side" :class="{ docked: ui.sideDocked }" :style="{ width: sideWidth + 'px' }">
     <template v-if="!ui.collapsed">
       <div class="side-top">
-        <label class="search" :title="tr('Поиск серверов') + ' · Ctrl P'"><Icon n="search" s="s" /><input v-model="ui.search" :placeholder="tr('Сервер')" spellcheck="false" @keydown="sideKey"></label>
+        <label class="search" :title="tr('Поиск серверов') + ' · Ctrl P'"><Icon n="search" s="s" /><input :ref="searchRef" v-model="ui.search" :placeholder="phFits ? tr('Сервер') : ''" spellcheck="false" @keydown="sideKey"></label>
         <button class="ibtn" :title="tr('Добавить сервер')" @click="openServer(null)"><Icon n="plus" /></button>
         <button class="ibtn" :title="tr('Сортировка и группы')" @click="openMenu('sort', $event, {}, 'right')"><Icon n="sort" /></button>
         <button class="ibtn" :title="tr('Скрыть серверы') + ' · Ctrl B'" @click="toggleSide"><Icon n="panel" /></button>
