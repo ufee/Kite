@@ -53,6 +53,12 @@ pub async fn passphrase_respond(ssh: SshState<'_>, req_id: u64, phrase: Option<Z
     ssh.prompts.passphrase_respond(req_id, phrase, add_to_agent).await
 }
 
+/// The window was (re)loaded: dialogs of the previous page are gone, nobody will answer them.
+#[tauri::command]
+pub fn prompts_reset(app: AppHandle, ssh: SshState<'_>) {
+    ssh.prompts.cancel(&app, None);
+}
+
 #[tauri::command]
 pub async fn hostkey_known(ssh: SshState<'_>, host: String, port: u16) -> Result<Option<String>> {
     Ok(ssh.hostkey_known(&host, port).await)
@@ -98,8 +104,9 @@ pub async fn secret_delete(server: String, user: String) -> Result<()> {
 }
 
 #[tauri::command]
-pub fn secrets_available() -> bool {
-    secrets::available()
+pub async fn secrets_available() -> bool {
+    // On Linux the first call connects to the Secret Service over D-Bus.
+    blocking(|| Ok(secrets::available())).await.unwrap_or(false)
 }
 
 #[derive(Serialize)]

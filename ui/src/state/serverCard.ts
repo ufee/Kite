@@ -100,6 +100,12 @@ export async function saveServer(d: Card) {
   if (!d.users.some((u: { name: string }) => u.name === d.defUser)) d.defUser = d.users[0].name;
 
   const was = srvBy(d.id);
+  // The keychain keeps the password of the default user: another default user needs its own.
+  const wasUser = was?.defaultUser ?? '';
+  if (was?.authPass && !d.install && !d.pass && wasUser !== d.defUser) {
+    d.errs = { pass: tr('Нужен пароль для {u}', { u: d.defUser }) };
+    return;
+  }
   const login = !!d.pass || (!!was?.authPass && d.install);
   if (login && !(await firstLogin(d))) return;
   if (dlg.value?.data !== d) return; // the card was closed while logging in
@@ -112,7 +118,8 @@ export async function saveServer(d: Card) {
   };
   let id: ServerId;
   if (was) {
-    if (was.host !== fields.host || was.port !== fields.port) await backend.hostkeyForget(was.host, was.port).catch(() => undefined);
+    // The old address keeps its known_hosts record: the file is shared with ssh and git, and
+    // other servers may point there. The new address is checked on its own.
     Object.assign(was, fields);
     id = was.id;
     toast(tr('{c} сохранён', { c: d.code }), 'ok');
@@ -123,7 +130,7 @@ export async function saveServer(d: Card) {
   }
   // A password-only server keeps its password in the OS keychain; key login drops it.
   if (authPass && d.pass) await backend.secretSet(id, d.defUser, d.pass);
-  else if (!authPass && was?.authPass) await backend.secretDelete(id, d.defUser);
+  if (was?.authPass && (!authPass || wasUser !== d.defUser)) await backend.secretDelete(id, wasUser).catch(() => undefined);
   d.pass = '';
   await saveServers();
   closeDlg(true);
@@ -142,6 +149,8 @@ export async function dropServer(id: ServerId) {
   const k = servers.findIndex(s => s.id === id);
   if (k < 0) return;
   await backend.sshDisconnect(id).catch(() => undefined);
+  const s = servers[k];
+  if (s.authPass) await backend.secretDelete(id, s.defaultUser).catch(() => undefined);
   servers.splice(k, 1);
   for (const key of Object.keys(sessions)) if (key.startsWith(id + '|')) delete sessions[key];
   panes.forEach((p, i) => { if (p.src === id) setSource(i, 'local'); });

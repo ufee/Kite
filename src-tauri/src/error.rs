@@ -14,6 +14,8 @@ pub enum Error {
     Dropped { addr: String },
     /// The user declined the host key, or it is revoked.
     HostkeyRejected,
+    /// "Test" in the card met another key than the one on record; the dialog comes on connect.
+    HostkeyChanged { addr: String, old: String, new: String },
     /// No key was accepted.
     AuthKey { user: String, server: String },
     /// The password was not accepted.
@@ -64,6 +66,18 @@ impl From<russh::Error> for Error {
             | russh::Error::HUP
             | russh::Error::KeepaliveTimeout
             | russh::Error::InactivityTimeout => Self::Disconnected,
+            // The server reset or closed the socket rather than saying goodbye.
+            russh::Error::IO(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::BrokenPipe
+                ) =>
+            {
+                Self::Disconnected
+            }
             e => Self::ssh(e),
         }
     }

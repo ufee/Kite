@@ -6,7 +6,13 @@
 //! asked for the passphrase once. Passwords: `password`, or `keyboard-interactive` with one prompt
 //! when the server only offers that (Ubuntu with PAM).
 
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use russh::{
     MethodKind, MethodSet,
@@ -47,6 +53,29 @@ pub struct Who<'a> {
     pub user: &'a str,
     /// The handshake slot, given back while the passphrase dialog waits for the user.
     pub permit: Option<&'a tokio::sync::Mutex<Option<tokio::sync::OwnedSemaphorePermit>>>,
+    /// Set when this connection showed the passphrase dialog.
+    pub prompted: Option<&'a AtomicBool>,
+}
+
+impl Who<'_> {
+    /// Gives the handshake slot back while waiting for the user: other servers keep connecting.
+    async fn pause(&self) {
+        if let Some(p) = self.permit {
+            p.lock().await.take();
+        }
+    }
+
+    /// Takes a slot again before going on with the login.
+    async fn resume(&self, ssh: &Ssh) {
+        if let Some(p) = self.permit {
+            let mut slot = p.lock().await;
+            if slot.is_none()
+                && let Ok(permit) = ssh.handshakes.clone().acquire_owned().await
+            {
+                *slot = Some(permit);
+            }
+        }
+    }
 }
 
 fn methods_text(m: &MethodSet) -> String {
@@ -278,24 +307,55 @@ async fn file_login(
         }
     };
     let name = kf.name();
-    if let Some(public) = &kf.public {
-        if a.seen(public) {
-            return Ok(false);
+    if kf.public.clone().or_else(|| ssh.unlocked.public_of(&kf.path)).is_some_and(|p| a.seen(&p)) {
+        return Ok(false);
+    }
+    let ready = match ready(ssh, &kf, in_agent) {
+        Some(r) => r,
+        None => {
+            // One dialog per key file. A connection that waited here usually finds the key open:
+            // in the agent (asked again, the list above is stale) or in this run's memory.
+            who.pause().await;
+            let gate = ssh.unlocked.gate(&kf.path);
+            let turn = gate.lock().await;
+            let now_in_agent = match agent.as_mut() {
+                Some(ag) => keys::agent_keys(ag).await,
+                None => Vec::new(),
+            };
+            let r = match ready(ssh, &kf, &now_in_agent) {
+                Some(r) => Ok(r),
+                None => unlock(ssh, who, &kf, agent).await.map(Ready::Key),
+            };
+            drop(turn);
+            who.resume(ssh).await;
+            r?
         }
-        if let Some(ag) = agent.as_mut()
-            && in_agent.iter().any(|k| k.key_data() == public.key_data())
-        {
-            return with_agent(ssh, h, who, a, ag, public.clone(), &name).await;
+    };
+    match ready {
+        Ready::Agent(public) => match agent.as_mut() {
+            Some(ag) => with_agent(ssh, h, who, a, ag, public, &name).await,
+            None => Ok(false),
+        },
+        Ready::Key(key) => with_key(ssh, h, who, a, key, &name).await,
+    }
+}
+
+enum Ready {
+    Agent(PublicKey),
+    Key(Arc<PrivateKey>),
+}
+
+/// The key without asking anyone: through the agent, unlocked earlier in this run, or not encrypted.
+fn ready(ssh: &Ssh, kf: &KeyFile, in_agent: &[PublicKey]) -> Option<Ready> {
+    if let Some(public) = kf.public.clone().or_else(|| ssh.unlocked.public_of(&kf.path)) {
+        if in_agent.iter().any(|k| k.key_data() == public.key_data()) {
+            return Some(Ready::Agent(public));
         }
-        if let Some(key) = ssh.unlocked.find(public) {
-            return with_key(ssh, h, who, a, key, &name).await;
+        if let Some(key) = ssh.unlocked.find(&public) {
+            return Some(Ready::Key(key));
         }
     }
-    if let Some(key) = &kf.plain {
-        return with_key(ssh, h, who, a, Arc::new(key.clone()), &name).await;
-    }
-    let key = unlock(ssh, who, &kf, agent).await?;
-    with_key(ssh, h, who, a, key, &name).await
+    kf.plain.as_ref().map(|k| Ready::Key(Arc::new(k.clone())))
 }
 
 /// Asks for the passphrase until it opens the key or the user cancels. The phrase is wiped as soon
@@ -311,11 +371,10 @@ async fn unlock(ssh: &Ssh, who: &Who<'_>, kf: &KeyFile, agent: &mut Option<Agent
         agent: agent.is_some(),
     };
     ssh.log.ok(who.code, "KEY", msg!("Ключ {k} защищён паролем", k = name));
-    // Other servers keep connecting while the user types.
-    if let Some(p) = who.permit {
-        p.lock().await.take();
-    }
     let Some((id, mut rx)) = ssh.prompts.passphrase(&ssh.app, req) else { return Err(Error::Cancelled) };
+    if let Some(p) = who.prompted {
+        p.store(true, Ordering::Relaxed);
+    }
     let result = loop {
         let Some(answer) = rx.recv().await else { break Err(Error::Cancelled) };
         let Some(phrase) = answer.phrase else {
@@ -331,6 +390,7 @@ async fn unlock(ssh: &Ssh, who: &Who<'_>, kf: &KeyFile, agent: &mut Option<Agent
         };
         drop(phrase);
         let key = Arc::new(key);
+        ssh.unlocked.learn(&kf.path, key.public_key().clone());
         let mut in_agent = false;
         if answer.add_to_agent && agent.is_some() {
             match keys::agent_add(&key, &kf.path.to_string_lossy()).await {

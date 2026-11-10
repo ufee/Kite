@@ -222,6 +222,10 @@ impl KnownHosts {
     pub fn add(&self, host: &str, port: u16, key: &PublicKey) -> std::io::Result<()> {
         ensure_dir(&self.path)?;
         let text = self.read();
+        // Two connections that trusted the same new host one after the other: write it once.
+        if matches!(check(&text, host, port, key), Check::Known) {
+            return Ok(());
+        }
         let lead = if text.is_empty() || text.ends_with('\n') { "" } else { "\n" };
         let mut f = OpenOptions::new().create(true).append(true).open(&self.path)?;
         writeln!(f, "{lead}{}", entry(host, port, key))?;
@@ -234,7 +238,17 @@ impl KnownHosts {
         if next == text {
             return Ok(());
         }
-        crate::store::write_atomic(&self.path, next.as_bytes())
+        // Through a symlink to its target, with the file's mode kept: the rename must not turn
+        // the user's link into a plain file.
+        let path = fs::canonicalize(&self.path).unwrap_or_else(|_| self.path.clone());
+        #[cfg(unix)]
+        let mode = fs::metadata(&path).ok().map(|m| m.permissions());
+        crate::store::write_atomic(&path, next.as_bytes())?;
+        #[cfg(unix)]
+        if let Some(mode) = mode {
+            let _ = fs::set_permissions(&path, mode);
+        }
+        Ok(())
     }
 
     /// A changed key replaces every record of the host, like `ssh-keygen -R` followed by a new trust.
@@ -337,6 +351,7 @@ mod tests {
         kh.add("web1", 22, &key(ED_A)).unwrap();
         fs::write(&kh.path, kh.read().trim_end()).unwrap(); // no newline at the end, like a hand edit
         kh.add("db1", 2222, &key(ED_B)).unwrap();
+        kh.add("db1", 2222, &key(ED_B)).unwrap(); // a second trust of the same key writes nothing
         assert_eq!(kh.read(), format!("web1 ssh-ed25519 {ED_A}\n[db1]:2222 ssh-ed25519 {ED_B}\n"));
         kh.replace("web1", 22, &key(ED_B)).unwrap();
         assert_eq!(check(&kh.read(), "web1", 22, &key(ED_B)), Check::Known);

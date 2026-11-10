@@ -70,6 +70,7 @@ pub fn run() {
             ipc::ssh::ssh_first_login,
             ipc::ssh::hostkey_respond,
             ipc::ssh::passphrase_respond,
+            ipc::ssh::prompts_reset,
             ipc::ssh::hostkey_known,
             ipc::ssh::hostkey_forget,
             ipc::ssh::set_strict_host,

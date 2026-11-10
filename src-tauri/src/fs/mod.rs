@@ -1,7 +1,7 @@
 //! Folders on a server through the session's SFTP channel. Read-only for now: listing, resolving a
 //! typed path, the home folder. Changing operations and the local file system arrive in stage 4.
 
-use futures::future::join_all;
+use futures::stream::{self, StreamExt};
 use russh_sftp::{
     client::error::Error as SftpError,
     protocol::{File, StatusCode},
@@ -97,14 +97,23 @@ pub async fn list(s: &Session, path: &str) -> Result<Vec<Entry>> {
         }
     }
     let _ = sftp.close(handle).await;
-    // Links: one stat each for the target type, pipelined on the channel.
+    // Links: one stat each for the target type, pipelined on the channel, at most 16 in flight.
     let dir = path.trim_end_matches('/');
-    let targets = join_all(files.iter().map(|f| async move {
-        if !f.attrs.is_symlink() {
-            return None;
-        }
-        sftp.stat(format!("{dir}/{}", f.filename)).await.ok().map(|a| a.attrs.is_dir())
-    }))
+    let stats: Vec<_> = files
+        .iter()
+        .map(|f| {
+            let link = f.attrs.is_symlink().then(|| format!("{dir}/{}", f.filename));
+            async move {
+                match link {
+                    Some(p) => sftp.stat(p).await.ok().map(|a| a.attrs.is_dir()),
+                    None => None,
+                }
+            }
+        })
+        .collect();
+    let targets: Vec<Option<bool>> = stream::iter(stats)
+        .buffered(16)
+    .collect()
     .await;
     Ok(files
         .iter()

@@ -14,12 +14,13 @@ defineProps<{ d: Record<string, any> }>();
     <div class="dlg-b">
       <template v-if="d.mode === 'changed'">
         <div class="note bad"><Icon n="warn" /><div>{{ tr('Сервер {host} прислал не тот ключ, что в known_hosts. Так бывает после переустановки или при перехвате соединения.', { host: d.host }) }}</div></div>
-        <div><span class="lbl">{{ tr('Сохранённый') }}</span><div class="fp">ED25519 · {{ d.old }}</div></div>
-        <div><span class="lbl">{{ tr('Новый') }}</span><div class="fp">ED25519 · {{ d.fp }}</div></div>
+        <div><span class="lbl">{{ tr('Сохранённый') }}</span><div class="fp">{{ d.algo }} · {{ d.old }}</div></div>
+        <div><span class="lbl">{{ tr('Новый') }}</span><div class="fp">{{ d.algo }} · {{ d.fp }}</div></div>
       </template>
       <template v-else>
-        <div class="muted">{{ tr('Новый сервер. Сверить отпечаток можно так:') }} <span class="mono" style="font-size:12px">ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub</span></div>
-        <div><span class="lbl">{{ d.host }}:{{ d.port }}</span><div class="fp">ED25519 · {{ d.fp }}</div></div>
+        <div v-if="d.others" class="note bad"><Icon n="warn" /><div>{{ tr('Для {host} в known_hosts уже есть ключ другого типа. Сверь отпечаток, прежде чем доверять.', { host: d.host }) }}</div></div>
+        <div class="muted">{{ tr(d.others ? 'Сверить отпечаток можно так:' : 'Новый сервер. Сверить отпечаток можно так:') }} <span class="mono" style="font-size:12px">ssh-keygen -lf /etc/ssh/ssh_host_{{ d.algo.toLowerCase() }}_key.pub</span></div>
+        <div><span class="lbl">{{ d.host }}:{{ d.port }}</span><div class="fp">{{ d.algo }} · {{ d.fp }}</div></div>
       </template>
     </div>
     <div class="dlg-f">

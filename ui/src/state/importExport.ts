@@ -128,8 +128,9 @@ export async function applyImport() {
       });
     } else {
       const cur = srvByCode(s.code)!;
-      // A new address is a new host: its key must be confirmed again.
-      if (cur.host !== s.host || cur.port !== s.port) await backend.hostkeyForget(cur.host, cur.port).catch(() => undefined);
+      // A new address is checked on its own; the old one keeps its known_hosts record (shared with ssh).
+      // The keychain holds the password of the default user only.
+      if (cur.authPass && cur.defaultUser !== s.defUser) await backend.secretDelete(cur.id, cur.defaultUser).catch(() => undefined);
       Object.assign(cur, { group: s.group, description: s.desc, host: s.host, port: s.port, users: s.users, defaultUser: s.defUser });
     }
   }

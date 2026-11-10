@@ -35,6 +35,7 @@ function words(e: CoreError): [string, string] {
     case 'NET': return [tr('Нет связи с сервером'), `${e.addr}: ${e.reason}`];
     case 'DROPPED': return [tr('Сервер закрыл соединение'), tr('{addr}: сервер закрыл соединение до входа. Так бывает при блокировке после неудачных входов.', { addr: e.addr })];
     case 'HOSTKEY_REJECTED':return [tr('Подключение отменено'), tr('Ключ хоста не подтверждён.')];
+    case 'HOSTKEY_CHANGED': return [tr('Ключ хоста изменился'), tr('{addr}: ключ не совпадает с known_hosts. Сохранённый {old}, новый {new}.', { addr: e.addr, old: e.old, new: e.new })];
     case 'AUTH_KEY': return [tr('Сервер не принял ключ'), tr('{u}@{c}. Если ключа там ещё нет, укажи пароль в карточке сервера.', { u: e.user, c: e.server })];
     case 'AUTH_PASS': return [tr('Пароль не подошёл'), tr('Укажи новый пароль в карточке сервера.')];
     case 'NO_SECRET': return [tr('Нет сохранённого пароля'), tr('Укажи пароль в карточке сервера.')];
@@ -76,6 +77,9 @@ export class TauriBackend extends MockBackend {
     void listen<{ server: ServerId; user: string; state: SessionState | null }>('ssh://status', e => this.emit('ssh', e.payload.server, e.payload.user, e.payload.state));
     void listen<HostKeyRequest>('ssh://hostkey', e => this.emit('hostkey', e.payload));
     void listen<PassphraseRequest>('ssh://passphrase', e => this.emit('passphrase', e.payload));
+    void listen<number[]>('ssh://prompt-gone', e => this.emit('promptGone', e.payload));
+    // A reloaded window lost the dialogs of the page before: their connections stop waiting.
+    void invoke('prompts_reset').catch(() => undefined);
     void listen<CoreRow>('log://row', e => this.emit('log', row(e.payload)));
     void listen<CoreRow>('log://update', e => this.emit('logUpdate', row(e.payload)));
   }

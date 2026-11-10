@@ -47,7 +47,7 @@ export interface Entry {
 
 export type ErrCode =
   | 'ENOENT' | 'ENOTDIR' | 'EACCES' | 'EEXIST' | 'EINVAL'
-  | 'TIMEOUT' | 'NET' | 'DROPPED' |'AUTH_KEY' | 'AUTH_PASS' | 'NO_SECRET' | 'AUTH_MULTI' | 'AUTH_METHODS' | 'HOSTKEY_REJECTED'
+  | 'TIMEOUT' | 'NET' | 'DROPPED' |'AUTH_KEY' | 'AUTH_PASS' | 'NO_SECRET' | 'AUTH_MULTI' | 'AUTH_METHODS' | 'HOSTKEY_REJECTED' | 'HOSTKEY_CHANGED'
   | 'KEY_FILE' | 'NO_PUBKEY' | 'KEY_CHECK' | 'PASSPHRASE' | 'KEYCHAIN' | 'SSH' | 'CANCELLED' | 'DISCONNECTED'
   /** The operation arrives in a later stage. */
   | 'NOT_YET';
@@ -70,8 +70,12 @@ export interface HostKeyRequest {
   code: string;
   host: string;
   port: number;
+  /** ED25519, ECDSA, RSA: the server's file to compare with is ssh_host_<lowercase>_key.pub. */
+  algo: string;
   fp: string;
   old?: string;
+  /** A new host whose address already has a key of another type on record. */
+  others: boolean;
 }
 
 /** A key file with a passphrase and not in the agent. A wrong phrase rejects the reply; the dialog stays. */
@@ -236,6 +240,8 @@ export interface Backend {
   onSshStatus(cb: (server: ServerId, user: string, state: SessionState | null) => void): Unlisten;
   onHostkey(cb: (req: HostKeyRequest) => void): Unlisten;
   onPassphrase(cb: (req: PassphraseRequest) => void): Unlisten;
+  /** Host key or passphrase requests nobody will answer any more (server disconnected): close their dialogs. */
+  onPromptGone(cb: (reqIds: number[]) => void): Unlisten;
   onTransferState(cb: (items: TransferItem[]) => void): Unlisten;
   onTransferBatch(cb: (r: BatchReport) => void): Unlisten;
   onPtyExit(cb: (id: number, reason: string) => void): Unlisten;

@@ -2,7 +2,7 @@
 import { watch } from 'vue';
 import { backend, type HostKeyRequest, type PassphraseRequest } from '../backend';
 import { settings, ui } from './prefs';
-import { ask } from './overlay';
+import { ask, dropDialogs } from './overlay';
 import { logPush, logUpdate, log } from './log';
 import { initServers, loadServers, sessions } from './servers';
 import { initPanes, panes, setSource } from './panes';
@@ -20,6 +20,11 @@ function initHostkeys() {
     ask<string>('passphrase', { ...req, name, phrase: '', add: req.agent, err: '', busy: false }).then(r => {
       if (r !== 'ok') backend.passphraseRespond(req.reqId, null, false).catch(() => undefined);
     });
+  });
+  backend.onPromptGone(ids => {
+    const gone = (d: Record<string, any>) => ids.includes(d.reqId);
+    dropDialogs('hostkey', gone);
+    dropDialogs('passphrase', gone);
   });
 }
 

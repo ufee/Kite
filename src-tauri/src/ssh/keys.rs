@@ -1,8 +1,10 @@
 //! Key files in `~/.ssh`, the OpenSSH agent and keys unlocked for this run.
 
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use russh::keys::{
@@ -114,22 +116,50 @@ pub fn algo_short(key: &PublicKey) -> String {
     }
 }
 
+/// Host key type as the dialog names it; the server's file is `ssh_host_<lowercase>_key.pub`.
+pub fn host_algo(key: &PublicKey) -> String {
+    match key.algorithm() {
+        ssh_key::Algorithm::Ed25519 => "ED25519".into(),
+        ssh_key::Algorithm::Rsa { .. } => "RSA".into(),
+        ssh_key::Algorithm::Ecdsa { .. } => "ECDSA".into(),
+        a => a.as_str().to_uppercase(),
+    }
+}
+
 /// Keys unlocked with a passphrase without going to the agent: kept until Kite closes.
 /// `PrivateKey` wipes its secret half when dropped.
 #[derive(Default)]
-pub struct Unlocked(Mutex<Vec<Arc<PrivateKey>>>);
+pub struct Unlocked {
+    keys: Mutex<Vec<Arc<PrivateKey>>>,
+    /// Public halves learnt by decrypting, for files that carry none (encrypted PEM without `.pub`).
+    publics: Mutex<HashMap<PathBuf, PublicKey>>,
+    /// One passphrase dialog per key file: connections that need the same key wait for it.
+    gates: Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
+}
 
 impl Unlocked {
     pub fn find(&self, public: &PublicKey) -> Option<Arc<PrivateKey>> {
-        let keys = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let keys = self.keys.lock().unwrap_or_else(|e| e.into_inner());
         keys.iter().find(|k| k.public_key().key_data() == public.key_data()).cloned()
     }
 
     pub fn add(&self, key: Arc<PrivateKey>) {
-        let mut keys = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut keys = self.keys.lock().unwrap_or_else(|e| e.into_inner());
         if !keys.iter().any(|k| k.public_key().key_data() == key.public_key().key_data()) {
             keys.push(key);
         }
+    }
+
+    pub fn learn(&self, path: &Path, public: PublicKey) {
+        self.publics.lock().unwrap_or_else(|e| e.into_inner()).insert(path.into(), public);
+    }
+
+    pub fn public_of(&self, path: &Path) -> Option<PublicKey> {
+        self.publics.lock().unwrap_or_else(|e| e.into_inner()).get(path).cloned()
+    }
+
+    pub fn gate(&self, path: &Path) -> Arc<tokio::sync::Mutex<()>> {
+        self.gates.lock().unwrap_or_else(|e| e.into_inner()).entry(path.into()).or_default().clone()
     }
 }
 
@@ -137,18 +167,28 @@ impl Unlocked {
 
 pub type Agent = AgentClient<Box<dyn russh::keys::agent::client::AgentStream + Send + Unpin + 'static>>;
 
+/// A hung agent must not hang the login: listing and adding keys are bounded. Signing is not,
+/// since a hardware key may wait for a touch.
+const AGENT_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// The OpenSSH agent: the Windows service pipe, `SSH_AUTH_SOCK` elsewhere. `None` when it is not running.
 pub async fn agent() -> Option<Agent> {
     #[cfg(windows)]
-    let client = AgentClient::connect_named_pipe(r"\\.\pipe\openssh-ssh-agent").await.ok()?;
+    let client = tokio::time::timeout(AGENT_TIMEOUT, AgentClient::connect_named_pipe(r"\\.\pipe\openssh-ssh-agent")).await.ok()?.ok()?;
     #[cfg(unix)]
-    let client = AgentClient::connect_env().await.ok()?;
+    let client = tokio::time::timeout(AGENT_TIMEOUT, AgentClient::connect_env()).await.ok()?.ok()?;
     Some(client.dynamic())
 }
 
 /// Puts a private key into the agent with a comment, like `ssh-add` does (the file path), so the
 /// agent lists it by name. russh's `add_identity` always sends an empty comment.
 pub async fn agent_add(key: &PrivateKey, comment: &str) -> std::io::Result<()> {
+    tokio::time::timeout(AGENT_TIMEOUT, agent_add_once(key, comment))
+        .await
+        .unwrap_or_else(|_| Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "the agent did not answer")))
+}
+
+async fn agent_add_once(key: &PrivateKey, comment: &str) -> std::io::Result<()> {
     use ssh_key::encoding::Encode;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     const ADD_IDENTITY: u8 = 17;
@@ -168,7 +208,11 @@ pub async fn agent_add(key: &PrivateKey, comment: &str) -> std::io::Result<()> {
     stream.write_all(&body).await?;
     let mut head = [0u8; 4];
     stream.read_exact(&mut head).await?;
-    let mut reply = vec![0u8; (u32::from_be_bytes(head) as usize).clamp(1, 1024)];
+    let len = u32::from_be_bytes(head) as usize;
+    if !(1..=1024).contains(&len) {
+        return Err(std::io::Error::other("bad agent reply"));
+    }
+    let mut reply = vec![0u8; len];
     stream.read_exact(&mut reply).await?;
     if reply[0] == SUCCESS { Ok(()) } else { Err(std::io::Error::other("the agent refused the key")) }
 }
@@ -177,9 +221,10 @@ pub async fn agent_keys<S>(agent: &mut AgentClient<S>) -> Vec<PublicKey>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    agent
-        .request_identities()
+    tokio::time::timeout(AGENT_TIMEOUT, agent.request_identities())
         .await
+        .ok()
+        .and_then(|r| r.ok())
         .unwrap_or_default()
         .into_iter()
         .filter_map(|id| match id {

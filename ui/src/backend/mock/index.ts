@@ -98,6 +98,7 @@ export class MockBackend implements Backend {
   onSshStatus(cb: (server: ServerId, user: string, state: SessionState | null) => void) { return this.on('ssh', cb); }
   onHostkey(cb: (req: HostKeyRequest) => void) { return this.on('hostkey', cb); }
   onPassphrase(cb: (req: PassphraseRequest) => void) { return this.on('passphrase', cb); }
+  onPromptGone(cb: (reqIds: number[]) => void) { return this.on('promptGone', cb); }
   onTransferState(cb: (items: TransferItem[]) => void) { return this.on('transfer', cb); }
   onTransferBatch(cb: (r: BatchReport) => void) { return this.on('batch', cb); }
   onPtyExit(cb: (id: number, reason: string) => void) { return this.on('ptyExit', cb); }
@@ -193,7 +194,7 @@ export class MockBackend implements Backend {
       this.add(code, 'KEY', tr('Ключ хоста не проверяется'), tr('проверка выключена'), 'ok', true);
       return Promise.resolve(true);
     }
-    const req: HostKeyRequest = { reqId: ++this.reqId, mode: old ? 'changed' : 'tofu', server, code, host, port, fp, ...(old ? { old } : {}) };
+    const req: HostKeyRequest = { reqId: ++this.reqId, mode: old ? 'changed' : 'tofu', server, code, host, port, algo: 'ED25519', fp, others: false, ...(old ? { old } : {}) };
     return new Promise(res => {
       this.hostReqs.set(req.reqId, trust => {
         if (trust) this.known.set(k, fp);

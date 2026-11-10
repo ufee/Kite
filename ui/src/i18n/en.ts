@@ -77,6 +77,11 @@ export const EN: Record<string, string> = {
   'Сервер {host} прислал не тот ключ, что в known_hosts. Так бывает после переустановки или при перехвате соединения.': 'Server {host} sent a key that does not match known_hosts. This happens after a reinstall or when the connection is intercepted.',
   'Сохранённый': 'Saved', 'Новый': 'New',
   'Новый сервер. Сверить отпечаток можно так:': 'New server. To verify the fingerprint, run:',
+  'Сверить отпечаток можно так:': 'To verify the fingerprint, run:',
+  'Для {host} в known_hosts уже есть ключ другого типа. Сверь отпечаток, прежде чем доверять.': 'known_hosts already has a key of another type for {host}. Verify the fingerprint before trusting it.',
+  'Ключ хоста изменился': 'Host key changed',
+  '{addr}: ключ не совпадает с known_hosts. Сохранённый {old}, новый {new}.': '{addr}: the key does not match known_hosts. Saved {old}, new {new}.',
+  'Нужен пароль для {u}': 'Password needed for {u}',
   'Доверять новому ключу': 'Trust new key', 'Доверять и подключиться': 'Trust and connect',
 
   'Сервер {code}': 'Server {code}', 'Описание': 'Description', 'Что на сервере': 'What runs here',

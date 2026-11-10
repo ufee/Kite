@@ -33,7 +33,7 @@ use russh::{
 };
 use russh_sftp::client::RawSftpSession;
 use serde::Serialize;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tokio::{
     net::TcpStream,
     sync::{OwnedSemaphorePermit, Semaphore, watch},
@@ -100,7 +100,7 @@ impl Target {
     }
 
     fn who(&self) -> Who<'_> {
-        Who { server: &self.server, code: &self.code, user: &self.user, permit: None }
+        Who { server: &self.server, code: &self.code, user: &self.user, permit: None, prompted: None }
     }
 }
 
@@ -134,7 +134,8 @@ pub enum HostSeen {
     Trusted,
     /// Report mode: new key, accepted for this one connection only.
     Unverified(String),
-    Changed,
+    /// Report mode: another key is on record.
+    Changed { old: String, new: String },
     Rejected,
     /// strictHost is off.
     Unchecked,
@@ -150,7 +151,10 @@ struct Shake {
     sem: Arc<Semaphore>,
     permit: tokio::sync::Mutex<Option<OwnedSemaphorePermit>>,
     seen: Mutex<HostSeen>,
+    /// The host key dialog was shown.
     asked: AtomicBool,
+    /// The passphrase dialog was shown.
+    prompted: AtomicBool,
     first_kex: AtomicBool,
     dropped: watch::Sender<bool>,
 }
@@ -328,7 +332,7 @@ impl Ssh {
             return true;
         }
         let check = known_hosts::check(&self.known_text().await, &shake.host, shake.port, key);
-        let (mode, old) = match check {
+        let (mode, old, others) = match check {
             Check::Known => {
                 self.log.add(src, "KEY", format!("{algo} {fp}"), "известен", State::Ok);
                 shake.set_seen(HostSeen::Known);
@@ -339,13 +343,13 @@ impl Ssh {
                 shake.set_seen(HostSeen::Rejected);
                 return false;
             }
-            Check::Unknown { .. } => ("tofu", None),
-            Check::Changed { old } => ("changed", Some(old)),
+            Check::Unknown { others } => ("tofu", None, others),
+            Check::Changed { old } => ("changed", Some(old), false),
         };
         if shake.mode == HostMode::Report {
-            if mode == "changed" {
+            if let Some(old) = old {
                 self.log.err(src, "KEY", format!("{algo} {fp}"), "ключ хоста изменился");
-                shake.set_seen(HostSeen::Changed);
+                shake.set_seen(HostSeen::Changed { old, new: fp });
                 return false;
             }
             self.log.add(src, "KEY", format!("{algo} {fp}"), "ещё не подтверждён", State::Ok);
@@ -363,8 +367,10 @@ impl Ssh {
             code: shake.code.clone(),
             host: shake.host.clone(),
             port: shake.port,
+            algo: keys::host_algo(key),
             fp: fp.clone(),
             old,
+            others,
         };
         let trust = self.prompts.host_key(&self.app, req).await;
         if let Ok(p) = shake.sem.clone().acquire_owned().await {
@@ -454,6 +460,7 @@ impl Ssh {
             permit: tokio::sync::Mutex::new(Some(permit)),
             seen: Mutex::new(HostSeen::None),
             asked: AtomicBool::new(false),
+            prompted: AtomicBool::new(false),
             first_kex: AtomicBool::new(true),
             dropped,
         });
@@ -464,12 +471,13 @@ impl Ssh {
             Ok(h) => h,
             Err(e) => {
                 let err = match (&seen, Error::from(e)) {
-                    (HostSeen::Rejected | HostSeen::Changed, _) => Error::HostkeyRejected,
+                    (HostSeen::Rejected, _) => Error::HostkeyRejected,
+                    (HostSeen::Changed { old, new }, _) => Error::HostkeyChanged { addr: addr.clone(), old: old.clone(), new: new.clone() },
                     // Closed before any host key: a ban, MaxStartups, not an SSH server.
                     (HostSeen::None, Error::Disconnected) => Error::Dropped { addr: addr.clone() },
                     (_, e) => e,
                 };
-                if !matches!(err, Error::HostkeyRejected) {
+                if !matches!(err, Error::HostkeyRejected | Error::HostkeyChanged { .. }) {
                     self.log.err(src, "SSH", "Рукопожатие не удалось", err.to_string());
                 }
                 return Err((err, asked && seen == HostSeen::Trusted));
@@ -480,16 +488,17 @@ impl Ssh {
         if let (HostSeen::Unverified(_), Method::Password(_)) = (&seen, method) {
             return Ok(Shaken { handle, seen, dropped });
         }
-        let asked_before = self.prompts.issued();
-        let who = auth::Who { permit: Some(&shake.permit), ..t.who() };
+        let who = auth::Who { permit: Some(&shake.permit), prompted: Some(&shake.prompted), ..t.who() };
         let res = auth::login(self, &mut handle, &who, method).await;
         drop(shake.permit.lock().await.take());
         match res {
             Ok(()) => Ok(Shaken { handle, seen, dropped }),
             Err(e) => {
-                // The passphrase took longer than LoginGraceTime: the key is open now, try once more.
-                let retry = self.prompts.issued() != asked_before
+                // This connection's passphrase took longer than LoginGraceTime: the key is open now,
+                // try once more. A password is never sent twice.
+                let retry = shake.prompted.load(Ordering::Relaxed)
                     && *dropped.borrow()
+                    && matches!(method, Method::Keys(_))
                     && matches!(e, Error::Disconnected | Error::AuthKey { .. });
                 let _ = handle.disconnect(Disconnect::ByApplication, "", "en").await;
                 Err(if retry { (Error::Disconnected, true) } else { (e, false) })
@@ -624,6 +633,13 @@ impl Ssh {
         });
     }
 
+    /// The server as `servers.json` has it now.
+    async fn saved(&self, id: &str) -> Option<Server> {
+        let store = self.app.try_state::<Arc<crate::store::Store>>()?.inner().clone();
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || store.load_servers()?.servers.into_iter().find(|s| s.id == id)).await.ok().flatten()
+    }
+
     async fn reconnect(self: Arc<Self>, server: Server, user: String, epoch: u64) {
         let pair: Pair = (server.id.clone(), user.clone());
         {
@@ -638,10 +654,15 @@ impl Ssh {
         self.reconnecting.lock().unwrap_or_else(|e| e.into_inner()).insert(pair.clone());
         let still = |me: &Self| me.reconnecting.lock().unwrap_or_else(|e| e.into_inner()).contains(&pair);
         let mut ok = false;
+        let mut server = server;
         for (k, pause) in RECONNECT.iter().enumerate() {
             tokio::time::sleep(Duration::from_secs(*pause)).await;
             if !still(&self) {
                 return; // disconnected by the user meanwhile
+            }
+            // The card may have changed the address or the key since the session was opened.
+            if let Some(saved) = self.saved(&server.id).await {
+                server = saved;
             }
             self.log.ok(&server.code, "SSH", msg!("Повторное подключение · попытка {n}", n = k + 1));
             match self.connect(&server, &user).await {
@@ -662,6 +683,10 @@ impl Ssh {
 
     /// Closes the pairs of a server (one user or all). A connection still being made is dropped when it lands.
     pub async fn disconnect(&self, server: &str, user: Option<&str>) {
+        // A dialog still waiting for an answer would keep its connection hanging.
+        if user.is_none() {
+            self.prompts.cancel(&self.app, Some(server));
+        }
         let mut gone = Vec::new();
         {
             let mut slots = self.slots();
