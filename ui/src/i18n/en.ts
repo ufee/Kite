@@ -264,4 +264,9 @@ export const EN: Record<string, string> = {
   'Сервер закрыл соединение': 'The server closed the connection',
   '{addr}: сервер закрыл соединение до входа. Так бывает при блокировке после неудачных входов.': '{addr}: the server closed the connection before login. This happens when it bans after failed logins.', 'Сервер закрыл вход, пока ждали ответа · повтор': 'The server ended the login while waiting for an answer · retrying',
   'Контрольный вход по ключу прошёл':'Check login with the key passed', 'Контрольный вход по ключу не прошёл': 'Check login with the key failed',
+
+  // Files in the core
+  'Не найдено: {p}': 'Not found: {p}', 'Операция не выполнена': 'Operation failed',
+  'Владелец не изменён': 'Owner not changed', 'Сервер не выполняет команды: только SFTP.': 'The server runs no commands: SFTP only.',
+  'больше 10 МБ': 'over 10 MB', 'двоичный': 'binary', '{n} байт': '{n} bytes',
 };

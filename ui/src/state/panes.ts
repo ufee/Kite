@@ -99,7 +99,8 @@ export function idleInfo() {
   const s = srvBy(p.src);
   if (!s) return '';
   const u = s.users.find(x => x.name === p.user);
-  const key = s.authPass ? tr('вход по паролю') : !u || u.key === 'auto' ? tr('ключ из агента') : tr('ключ {k}', { k: u.key });
+  const file = u && u.key !== 'auto' ? u.key : s.keyMode === 'file' ? s.keyFile.split(/[\\/]/).pop() : '';
+  const key = s.authPass ? tr('вход по паролю') : file ? tr('ключ {k}', { k: file }) : tr('ключ из агента');
   return `${p.user}@${s.code} · ${s.host}${s.port !== 22 ? ':' + s.port : ''} · ${key}`;
 }
 export const hasUp = (i: number) => panes[i].state === 'ok' && !!parentOf(panes[i].src, panes[i].path);
@@ -467,7 +468,7 @@ export function openChmod(i: number) {
   const p = panes[i], list = selEntries(i);
   if (isLocal(p.src) || !list.length) return;
   const e = list[0], bits = [0, 1, 2].map(g => [0, 1, 2].map(b => e.perm[g * 3 + b] !== '-'));
-  ask('chmod', { i, names: list.map(x => x.name), bits, owner: e.owner, group: e.group, recursive: false, hasDir: list.some(x => x.dir) });
+  ask('chmod', { i, names: list.map(x => x.name), bits, owner: e.owner, group: e.group, owner0: e.owner, group0: e.group, recursive: false, hasDir: list.some(x => x.dir) });
 }
 export const octal = (bits: boolean[][]) => bits.map(g => (g[0] ? 4 : 0) + (g[1] ? 2 : 0) + (g[2] ? 1 : 0)).join('');
 export function setOctal(d: Record<string, any>, v: string) {
@@ -476,8 +477,10 @@ export function setOctal(d: Record<string, any>, v: string) {
 }
 export async function applyChmod(d: Record<string, any>) {
   const p = panes[d.i];
+  // Owner and group change only when edited: the dialog shows the first file's, others may differ.
+  const owner = d.owner.trim() !== d.owner0 ? d.owner.trim() : '', group = d.group.trim() !== d.group0 ? d.group.trim() : '';
   try {
-    await backend.fsChmod(p.src, p.user, d.names.map((n: string) => childOf(p.src, p.path, n)), parseInt(octal(d.bits), 8), d.owner, d.group, d.recursive);
+    await backend.fsChmod(p.src, p.user, d.names.map((n: string) => childOf(p.src, p.path, n)), parseInt(octal(d.bits), 8), owner, group, d.recursive);
   } catch (e) { toast(errOf(e).title, 'bad'); return; }
   toast(tr('Права {m} · {o}', { m: octal(d.bits), o: `${d.owner}:${d.group}` }) + (d.recursive ? tr(' · рекурсивно') : ''), 'ok');
   closeDlg(true);

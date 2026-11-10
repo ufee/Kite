@@ -231,6 +231,8 @@ pub struct Session {
     pub handle: Handle<Client>,
     pub sftp: RawSftpSession,
     pub home: String,
+    /// The server's code at connect time: the log's source column.
+    pub code: String,
     closing: AtomicBool,
 }
 
@@ -519,7 +521,7 @@ impl Ssh {
             }
         };
         self.log.ok(&t.code, "SFTP", msg!("Подсистема запущена, протокол v{v}", v = version));
-        Ok((Arc::new(Session { handle, sftp, home, closing: AtomicBool::new(false) }), dropped))
+        Ok((Arc::new(Session { handle, sftp, home, code: t.code.clone(), closing: AtomicBool::new(false) }), dropped))
     }
 
     /* ----- saved servers ----- */

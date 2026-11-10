@@ -46,7 +46,7 @@ export interface Entry {
 }
 
 export type ErrCode =
-  | 'ENOENT' | 'ENOTDIR' | 'EACCES' | 'EEXIST' | 'EINVAL'
+  | 'ENOENT' | 'ENOTDIR' | 'EACCES' | 'EEXIST' | 'EINVAL' | 'BAD_PATH' | 'NO_EXEC'
   | 'TIMEOUT' | 'NET' | 'DROPPED' |'AUTH_KEY' | 'AUTH_PASS' | 'NO_SECRET' | 'AUTH_MULTI' | 'AUTH_METHODS' | 'HOSTKEY_REJECTED' | 'HOSTKEY_CHANGED'
   | 'KEY_FILE' | 'NO_PUBKEY' | 'KEY_CHECK' | 'PASSPHRASE' | 'KEYCHAIN' | 'SSH' | 'CANCELLED' | 'DISCONNECTED'
   /** The operation arrives in a later stage. */

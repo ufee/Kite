@@ -422,7 +422,7 @@ export class MockBackend implements Backend {
     for (const { p, e } of entries) {
       await this.op(src, 'SFTP', `SETSTAT ${p} ${oct} ${owner}:${group}${recursive ? ' -R' : ''}`, () => {
         if (!e) throw fail('ENOENT', tr('Нет такого файла: {p}', { p }));
-        e.perm = tail; e.owner = owner; e.group = group;
+        e.perm = tail; if (owner) e.owner = owner; if (group) e.group = group;
       }, () => tr('готово'));
     }
   }
