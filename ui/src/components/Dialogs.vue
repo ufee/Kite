@@ -10,10 +10,11 @@ import SettingsDlg from './dialogs/SettingsDlg.vue';
 import DestDlg from './dialogs/DestDlg.vue';
 import FileDlg from './dialogs/FileDlg.vue';
 import KeysDlg from './dialogs/KeysDlg.vue';
+import PassphraseDlg from './dialogs/PassphraseDlg.vue';
 
 // A click on the backdrop closes only the dialogs that hold nothing to lose.
 const LIGHT = ['confirm', 'keys', 'chmod', 'settings', 'dest', 'file'];
-const VIEWS = { confirm: ConfirmDlg, conflict: ConflictDlg, hostkey: HostKeyDlg, server: ServerDlg, import: ImportDlg, chmod: ChmodDlg, settings: SettingsDlg, dest: DestDlg, file: FileDlg, keys: KeysDlg };
+const VIEWS = { confirm: ConfirmDlg, conflict: ConflictDlg, hostkey: HostKeyDlg, server: ServerDlg, import: ImportDlg, chmod: ChmodDlg, settings: SettingsDlg, dest: DestDlg, file: FileDlg, keys: KeysDlg, passphrase: PassphraseDlg };
 </script>
 
 <template>

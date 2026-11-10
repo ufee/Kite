@@ -28,7 +28,9 @@ export async function openServer(id: ServerId | null, focusNewUser = false) {
   ask('server', d);
   const live = dlg.value!.data; // the reactive copy the dialog renders
   nextTick(() => document.querySelector<HTMLInputElement>(focusNewUser ? '.urow:last-child input' : '.dlg input')?.focus());
-  if (s) live.fp = await backend.hostkeyKnown(s.host, s.port);
+  // Linux without a Secret Service: no password-only servers, the key always goes on the server.
+  backend.secretsAvailable().then(ok => { if (!ok) { live.noStore = true; live.install = true; } }, () => undefined);
+  if (s) live.fp = await backend.hostkeyKnown(s.host, s.port).catch(() => null);
 }
 
 export function addUser(d: Card) {
@@ -42,7 +44,7 @@ export function removeUser(d: Card, k: number) {
 
 const draftOf = (d: Card): ServerDraft => ({
   id: d.id, code: d.code.trim(), host: d.host.trim(), port: +d.port, user: d.defUser || 'root',
-  keyMode: d.keyMode, keyFile: d.keyFile, password: d.pass,
+  keyMode: d.keyMode, keyFile: d.keyFile, password: d.pass, authPass: !!srvBy(d.id)?.authPass,
 });
 
 export async function testServer(d: Card) {
@@ -56,6 +58,7 @@ export async function chooseKeyFile(d: Card) {
 }
 export function passHint(d: Card) {
   if (!d.pass && !d.hasPass) return tr('Если ключ уже на сервере, пароль не нужен');
+  if (d.noStore) return tr('В системе нет хранилища паролей');
   if (!d.install) return tr('Вход только по паролю. Он хранится в системном хранилище');
   return tr(d.hasPass ? 'Войдём как {u} один раз, добавим ключ и удалим пароль' : 'Войдём как {u} один раз и добавим ключ. Пароль не сохраняем', { u: d.defUser });
 }

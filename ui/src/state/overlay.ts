@@ -28,7 +28,7 @@ export function dropToast(id: number) {
  * A stack: the top one is visible, the ones below wait. A host key request that arrives
  * while another one is shown goes under it, so requests are answered in arrival order.
  */
-export type DlgKind = 'confirm' | 'conflict' | 'hostkey' | 'server' | 'import' | 'chmod' | 'settings' | 'dest' | 'file' | 'keys';
+export type DlgKind = 'confirm' | 'conflict' | 'hostkey' | 'server' | 'import' | 'chmod' | 'settings' | 'dest' | 'file' | 'keys' | 'passphrase';
 interface Dlg {
   id: number;
   kind: DlgKind;

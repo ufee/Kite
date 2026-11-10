@@ -1,5 +1,7 @@
 //! Commands the UI calls. Thin: they move the work off the async runtime and map errors to text.
 
+pub mod ssh;
+
 use std::sync::Arc;
 
 use serde_json::Value;

@@ -540,6 +540,16 @@ export function initPanes() {
   backend.onFsChanged((src, path) => panes.forEach((p, i) => { if (p.state === 'ok' && p.src === src && p.path === path) reload(i); }));
   backend.onEditChanged(editChanged);
   backend.onSshStatus((server, user, state) => {
+    // The core gave up reconnecting a working session: the pane shows the error with "Retry".
+    if (state === 'bad') {
+      panes.forEach(p => {
+        if (p.src !== server || p.user !== user || p.state !== 'ok') return;
+        ++p.token;
+        p.state = 'error';
+        p.msg = { title: tr('Соединение потеряно'), text: tr('{u}@{c}: переподключиться не удалось.', { u: user, c: label(server) }) };
+      });
+      return;
+    }
     if (state) return;
     panes.forEach((p, i) => {
       if (p.src !== server || p.user !== user || p.state === 'off') return;

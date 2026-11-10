@@ -1,13 +1,13 @@
 import { isTauri } from '@tauri-apps/api/core';
 import type { Backend } from './types';
 import { MockBackend } from './mock';
+import { TauriBackend } from './tauri';
 import { browserStore, tauriStore } from './store';
 
 /*
- * The mock still runs everything except storage: in the Tauri window the core already keeps the files,
- * in a browser tab they live in localStorage. The Rust core takes over method by method in later stages
- * behind the same interface.
+ * In the Tauri window the Rust core answers what it already has and the mock the rest (see tauri.ts).
+ * In a plain browser tab, used for UI development and the stand comparison, everything is the mock.
  */
-export const backend: Backend = new MockBackend(isTauri() ? tauriStore : browserStore());
+export const backend: Backend = isTauri() ? new TauriBackend(tauriStore) : new MockBackend(browserStore());
 
 export * from './types';

@@ -20,6 +20,15 @@ tauri-plugin-single-instance = "=2.5.5"
 tauri-plugin-window-state = "=2.5.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "net"] }
+russh = { version = "=0.65.1", default-features = false, features = ["ring", "flate2", "rsa"] }
+russh-sftp = "=3.0.1"
+futures = "0.3"
+zeroize = { version = "1.9.1", features = ["serde"] }
+data-encoding = "2"
+ring = "0.17"
+keyring = "4.2.0"
+tauri-plugin-dialog = "=2.8.4"
 
 [target.'cfg(windows)'.dependencies]
 # Must match the versions wry uses, so the COM interfaces are the same types.
