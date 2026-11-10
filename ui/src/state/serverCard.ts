@@ -2,7 +2,7 @@
 import { nextTick } from 'vue';
 import { backend, isBackendError, type Server, type ServerDraft, type ServerId } from '../backend';
 import { tr } from '../i18n';
-import { ask, closeDlg, confirmBox, dlg, toast } from './overlay';
+import { ask, closeDlg, confirmBox, dlg, dlgOf, toast } from './overlay';
 import { groupOrder, newServerId, recent, saveServers, servers, sessions, srvBy } from './servers';
 import { panes, setSource } from './panes';
 import { terms } from './terms';
@@ -68,7 +68,7 @@ export function passHint(d: Card) {
  * A host key question lands above the card in the dialog stack. Returns false if the card must stay open.
  */
 async function firstLogin(d: Card): Promise<boolean> {
-  d.busy = true; d.errs = {};
+  d.errs = {};
   d.test = { state: 'run', text: tr(d.install ? 'Добавляем ключ…' : 'Проверяем пароль…') };
   try {
     await backend.sshFirstLogin(draftOf(d), d.install);
@@ -81,12 +81,21 @@ async function firstLogin(d: Card): Promise<boolean> {
     } else if (err && err.code !== 'HOSTKEY_REJECTED') d.errs = { pass: err.title };
     return false;
   } finally {
-    d.busy = false; d.test = null;
+    d.test = null;
   }
 }
 
 export async function saveServer(d: Card) {
   if (d.busy) return;
+  d.busy = true;
+  try {
+    await save(d);
+  } finally {
+    d.busy = false;
+  }
+}
+
+async function save(d: Card) {
   const errs: Record<string, string> = {};
   d.code = d.code.trim(); d.host = d.host.trim();
   if (!/^[a-z0-9][a-z0-9-]*$/i.test(d.code)) errs.code = tr('Латиница, цифры и дефис');
@@ -108,7 +117,7 @@ export async function saveServer(d: Card) {
   }
   const login = !!d.pass || (!!was?.authPass && d.install);
   if (login && !(await firstLogin(d))) return;
-  if (dlg.value?.data !== d) return; // the card was closed while logging in
+  if (!dlgOf(d)) return; // the card was closed while logging in
   const authPass = !d.install && (!!d.pass || !!was?.authPass);
   const fields: Omit<Server, 'id'> = {
     code: d.code, group: d.group.trim() || tr('Без группы'), description: d.desc.trim(), host: d.host, port: +d.port,
@@ -138,8 +147,10 @@ export async function saveServer(d: Card) {
   }
   if (was?.authPass && (!authPass || wasUser !== d.defUser)) await backend.secretDelete(id, wasUser).catch(() => undefined);
   d.pass = '';
+  // Past the keychain the save goes through even if the card was closed meanwhile; only the card
+  // itself is closed, never a dialog that opened above it.
   await saveServers();
-  closeDlg(true);
+  closeDlg(true, dlgOf(d));
 }
 
 export async function deleteServer(id: ServerId) {

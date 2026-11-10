@@ -85,9 +85,21 @@ fn methods_text(m: &MethodSet) -> String {
     m.iter().map(<&str>::from).collect::<Vec<_>>().join(", ")
 }
 
+/// russh answers a login request on a connection that has ended with an empty failure, not an
+/// error: that is a closed connection, not a refusal.
+fn ended(h: &Handle<Client>, res: Result<AuthResult>) -> Result<AuthResult> {
+    match res {
+        Ok(AuthResult::Failure { remaining_methods, partial_success: false }) if remaining_methods.is_empty() && h.is_closed() => {
+            Err(Error::Disconnected)
+        }
+        r => r,
+    }
+}
+
 /// Asks the server which methods it takes; a server with `none` lets us in right away.
 async fn methods(h: &mut Handle<Client>, user: &str) -> Result<Option<MethodSet>> {
-    match h.authenticate_none(user).await? {
+    let res = h.authenticate_none(user).await?;
+    match ended(h, Ok(res))? {
         AuthResult::Success => Ok(None),
         AuthResult::Failure { remaining_methods, .. } => Ok(Some(remaining_methods)),
     }
@@ -119,7 +131,12 @@ async fn password(ssh: &Ssh, h: &mut Handle<Client>, who: &Who<'_>, pass: &Zeroi
     // the server counts (fail2ban).
     if offered.contains(&MethodKind::Password) {
         let row = ssh.log.run(who.code, "AUTH", format!("password · {}", who.user));
-        return match h.authenticate_password(who.user, pass.as_str()).await? {
+        let res = h.authenticate_password(who.user, pass.as_str()).await?;
+        let res = ended(h, Ok(res));
+        if res.is_err() {
+            ssh.log.done(row, "соединение закрыто", State::Err);
+        }
+        return match res? {
             AuthResult::Success => {
                 ssh.log.done(row, "", State::Ok);
                 Ok(())
@@ -226,6 +243,7 @@ async fn with_agent(ssh: &Ssh, h: &mut Handle<Client>, who: &Who<'_>, a: &mut At
         russh::AgentAuthError::Send(_) => key_error(russh::Error::SendError, who, a),
         russh::AgentAuthError::Key(e) => Error::ssh(format!("agent: {e}")),
     });
+    let res = ended(h, res).map_err(|e| if matches!(e, Error::Disconnected) { key_error(russh::Error::Disconnect, who, a) } else { e });
     finish(ssh, row, res)
 }
 
@@ -235,7 +253,11 @@ async fn with_key(ssh: &Ssh, h: &mut Handle<Client>, who: &Who<'_>, a: &mut Atte
     let hash = public.algorithm().is_rsa().then_some(a.rsa).flatten();
     a.tried.push(public);
     let res = h.authenticate_publickey(who.user, PrivateKeyWithHashAlg::new(key, hash)).await;
-    finish(ssh, row, res.map_err(|e| key_error(e, who, a)))
+    let res = match res {
+        Ok(r) => ended(h, Ok(r)).map_err(|_| key_error(russh::Error::Disconnect, who, a)),
+        Err(e) => Err(key_error(e, who, a)),
+    };
+    finish(ssh, row, res)
 }
 
 fn finish(ssh: &Ssh, row: u64, res: Result<AuthResult>) -> Result<bool> {
@@ -263,6 +285,7 @@ async fn keys_login(ssh: &Ssh, h: &mut Handle<Client>, who: &Who<'_>, src: &KeyS
     let rsa = h.best_supported_rsa_hash().await?.flatten();
     let mut a = Attempt { rsa, tried: Vec::new() };
     let mut agent = keys::agent().await;
+    let running = agent.is_some();
     let in_agent = listed(&mut agent).await;
     let fail = || Error::AuthKey { user: who.user.into(), server: who.code.into() };
 
@@ -274,6 +297,8 @@ async fn keys_login(ssh: &Ssh, h: &mut Handle<Client>, who: &Who<'_>, src: &KeyS
                         return Ok(());
                     }
                 }
+            } else if running {
+                ssh.log.err(who.code, "KEY", "Агент OpenSSH не ответил", "нет ответа за 10 с");
             } else {
                 ssh.log.ok(who.code, "KEY", "Агент OpenSSH не запущен");
             }

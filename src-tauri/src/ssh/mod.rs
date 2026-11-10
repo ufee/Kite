@@ -495,9 +495,11 @@ impl Ssh {
             Ok(()) => Ok(Shaken { handle, seen, dropped }),
             Err(e) => {
                 // A passphrase dialog took longer than LoginGraceTime: the key is open now,
-                // try once more. A password is never sent twice.
+                // try once more. A password is never sent twice. `is_closed` covers the moment
+                // between russh closing its queue and reporting the disconnect. After MaxAuthTries
+                // this resends the keys once: bounded, and only when the login waited for the user.
                 let retry = shake.waited.load(Ordering::Relaxed)
-                    && *dropped.borrow()
+                    && (*dropped.borrow() || handle.is_closed())
                     && matches!(method, Method::Keys(_))
                     && matches!(e, Error::Disconnected | Error::AuthKey { .. });
                 let _ = handle.disconnect(Disconnect::ByApplication, "", "en").await;
