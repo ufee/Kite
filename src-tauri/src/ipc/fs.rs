@@ -69,6 +69,10 @@ async fn logged<T>(log: &Log, p: &Place, text: String, work: impl Future<Output 
         Ok(v) => log.done(id, note(v), Row::Ok),
         Err(e) => log.done(id, e.to_string(), Row::Err),
     }
+    // The channel is gone but the connection may look alive: drop it, the reconnect follows.
+    if let (Err(Error::Disconnected), Place::Server(s)) = (&res, p) {
+        s.sftp_lost().await;
+    }
     res
 }
 

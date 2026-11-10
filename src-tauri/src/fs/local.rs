@@ -71,6 +71,11 @@ pub fn normalize(raw: &str, home: &str, base: Option<&str>) -> Result<String> {
         let b = s.as_bytes();
         (b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b.len() == 2 || b[2] == b'\\')).then(|| b[0].to_ascii_uppercase() as char)
     };
+    // Network shares and drive-relative `C:name` are not supported: refuse instead of guessing.
+    let b = p.as_bytes();
+    if p.starts_with("\\\\") || (b.len() > 2 && b[1] == b':' && drive(&p).is_none()) {
+        return Err(Error::BadPath);
+    }
     if drive(&p).is_none() {
         match base {
             // `\folder` is the root of the base's drive
@@ -178,6 +183,8 @@ mod tests {
         assert!(matches!(normalize("folder", home, None), Err(Error::BadPath)));
         assert!(matches!(normalize("  ", home, None), Err(Error::BadPath)));
         assert!(matches!(normalize("cc:", home, None), Err(Error::BadPath)));
+        assert!(matches!(normalize(r"\\nas\share", home, Some(r"E:\www")), Err(Error::BadPath)));
+        assert!(matches!(normalize("c:logs", home, Some(r"E:\www")), Err(Error::BadPath)));
     }
 
     #[test]

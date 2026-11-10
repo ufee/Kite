@@ -191,7 +191,8 @@ export async function go(i: number, raw: string, push = true, quiet = false): Pr
   const nav = ++p.nav, src = p.src, user = p.user;
   let path: string, list: Entry[];
   try {
-    path = await backend.fsResolve(src, user, raw);
+    // A relative path is taken from the folder on screen.
+    path = await backend.fsResolve(src, user, raw, p.path || undefined);
     list = await backend.fsList(src, user, path);
   } catch (e) {
     if (p.nav !== nav) return false;
@@ -368,7 +369,7 @@ export function destBlocked(d: Record<string, any>) {
   return '';
 }
 export async function destGo(d: Record<string, any>, raw: string) {
-  try { d.path = await backend.fsResolve(d.src, d.user, raw); } catch (e) { d.err = errOf(e).title; return; }
+  try { d.path = await backend.fsResolve(d.src, d.user, raw, d.path || undefined); } catch (e) { d.err = errOf(e).title; return; }
   d.input = d.path; d.err = '';
   destList(d);
 }
@@ -467,7 +468,8 @@ export async function removeSel(i: number) {
 export function openChmod(i: number) {
   const p = panes[i], list = selEntries(i);
   if (isLocal(p.src) || !list.length) return;
-  const e = list[0], bits = [0, 1, 2].map(g => [0, 1, 2].map(b => e.perm[g * 3 + b] !== '-'));
+  // `S` and `T` are setuid/setgid/sticky without x: the execute box stays off.
+  const e = list[0], bits = [0, 1, 2].map(g => [0, 1, 2].map(b => !/[-ST]/.test(e.perm[g * 3 + b] ?? '-')));
   ask('chmod', { i, names: list.map(x => x.name), bits, owner: e.owner, group: e.group, owner0: e.owner, group0: e.group, recursive: false, hasDir: list.some(x => x.dir) });
 }
 export const octal = (bits: boolean[][]) => bits.map(g => (g[0] ? 4 : 0) + (g[1] ? 2 : 0) + (g[2] ? 1 : 0)).join('');
@@ -479,9 +481,16 @@ export async function applyChmod(d: Record<string, any>) {
   const p = panes[d.i];
   // Owner and group change only when edited: the dialog shows the first file's, others may differ.
   const owner = d.owner.trim() !== d.owner0 ? d.owner.trim() : '', group = d.group.trim() !== d.group0 ? d.group.trim() : '';
+  if (d.busy) return;
+  d.busy = true;
   try {
     await backend.fsChmod(p.src, p.user, d.names.map((n: string) => childOf(p.src, p.path, n)), parseInt(octal(d.bits), 8), owner, group, d.recursive);
-  } catch (e) { toast(errOf(e).title, 'bad'); return; }
+  } catch (e) {
+    // Part of the tree may have changed before the error.
+    toast(errOf(e).title, 'bad');
+    reload(d.i);
+    return;
+  } finally { d.busy = false; }
   toast(tr('Права {m} · {o}', { m: octal(d.bits), o: `${d.owner}:${d.group}` }) + (d.recursive ? tr(' · рекурсивно') : ''), 'ok');
   closeDlg(true);
   reload(d.i);

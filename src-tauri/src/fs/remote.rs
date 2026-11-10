@@ -132,24 +132,27 @@ pub async fn rename(s: &Session, from: &str, to: &str) -> Result<()> {
     }
 }
 
-/// Runs the futures `n` at a time, results in order; stops at the first error. The futures are
-/// built before the stream: a lazy `map` inside it trips the Send check of Tauri commands.
+/// Runs the futures `n` at a time, results in order, the first error wins. Every future runs to
+/// its end even after an error: one dropped halfway may leave a handle open on the server.
+/// The futures are built before the stream: a lazy `map` inside it trips the Send check of Tauri commands.
 async fn ordered<T, F: Future<Output = Result<T>>>(futs: Vec<F>, n: usize) -> Result<Vec<T>> {
-    let mut s = stream::iter(futs).buffered(n);
-    let mut out = Vec::new();
-    while let Some(r) = s.next().await {
-        out.push(r?);
-    }
-    Ok(out)
+    let all: Vec<Result<T>> = stream::iter(futs).buffered(n).collect().await;
+    all.into_iter().collect()
 }
 
-/// Like `ordered`, for results nobody needs, in any order.
+/// For results nobody needs, in any order; stops at the first error.
 async fn each<T, F: Future<Output = Result<T>>>(futs: Vec<F>) -> Result<()> {
     let mut s = stream::iter(futs).buffer_unordered(IN_FLIGHT);
     while let Some(r) = s.next().await {
         r?;
     }
     Ok(())
+}
+
+/// Like `each`, but goes through all of them, as `chmod -R` does; returns the first error.
+async fn all_of<T, F: Future<Output = Result<T>>>(futs: Vec<F>) -> Result<()> {
+    let all: Vec<Result<T>> = stream::iter(futs).buffer_unordered(IN_FLIGHT).collect().await;
+    all.into_iter().find(|r| r.is_err()).map_or(Ok(()), |r| r.map(|_| ()))
 }
 
 struct Node {
@@ -159,22 +162,40 @@ struct Node {
 }
 
 /// Everything under `root`, parents before children. Links are entries, never followed.
-async fn walk(sftp: &RawSftpSession, root: &str) -> Result<Vec<Node>> {
+/// Some servers (not OpenSSH) fill READDIR attributes from stat(), so a link to a folder looks like
+/// a folder there: a folder is checked with lstat before going in. With `every`, all entries are,
+/// for callers that would act through a link to a file.
+async fn walk(sftp: &RawSftpSession, root: &str, every: bool) -> Result<Vec<Node>> {
     let mut out = Vec::new();
     let mut level = vec![root.to_owned()];
     let mut depth = 1;
     while !level.is_empty() {
         let reads: Vec<_> = level.iter().map(|d| async move { read_dir(sftp, d).await.map(|l| (d.clone(), l)) }).collect();
-        let lists = ordered(reads, DIRS_IN_FLIGHT).await?;
-        let mut next = Vec::new();
-        for (dir, files) in lists {
-            for f in files {
-                let path = join(&dir, &f.filename);
-                if f.attrs.is_dir() && !f.attrs.is_symlink() {
-                    next.push(path.clone());
+        let found: Vec<(String, FileAttributes)> = ordered(reads, DIRS_IN_FLIGHT)
+            .await?
+            .into_iter()
+            .flat_map(|(dir, files)| files.into_iter().map(move |f| (join(&dir, &f.filename), f.attrs)))
+            .collect();
+        let checks: Vec<_> = found
+            .iter()
+            .map(|(path, attrs)| {
+                let check = every || (attrs.is_dir() && !attrs.is_symlink());
+                async move {
+                    if !check {
+                        return Ok(None);
+                    }
+                    sftp.lstat(path.as_str()).await.map(|a| Some(a.attrs)).map_err(|e| fs_error(e, path))
                 }
-                out.push(Node { path, attrs: f.attrs, depth });
+            })
+            .collect();
+        let own = ordered(checks, IN_FLIGHT).await?;
+        let mut next = Vec::new();
+        for ((path, listed), own) in found.into_iter().zip(own) {
+            let attrs = own.unwrap_or(listed);
+            if attrs.is_dir() && !attrs.is_symlink() {
+                next.push(path.clone());
             }
+            out.push(Node { path, attrs, depth });
         }
         level = next;
         depth += 1;
@@ -190,7 +211,8 @@ pub async fn delete(s: &Session, path: &str) -> Result<usize> {
         sftp.remove(path).await.map_err(|e| fs_error(e, path))?;
         return Ok(1);
     }
-    let tree = walk(sftp, path).await?;
+    // unlink and rmdir never follow links, so only folders need the lstat check.
+    let tree = walk(sftp, path, false).await?;
     let (dirs, files): (Vec<&Node>, Vec<&Node>) = tree.iter().partition(|n| n.attrs.is_dir() && !n.attrs.is_symlink());
     each(files.iter().map(|n| async move { sftp.remove(n.path.as_str()).await.map_err(|e| fs_error(e, &n.path)) }).collect()).await?;
     // Deepest folders first; folders of one depth go together.
@@ -218,7 +240,13 @@ async fn exec(s: &Session, cmd: &str) -> Result<std::result::Result<(), String>>
     let (mut out, mut err) = (Vec::new(), Vec::new());
     while let Some(m) = ch.wait().await {
         match m {
-            ChannelMsg::Data { data } if out.len() < 4096 => out.extend_from_slice(&data),
+            // Only the tail of stdout matters: a chatty login shell must not push the marker out.
+            ChannelMsg::Data { data } => {
+                out.extend_from_slice(&data);
+                if out.len() > 8192 {
+                    out.drain(..out.len() - 4096);
+                }
+            }
             ChannelMsg::ExtendedData { data, .. } if err.len() < 4096 => err.extend_from_slice(&data),
             ChannelMsg::Failure => return Err(Error::NoExec),
             ChannelMsg::Close => break,
@@ -259,38 +287,69 @@ async fn chown(s: &Session, paths: &[String], owner: &str, group: &str, recursiv
     }
 }
 
+struct Target {
+    path: String,
+    old: u32,
+    dir: bool,
+    depth: usize,
+}
+
 /// Permission bits 0o777 for every path, and with `recursive` for everything under the folders.
 /// setuid, setgid and sticky stay as they were. Owner and group change through `chown` when given.
 pub async fn chmod(s: &Session, paths: &[String], mode: u32, owner: &str, group: &str, recursive: bool) -> Result<usize> {
     let sftp = &s.sftp;
     // Modes before chown: a chown by a non-root user clears setuid and setgid.
-    let mut targets: Vec<(String, u32)> = Vec::new();
+    let mut targets: Vec<Target> = Vec::new();
+    let (mut links, mut plain) = (Vec::new(), Vec::new());
     for p in paths {
         let own = sftp.lstat(p.as_str()).await.map_err(|e| fs_error(e, p))?.attrs;
         // A link on the list changes its target, as chmod does; its tree is not walked.
         let attrs = if own.is_symlink() { sftp.stat(p.as_str()).await.map_err(|e| fs_error(e, p))?.attrs } else { own.clone() };
-        targets.push((p.clone(), attrs.permissions.unwrap_or(0)));
+        targets.push(Target { path: p.clone(), old: attrs.permissions.unwrap_or(0), dir: attrs.is_dir(), depth: 0 });
+        if own.is_symlink() {
+            links.push(p.clone());
+        } else {
+            plain.push(p.clone());
+        }
         if recursive && own.is_dir() && !own.is_symlink() {
-            for n in walk(sftp, p).await? {
+            for n in walk(sftp, p, true).await? {
                 // A link's own mode means nothing, and setstat would follow it out of the tree.
                 if !n.attrs.is_symlink() {
-                    targets.push((n.path, n.attrs.permissions.unwrap_or(0)));
+                    targets.push(Target { old: n.attrs.permissions.unwrap_or(0), dir: n.attrs.is_dir(), depth: n.depth, path: n.path });
                 }
             }
         }
     }
+    let mut owned = Ok(());
     if !owner.is_empty() || !group.is_empty() {
-        chown(s, paths, owner, group, recursive).await?;
+        // Links go without -R: `chown -R` would change the link itself, chmod changes its target.
+        for (list, deep) in [(&plain, recursive), (&links, false)] {
+            if !list.is_empty() && owned.is_ok() {
+                owned = chown(s, list, owner, group, deep).await;
+            }
+        }
     }
-    let sets: Vec<_> = targets
-        .iter()
-        .map(|(p, old)| async move {
-            let attrs = FileAttributes { permissions: Some((old & 0o7000) | (mode & 0o777)), ..FileAttributes::empty() };
-            sftp.setstat(p.as_str(), attrs).await.map_err(|e| fs_error(e, p))
-        })
-        .collect();
-    each(sets).await?;
+    // Modes go on even after a failed chown: what it did change keeps its special bits.
+    let set = set_modes(sftp, &targets, mode).await;
+    owned?;
+    set?;
     Ok(targets.len())
+}
+
+/// Files first, then folders deepest first: a folder that loses its x must come after its children.
+async fn set_modes(sftp: &RawSftpSession, targets: &[Target], mode: u32) -> Result<()> {
+    let set = |t: &Target| {
+        let attrs = FileAttributes { permissions: Some((t.old & 0o7000) | (mode & 0o777)), ..FileAttributes::empty() };
+        let path = t.path.clone();
+        async move { sftp.setstat(path.as_str(), attrs).await.map_err(|e| fs_error(e, &path)) }
+    };
+    let mut first = all_of(targets.iter().filter(|t| !t.dir).map(&set).collect()).await;
+    let deepest = targets.iter().filter(|t| t.dir).map(|t| t.depth).max().unwrap_or(0);
+    for depth in (0..=deepest).rev() {
+        let r = all_of(targets.iter().filter(|t| t.dir && t.depth == depth).map(&set).collect()).await;
+        first = first.and(r);
+    }
+    first
 }
 
 /// A file for the viewer: up to 10 MB, read with pipelined chunks.

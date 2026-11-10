@@ -27,6 +27,6 @@ const ROWS = ['Владелец', 'Группа', 'Остальные'];
       </div>
       <label v-if="d.hasDir" class="chk"><input v-model="d.recursive" type="checkbox" class="cb">{{ tr('Применить к вложенным') }}</label>
     </div>
-    <div class="dlg-f"><div class="grow"></div><button class="btn ghost" @click="closeDlg(null)">{{ tr('Отмена') }}</button><button class="btn pri" @click="applyChmod(d)">{{ tr('Применить') }}</button></div>
+    <div class="dlg-f"><div class="grow"></div><button class="btn ghost" @click="closeDlg(null)">{{ tr('Отмена') }}</button><button class="btn pri" :disabled="d.busy" @click="applyChmod(d)">{{ tr('Применить') }}</button></div>
   </div>
 </template>

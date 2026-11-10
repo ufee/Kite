@@ -241,6 +241,14 @@ impl Session {
         self.handle.is_closed()
     }
 
+    /// The SFTP channel died under a live connection (sftp-server killed): the connection is dropped
+    /// on purpose, so the reconnect brings both back instead of every operation failing.
+    pub async fn sftp_lost(&self) {
+        if !self.is_closed() {
+            let _ = self.handle.disconnect(Disconnect::ByApplication, "sftp channel lost", "en").await;
+        }
+    }
+
     async fn close(&self) {
         self.closing.store(true, Ordering::Relaxed);
         let _ = self.handle.disconnect(Disconnect::ByApplication, "", "en").await;
