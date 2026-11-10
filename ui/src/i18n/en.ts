@@ -12,7 +12,7 @@ export const EN: Record<string, string> = {
   'Вид': 'View', 'Только файлы': 'Files only', 'Файлы и терминал': 'Files and terminal', 'Только терминал': 'Terminal only',
   'Светлая тема': 'Light theme', 'Тёмная тема': 'Dark theme',
   'Свернуть': 'Minimize', 'Развернуть': 'Maximize', 'Закрыть': 'Close',
-  'Серверы': 'Servers', 'Сортировка и группы': 'Sort and groups', 'Новый сервер': 'New server', 'Добавить': 'Add',
+  'Серверы': 'Servers', 'Сервер': 'Server', 'Добавить сервер': 'Add server', 'Серверов пока нет': 'No servers yet', 'Добавь первый, чтобы подключиться': 'Add the first one to connect', 'Сортировка и группы': 'Sort and groups', 'Новый сервер': 'New server',
   'Этот ПК': 'This PC', 'ПК': 'PC', 'Ctrl+щелчок: в другой панели': 'Ctrl+click: open in the other pane',
   'Развернуть группу': 'Expand group', 'Свернуть группу': 'Collapse group',
   'Подключено: {n}': 'Connected: {n}', 'Терминал': 'Terminal', 'Ничего не найдено': 'Nothing found',
