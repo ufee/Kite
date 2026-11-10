@@ -170,10 +170,42 @@ async fn each<T, F: Future<Output = Result<T>>>(futs: Vec<F>) -> Result<()> {
     Ok(())
 }
 
-/// Like `each`, but goes through all of them, as `chmod -R` does; returns the first error.
+/// Like `each`, but goes on past refused items, as `chmod -R` does, and returns the first error.
+/// A lost connection stops it: nothing after that can succeed.
 async fn all_of<T, F: Future<Output = Result<T>>>(futs: Vec<F>) -> Result<()> {
-    let all: Vec<Result<T>> = stream::iter(futs).buffer_unordered(IN_FLIGHT).collect().await;
-    all.into_iter().find(|r| r.is_err()).map_or(Ok(()), |r| r.map(|_| ()))
+    let lost = AtomicBool::new(false);
+    let mut s = stream::iter(futs).take_while(|_| future::ready(!lost.load(Ordering::Relaxed))).buffer_unordered(IN_FLIGHT);
+    let mut first = None;
+    while let Some(r) = s.next().await {
+        if let Err(e) = r {
+            if matches!(e, Error::Disconnected) {
+                lost.store(true, Ordering::Relaxed);
+            }
+            first.get_or_insert(e);
+        }
+    }
+    first.map_or(Ok(()), Err)
+}
+
+/// Results in order. Without `skip` the first error stops it (see `ordered`). With `skip` a failed
+/// item is left out (None) and its error kept in `err` for the end; a lost connection still stops it.
+async fn gather<T, F: Future<Output = Result<T>>>(futs: Vec<F>, n: usize, skip: bool, err: &mut Option<Error>) -> Result<Vec<Option<T>>> {
+    if !skip {
+        return Ok(ordered(futs, n).await?.into_iter().map(Some).collect());
+    }
+    let all: Vec<Result<T>> = stream::iter(futs).buffered(n).collect().await;
+    let mut out = Vec::with_capacity(all.len());
+    for r in all {
+        match r {
+            Ok(v) => out.push(Some(v)),
+            Err(Error::Disconnected) => return Err(Error::Disconnected),
+            Err(e) => {
+                err.get_or_insert(e);
+                out.push(None);
+            }
+        }
+    }
+    Ok(out)
 }
 
 struct Node {
@@ -186,15 +218,19 @@ struct Node {
 /// followed. Some servers (not OpenSSH) fill READDIR attributes from stat(), so a link to a folder
 /// looks like a folder there: a folder is checked with lstat before going in. With `every`, all
 /// entries are, for callers that would act through a link to a file.
+/// With `skip`, a folder that cannot be read is left out and the walk goes on; the first such error
+/// is kept in `err`.
 struct Walker {
     level: Vec<String>,
     depth: usize,
     every: bool,
+    skip: bool,
+    err: Option<Error>,
 }
 
 impl Walker {
-    fn new(root: &str, every: bool) -> Self {
-        Self { level: vec![root.to_owned()], depth: 1, every }
+    fn new(root: &str, every: bool, skip: bool) -> Self {
+        Self { level: vec![root.to_owned()], depth: 1, every, skip, err: None }
     }
 
     /// The next level; the folders in it are read on the following call, so a caller may change
@@ -204,9 +240,10 @@ impl Walker {
             return Ok(None);
         }
         let reads: Vec<_> = self.level.iter().map(|d| async move { read_dir(sftp, d).await.map(|l| (d.clone(), l)) }).collect();
-        let found: Vec<(String, FileAttributes)> = ordered(reads, DIRS_IN_FLIGHT)
+        let found: Vec<(String, FileAttributes)> = gather(reads, DIRS_IN_FLIGHT, self.skip, &mut self.err)
             .await?
             .into_iter()
+            .flatten()
             .flat_map(|(dir, files)| files.into_iter().map(move |f| (join(&dir, &f.filename), f.attrs)))
             .collect();
         let every = self.every;
@@ -222,9 +259,11 @@ impl Walker {
                 }
             })
             .collect();
-        let own = ordered(checks, IN_FLIGHT).await?;
+        let own = gather(checks, IN_FLIGHT, self.skip, &mut self.err).await?;
         let (mut next, mut nodes) = (Vec::new(), Vec::new());
         for ((path, listed), own) in found.into_iter().zip(own) {
+            // An entry whose lstat failed is not known well enough to act on.
+            let Some(own) = own else { continue };
             let attrs = own.unwrap_or(listed);
             if is_folder(&attrs) {
                 next.push(path.clone());
@@ -241,13 +280,14 @@ fn is_folder(a: &FileAttributes) -> bool {
     a.is_dir() && !a.is_symlink()
 }
 
-/// Everything under `root`, parents before children.
-async fn walk(sftp: &RawSftpSession, root: &str, every: bool) -> Result<Vec<Node>> {
-    let (mut w, mut out) = (Walker::new(root, every), Vec::new());
+/// Everything under `root`, parents before children, and with `skip` the first folder that could
+/// not be read.
+async fn walk(sftp: &RawSftpSession, root: &str, every: bool, skip: bool) -> Result<(Vec<Node>, Option<Error>)> {
+    let (mut w, mut out) = (Walker::new(root, every, skip), Vec::new());
     while let Some(level) = w.next(sftp).await? {
         out.extend(level);
     }
-    Ok(out)
+    Ok((out, w.err))
 }
 
 /// Deletes a file, a link or a whole folder; returns how many names went away.
@@ -259,7 +299,7 @@ pub async fn delete(s: &Session, path: &str) -> Result<usize> {
         return Ok(1);
     }
     // unlink and rmdir never follow links, so only folders need the lstat check.
-    let tree = walk(sftp, path, false).await?;
+    let (tree, _) = walk(sftp, path, false, false).await?;
     let (dirs, files): (Vec<&Node>, Vec<&Node>) = tree.iter().partition(|n| n.attrs.is_dir() && !n.attrs.is_symlink());
     each(files.iter().map(|n| async move { sftp.remove(n.path.as_str()).await.map_err(|e| fs_error(e, &n.path)) }).collect()).await?;
     // Deepest folders first; folders of one depth go together.
@@ -342,8 +382,9 @@ async fn chown_run(s: &Session, head: &str, paths: &[&String]) -> Result<()> {
     match exec(s, &cmd).await? {
         Ok(()) => Ok(()),
         Err(text) if text.contains("Operation not permitted") || text.contains("Permission denied") => {
-            // chown names the path it failed on: `chown: changing ownership of '/x': ...`.
-            let path = paths.iter().find(|p| text.contains(p.as_str())).or(paths.first()).map(|p| p.to_string()).unwrap_or_default();
+            // chown names the path it failed on, quoted: `chown: changing ownership of '/x': ...`.
+            let quoted = |p: &&&String| text.contains(&format!("'{p}'")) || text.contains(&format!("‘{p}’"));
+            let path = paths.iter().find(quoted).or(paths.first()).map(|p| p.to_string()).unwrap_or_default();
             Err(Error::Eacces { path })
         }
         Err(text) => Err(Error::Einval { reason: text.lines().next().unwrap_or_default().to_owned() }),
@@ -414,30 +455,46 @@ pub async fn chmod(s: &Session, paths: &[String], mode: Option<u32>, owner: &str
 }
 
 /// Sets the mode on the roots and the trees under `trees`. Goes through everything, as `chmod -R`
-/// does: the outer error is a walk that could not go on, the inner one the first refused change.
+/// does: a folder it cannot read or a change refused is skipped and the first such error returned
+/// after the pass (the inner result); the outer error is a lost connection.
 /// A mode that lets the owner into folders goes top-down, so folders without x open before they are
 /// read; any other mode goes bottom-up, so a folder loses its x after its children are done.
 async fn set_tree(sftp: &RawSftpSession, roots: Vec<Target>, trees: &[String], mode: u32) -> Result<(usize, Result<()>)> {
+    // A link's own mode means nothing, and setstat would follow it out of the tree.
+    let targets = |level: &[Node]| -> Vec<Target> {
+        level.iter().filter(|n| !n.attrs.is_symlink()).map(|n| Target::of(n.path.clone(), &n.attrs, n.depth)).collect()
+    };
     let mut count = roots.len();
     if mode & 0o500 == 0o500 {
         let mut first = set_modes(sftp, &roots, mode).await;
         for t in trees {
-            let mut w = Walker::new(t, true);
+            let mut w = Walker::new(t, true, true);
             while let Some(level) = w.next(sftp).await? {
-                let level: Vec<Target> = level.iter().filter(|n| !n.attrs.is_symlink()).map(|n| Target::of(n.path.clone(), &n.attrs, n.depth)).collect();
+                let level = targets(&level);
                 count += level.len();
                 first = first.and(set_modes(sftp, &level, mode).await);
             }
+            first = first.and(w.err.map_or(Ok(()), Err));
         }
-        return Ok((count, first));
+        return Ok((count, lost(first)?));
     }
-    let mut all = roots;
+    let (mut all, mut first) = (roots, Ok(()));
     for t in trees {
-        // A link's own mode means nothing, and setstat would follow it out of the tree.
-        all.extend(walk(sftp, t, true).await?.iter().filter(|n| !n.attrs.is_symlink()).map(|n| Target::of(n.path.clone(), &n.attrs, n.depth)));
+        let (tree, err) = walk(sftp, t, true, true).await?;
+        all.extend(targets(&tree));
+        first = first.and(err.map_or(Ok(()), Err));
     }
     count = all.len();
-    Ok((count, set_modes(sftp, &all, mode).await))
+    let first = set_modes(sftp, &all, mode).await.and(first);
+    Ok((count, lost(first)?))
+}
+
+/// A lost connection is the outer error: nothing after it ran.
+fn lost(r: Result<()>) -> Result<Result<()>> {
+    match r {
+        Err(Error::Disconnected) => Err(Error::Disconnected),
+        r => Ok(r),
+    }
 }
 
 /// Files first, then folders deepest first: a folder that loses its x must come after its children.

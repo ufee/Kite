@@ -476,20 +476,26 @@ export function openChmod(i: number) {
   // Paths are fixed now: the pane may move on while the dialog is open.
   ask('chmod', {
     i, src: p.src, user: p.user, paths: list.map(x => childOf(p.src, p.path, x.name)), names: list.map(x => x.name),
-    bits, mode0: octal(bits), owner: e.owner, group: e.group, owner0: e.owner, group0: e.group, recursive: false, hasDir: list.some(x => x.dir),
+    bits, owner: e.owner, group: e.group, modeT: false, ownerT: false, groupT: false, recursive: false, hasDir: list.some(x => x.dir),
   });
 }
 export const octal = (bits: boolean[][]) => bits.map(g => (g[0] ? 4 : 0) + (g[1] ? 2 : 0) + (g[2] ? 1 : 0)).join('');
 export function setOctal(d: Record<string, any>, v: string) {
   if (!/^[0-7]{3}$/.test(v)) return;
   d.bits = [...v].map(c => [+c & 4, +c & 2, +c & 1].map(Boolean));
+  d.modeT = true;
+}
+// Only what the user touched goes out. The dialog shows the first object's mode and owner, so with
+// several objects or a tree an untouched mode is still sent: the intent is to align them to it.
+export function chmodPlan(d: Record<string, any>) {
+  const owner = d.ownerT ? d.owner.trim() : '', group = d.groupT ? d.group.trim() : '';
+  const spread = d.recursive || d.paths.length > 1;
+  const mode = d.modeT || (spread && !d.ownerT && !d.groupT) ? parseInt(octal(d.bits), 8) : null;
+  return { mode, owner, group, empty: mode === null && !owner && !group };
 }
 export async function applyChmod(d: Record<string, any>) {
-  // Mode, owner and group change only when edited: the dialog shows the first file's, others may differ.
-  const owner = d.owner.trim() !== d.owner0 ? d.owner.trim() : '', group = d.group.trim() !== d.group0 ? d.group.trim() : '';
-  const mode = octal(d.bits) !== d.mode0 ? parseInt(octal(d.bits), 8) : null;
-  if (mode === null && !owner && !group) { closeDlg(true); return; }
-  if (d.busy) return;
+  const { mode, owner, group, empty } = chmodPlan(d);
+  if (empty || d.busy) return;
   d.busy = true;
   try {
     await backend.fsChmod(d.src, d.user, d.paths, mode, owner, group, d.recursive);
@@ -499,7 +505,9 @@ export async function applyChmod(d: Record<string, any>) {
     reload(d.i);
     return;
   } finally { d.busy = false; }
-  toast(tr('Права {m} · {o}', { m: octal(d.bits), o: `${d.owner}:${d.group}` }) + (d.recursive ? tr(' · рекурсивно') : ''), 'ok');
+  const who = owner || group ? owner + (group ? `:${group}` : '') : '';
+  const what = [mode === null ? '' : octal(d.bits), who].filter(Boolean).join(' · ');
+  toast(tr('Права · {what}', { what }) + (d.recursive ? tr(' · рекурсивно') : ''), 'ok');
   closeDlg(true);
   reload(d.i);
 }

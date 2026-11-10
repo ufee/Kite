@@ -181,7 +181,7 @@ export const EN: Record<string, string> = {
   'нет прав на удаление для {u}': 'no delete access for {u}', 'Нет прав на удаление в {p} для {u}': 'No delete access to {p} for {u}',
   'В корзине: {what}': 'In Trash: {what}', 'Удалено: {what}': 'Deleted: {what}',
   'чужие файлы, нужен root (сейчас {u})': 'not your files, root required (now {u})', 'Права чужих файлов меняет только root (сейчас {u})': 'Only root can change these files (now {u})',
-  'Права {m} · {o}': 'Permissions {m} · {o}', ' · рекурсивно': ' · recursive', 'Путь скопирован': 'Path copied',
+  'Права · {what}': 'Permissions · {what}', ' · рекурсивно': ' · recursive', 'Путь скопирован': 'Path copied',
   'Это та же папка': 'Same folder', 'Нельзя поместить {n} в саму себя': "Can't put {n} inside itself", 'Всё уже на месте': 'Already there',
   'Нет прав на запись: {u} в {p}': 'No write access: {u} in {p}', 'Передано {ok} из {n}, ошибок: {bad}': 'Transferred {ok} of {n}, errors: {bad}',
   'Перемещено: {what} в {to}': 'Moved: {what} to {to}', 'Скопировано: {what} в {to}': 'Copied: {what} to {to}',

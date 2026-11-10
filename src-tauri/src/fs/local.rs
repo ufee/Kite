@@ -117,12 +117,33 @@ pub fn resolve(raw: &str, base: Option<&str>) -> Result<String> {
 }
 
 pub fn mkdir(path: &str) -> Result<()> {
+    check_name(path)?;
     fs::create_dir(path).map_err(|e| io_error(&e, path))
+}
+
+/// Names Win32 would quietly change or turn into a device: a trailing dot or space, `CON`, `NUL`,
+/// `COM1`… A file made under such a name through `\\?\` cannot be reached by normal paths later.
+#[cfg(windows)]
+fn check_name(path: &str) -> Result<()> {
+    let name = path.rsplit('\\').next().unwrap_or_default();
+    let stem = name.split('.').next().unwrap_or_default().trim_end().to_ascii_uppercase();
+    let numbered = |p: &str| stem.len() == 4 && stem.starts_with(p) && matches!(stem.as_bytes()[3], b'1'..=b'9');
+    let device = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL") || numbered("COM") || numbered("LPT");
+    if name.ends_with('.') || name.ends_with(' ') || device {
+        return Err(Error::Einval { reason: format!("{name}: not a valid name on Windows") });
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn check_name(_: &str) -> Result<()> {
+    Ok(())
 }
 
 /// Never replaces: `rename` on Windows would overwrite a file silently. Changing only the case
 /// of a name on Windows is the same file and is allowed.
 pub fn rename(from: &str, to: &str) -> Result<()> {
+    check_name(to)?;
     let same = cfg!(windows) && from.to_lowercase() == to.to_lowercase();
     if !same && fs::symlink_metadata(to).is_ok() {
         return Err(Error::Eexist { path: to.into() });
@@ -210,6 +231,12 @@ mod tests {
         assert!(matches!(normalize("cc:", home, None), Err(Error::BadPath)));
         assert!(matches!(normalize(r"\\nas\share", home, Some(r"E:\www")), Err(Error::BadPath)));
         assert!(matches!(normalize("c:logs", home, Some(r"E:\www")), Err(Error::BadPath)));
+        for bad in [r"C:\x\v1.", r"C:\x\a ", r"C:\x\nul", r"C:\x\Com1.txt", r"C:\x\LPT9"] {
+            assert!(matches!(check_name(bad), Err(Error::Einval { .. })), "{bad}");
+        }
+        for good in [r"C:\x\v1.txt", r"C:\x\console", r"C:\x\com10", r"C:\x\.env"] {
+            assert!(check_name(good).is_ok(), "{good}");
+        }
     }
 
     #[test]
