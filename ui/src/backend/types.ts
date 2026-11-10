@@ -1,0 +1,236 @@
+/**
+ * The only door from the UI to the core. `MockBackend` simulates the core in memory,
+ * `TauriBackend` (later stages) calls the Rust commands of the same names.
+ */
+
+/** Server id. Everything internal points to the id, never to the code, so renaming keeps all memory. */
+export type ServerId = string;
+/** A file source: this PC or a server (the user travels next to it). */
+export type Src = 'local' | ServerId;
+
+export interface ServerUser {
+  name: string;
+  /** 'auto' follows the server's key mode; otherwise a key file name from ~/.ssh */
+  key: string;
+}
+
+export interface Server {
+  id: ServerId;
+  code: string;
+  group: string;
+  description: string;
+  host: string;
+  port: number;
+  users: ServerUser[];
+  defaultUser: string;
+  keyMode: 'auto' | 'file';
+  keyFile: string;
+  /** Password-only server; the password itself lives in the OS keychain. */
+  authPass: boolean;
+  startDir: string;
+  keepalive: number;
+}
+
+export interface Entry {
+  name: string;
+  dir: boolean;
+  /** Symbolic link: shown with a mark, `dir` follows the target, a broken link is a file. */
+  link?: boolean;
+  size: number;
+  mtime: number;
+  /** rwx string without the type letter on servers, empty locally */
+  perm: string;
+  owner: string;
+  group: string;
+  hidden?: boolean;
+}
+
+export type ErrCode =
+  | 'ENOENT' | 'ENOTDIR' | 'EACCES' | 'EEXIST' | 'EINVAL'
+  | 'TIMEOUT' | 'AUTH_KEY' | 'AUTH_PASS' | 'NO_SECRET' | 'HOSTKEY_REJECTED' | 'CANCELLED' | 'DISCONNECTED';
+
+/** Every failure crossing the boundary. `title` and `text` are ready for the UI. */
+export interface BackendError {
+  code: ErrCode;
+  title: string;
+  text: string;
+}
+export const isBackendError = (e: unknown): e is BackendError =>
+  !!e && typeof e === 'object' && 'code' in e && 'title' in e;
+
+export type SessionState = 'wait' | 'live' | 'bad';
+
+export interface HostKeyRequest {
+  reqId: number;
+  mode: 'tofu' | 'changed';
+  server: ServerId;
+  code: string;
+  host: string;
+  port: number;
+  fp: string;
+  old?: string;
+}
+
+export interface LogRow {
+  id: number;
+  /** HH:MM:SS.mmm */
+  time: string;
+  src: string;
+  tag: string;
+  text: string;
+  note: string;
+  state: 'run' | 'ok' | 'err';
+}
+
+export interface AgentStatus {
+  running: boolean;
+  keys: string[];
+}
+
+export interface Endpoint {
+  src: Src | 'ext';
+  user: string;
+  path: string;
+}
+
+export type ConflictPolicy = 'replace' | 'both' | 'skip';
+export type TransferState = 'wait' | 'count' | 'run' | 'pause' | 'done' | 'err';
+
+export interface TransferItem {
+  id: number;
+  batch: number;
+  name: string;
+  /** Target name, differs from `name` with "keep both" */
+  tname: string;
+  dir: boolean;
+  size: number;
+  done: number;
+  speed: number;
+  from: Endpoint;
+  to: Endpoint;
+  move: boolean;
+  state: TransferState;
+  err: string;
+  /** Lack of rights on the target: the queue offers "as root" */
+  denied?: boolean;
+}
+
+export interface BatchReport {
+  batch: number;
+  move: boolean;
+  to: Src;
+  ok: number;
+  bad: number;
+  total: number;
+}
+
+export interface TextFile {
+  text: string;
+  binary: boolean;
+  tooBig: boolean;
+}
+
+export interface ServerDraft {
+  id: ServerId | null;
+  code: string;
+  host: string;
+  port: number;
+  user: string;
+  keyMode: 'auto' | 'file';
+  keyFile: string;
+  password: string;
+}
+
+export interface TestResult {
+  ok: boolean;
+  text: string;
+}
+
+export interface Unlisten { (): void }
+
+export interface Backend {
+  readonly kind: 'mock' | 'tauri';
+  readonly platform: 'windows' | 'linux';
+
+  // SSH
+  sshConnect(server: Server, user: string): Promise<void>;
+  sshDisconnect(server: ServerId, user?: string): Promise<void>;
+  sshTest(draft: ServerDraft): Promise<TestResult>;
+  hostkeyRespond(reqId: number, trust: boolean): void;
+  /** Logs in with a password before the server is saved; with `installKey` adds our key and checks key login. */
+  sshFirstLogin(draft: ServerDraft, installKey: boolean): Promise<void>;
+  /** Host key state for the card: fingerprint if trusted, null otherwise. */
+  hostkeyKnown(host: string, port: number): Promise<string | null>;
+  hostkeyForget(host: string, port: number): Promise<void>;
+  /** Setting strictHost: off skips the host key check, with a warning in the log. */
+  setStrictHost(on: boolean): void;
+
+  // Secrets and keys
+  secretSet(server: ServerId, user: string, password: string): Promise<void>;
+  secretDelete(server: ServerId, user: string): Promise<void>;
+  agentStatus(): Promise<AgentStatus>;
+  keysList(): Promise<string[]>;
+  pickKeyFile(): Promise<string | null>;
+
+  // Files
+  fsList(src: Src, user: string, path: string): Promise<Entry[]>;
+  /** Resolves a typed path; `base` enables relative paths. Rejects with ENOENT, ENOTDIR, EACCES. */
+  fsResolve(src: Src, user: string, raw: string, base?: string): Promise<string>;
+  fsHome(src: Src, user: string): Promise<string>;
+  fsMkdir(src: Src, user: string, path: string): Promise<void>;
+  fsRename(src: Src, user: string, from: string, to: string): Promise<void>;
+  fsDelete(src: Src, user: string, paths: string[]): Promise<void>;
+  fsTrash(paths: string[]): Promise<void>;
+  fsChmod(src: Src, user: string, paths: string[], mode: number, owner: string, group: string, recursive: boolean): Promise<void>;
+  fsReadText(src: Src, user: string, path: string): Promise<TextFile>;
+  fsDrives(): Promise<string[]>;
+
+  // Transfers
+  transferEnqueue(from: Endpoint, names: Entry[], to: Endpoint, move: boolean, policy: ConflictPolicy): Promise<number>;
+  transferPause(id: number): void;
+  transferResume(id: number): void;
+  transferCancel(id: number): void;
+  transferPauseAll(pause: boolean): void;
+  transferRetry(id: number, asRoot?: boolean): void;
+  transferClearDone(): void;
+  transferSetParallel(n: number): void;
+  transferKeepTime(keep: boolean): void;
+
+  // Editing in an external program
+  editOpen(src: Src, user: string, path: string, editor: string, autosave: boolean): Promise<void>;
+  editUpload(src: Src, user: string, path: string): Promise<void>;
+
+  // Terminal: bytes go through `onData`, not through events
+  ptyOpen(src: Src, user: string, cwd: string, cols: number, rows: number, onData: (data: string) => void): Promise<number>;
+  ptyWrite(id: number, data: string): void;
+  ptyResize(id: number, cols: number, rows: number): void;
+  ptyClose(id: number): void;
+
+  // State the core already holds (after a UI reload), fetched once after subscribing
+  sshSessions(): Promise<{ server: ServerId; user: string; state: SessionState }[]>;
+  transferList(): Promise<TransferItem[]>;
+  logTail(): Promise<LogRow[]>;
+
+  // Events
+  onSshStatus(cb: (server: ServerId, user: string, state: SessionState | null) => void): Unlisten;
+  onHostkey(cb: (req: HostKeyRequest) => void): Unlisten;
+  onTransferState(cb: (items: TransferItem[]) => void): Unlisten;
+  onTransferBatch(cb: (r: BatchReport) => void): Unlisten;
+  onPtyExit(cb: (id: number, reason: string) => void): Unlisten;
+  /** A watched file was saved in the editor; `uploaded` is true when autosave already sent it. */
+  onEditChanged(cb: (src: Src, user: string, path: string, uploaded: boolean) => void): Unlisten;
+  onLogRow(cb: (row: LogRow) => void): Unlisten;
+  onLogUpdate(cb: (row: LogRow) => void): Unlisten;
+  /** Folder contents changed by the core (transfer finished, move removed a source). */
+  onFsChanged(cb: (src: Src, path: string) => void): Unlisten;
+
+  // Server list: the core owns the config file, the UI edits a copy and saves it whole
+  serversLoad(): Promise<ServerConfig>;
+  serversSave(cfg: ServerConfig): Promise<void>;
+}
+
+export interface ServerConfig {
+  servers: Server[];
+  /** Group order in the sidebar */
+  groups: string[];
+}

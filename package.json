@@ -1,0 +1,16 @@
+{
+  "name": "kite",
+  "private": true,
+  "type": "module",
+  "workspaces": ["ui"],
+  "scripts": {
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "ui": "npm --workspace ui run dev",
+    "check": "npm --workspace ui run check",
+    "tauri": "tauri"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.12.4"
+  }
+}
