@@ -4,6 +4,11 @@
 
 SSH и SFTP в одном окне: две файловые панели и терминал рядом — для тех, у кого много серверов.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshot-ru-dark.png">
+  <img alt="Kite: локальные файлы и сервер рядом, терминал снизу" src="docs/screenshot-ru-light.png">
+</picture>
+
 > **Статус:** ранняя разработка. Интерфейс работает на встроенном mock-бэкенде с демо-серверами; настоящее SSH-ядро пока не подключено.
 
 ## Стек

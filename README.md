@@ -4,6 +4,11 @@
 
 SSH and SFTP in one window: two file panes and a terminal side by side, for people who keep a lot of servers.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshot-en-dark.png">
+  <img alt="Kite: local files and a server side by side, terminal below" src="docs/screenshot-en-light.png">
+</picture>
+
 > **Status:** early development. The interface runs on a built-in mock backend with demo servers; the real SSH core is not wired in yet.
 
 ## Stack
