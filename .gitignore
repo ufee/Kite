@@ -8,6 +8,5 @@ Thumbs.db
 
 # Local notes and private references never go public
 CLAUDE.local.md
-.claude/settings.local.json
-.claude/launch.json
+.claude/
 .local/
