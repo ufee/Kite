@@ -127,7 +127,26 @@ pub fn rename(from: &str, to: &str) -> Result<()> {
     if !same && fs::symlink_metadata(to).is_ok() {
         return Err(Error::Eexist { path: to.into() });
     }
-    fs::rename(from, to).map_err(|e| io_error(&e, from))
+    move_no_replace(from, to).map_err(|e| if e.kind() == std::io::ErrorKind::AlreadyExists { Error::Eexist { path: to.into() } } else { io_error(&e, from) })
+}
+
+/// The check above can race with a file that appears meanwhile; on Windows the move itself refuses
+/// to replace. Paths are absolute and normalised, so the `\\?\` form lifts the 260-character limit.
+#[cfg(windows)]
+fn move_no_replace(from: &str, to: &str) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    let wide = |s: &str| std::ffi::OsStr::new(&format!(r"\\?\{s}")).encode_wide().chain(Some(0)).collect::<Vec<u16>>();
+    let (f, t) = (wide(from), wide(to));
+    // SAFETY: both are NUL-terminated wide strings that outlive the call.
+    let ok = unsafe { windows_sys::Win32::Storage::FileSystem::MoveFileExW(f.as_ptr(), t.as_ptr(), 0) };
+    if ok != 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
+}
+
+/// POSIX `rename` replaces; `renameat2(RENAME_NOREPLACE)` is Linux-only and not on every
+/// filesystem, so the check above stays the guard here.
+#[cfg(not(windows))]
+fn move_no_replace(from: &str, to: &str) -> std::io::Result<()> {
+    fs::rename(from, to)
 }
 
 /// To the system's recycle bin (Windows) or trash folder (Linux).
@@ -139,14 +158,20 @@ pub fn trash(paths: &[String]) -> Result<()> {
 }
 
 pub fn read_text(path: &str) -> Result<TextFile> {
+    use std::io::Read;
     let meta = fs::metadata(path).map_err(|e| io_error(&e, path))?;
     if meta.is_dir() {
         return Err(Error::Einval { reason: format!("{path}: is a folder") });
     }
+    // Devices, FIFOs and /proc report size 0 and may never end.
+    if !meta.is_file() {
+        return Err(Error::Einval { reason: format!("{path}: not a regular file") });
+    }
     if meta.len() > MAX_TEXT {
         return Ok(TextFile::too_big());
     }
-    let data = fs::read(path).map_err(|e| io_error(&e, path))?;
+    let mut data = Vec::new();
+    fs::File::open(path).and_then(|f| f.take(MAX_TEXT + 1).read_to_end(&mut data)).map_err(|e| io_error(&e, path))?;
     if data.len() as u64 > MAX_TEXT {
         return Ok(TextFile::too_big());
     }

@@ -1,8 +1,14 @@
 //! Server folders through the session's SFTP channel; chown through an exec channel.
 
-use std::future::Future;
+use std::{
+    future::Future,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
-use futures::stream::{self, StreamExt};
+use futures::{
+    future,
+    stream::{self, StreamExt},
+};
 use russh::ChannelMsg;
 use russh_sftp::{
     client::{RawSftpSession, error::Error as SftpError},
@@ -39,7 +45,10 @@ async fn read_dir(sftp: &RawSftpSession, path: &str) -> Result<Vec<File>> {
     let mut files = Vec::new();
     loop {
         match sftp.readdir(handle.as_str()).await {
-            Ok(name) => files.extend(name.files.into_iter().filter(|f| f.filename != "." && f.filename != "..")),
+            // An empty name or one with `/` would point back into the folder or out of it.
+            Ok(name) => files.extend(
+                name.files.into_iter().filter(|f| !matches!(f.filename.as_str(), "" | "." | "..") && !f.filename.contains('/')),
+            ),
             Err(SftpError::Status(st)) if st.status_code == StatusCode::Eof => break,
             Err(e) => {
                 let _ = sftp.close(handle).await;
@@ -132,12 +141,24 @@ pub async fn rename(s: &Session, from: &str, to: &str) -> Result<()> {
     }
 }
 
-/// Runs the futures `n` at a time, results in order, the first error wins. Every future runs to
-/// its end even after an error: one dropped halfway may leave a handle open on the server.
-/// The futures are built before the stream: a lazy `map` inside it trips the Send check of Tauri commands.
+/// Runs the futures `n` at a time, results in order, the first error wins. After an error nothing
+/// new is sent, but requests already out run to their end: one dropped halfway may leave a handle
+/// open on the server. The futures are built before the stream: a lazy `map` inside it trips the
+/// Send check of Tauri commands.
 async fn ordered<T, F: Future<Output = Result<T>>>(futs: Vec<F>, n: usize) -> Result<Vec<T>> {
-    let all: Vec<Result<T>> = stream::iter(futs).buffered(n).collect().await;
-    all.into_iter().collect()
+    let failed = AtomicBool::new(false);
+    let mut s = stream::iter(futs).take_while(|_| future::ready(!failed.load(Ordering::Relaxed))).buffered(n);
+    let (mut out, mut first) = (Vec::new(), None);
+    while let Some(r) = s.next().await {
+        match r {
+            Ok(v) => out.push(v),
+            Err(e) => {
+                failed.store(true, Ordering::Relaxed);
+                first.get_or_insert(e);
+            }
+        }
+    }
+    first.map_or(Ok(out), Err)
 }
 
 /// For results nobody needs, in any order; stops at the first error.
@@ -161,21 +182,34 @@ struct Node {
     depth: usize,
 }
 
-/// Everything under `root`, parents before children. Links are entries, never followed.
-/// Some servers (not OpenSSH) fill READDIR attributes from stat(), so a link to a folder looks like
-/// a folder there: a folder is checked with lstat before going in. With `every`, all entries are,
-/// for callers that would act through a link to a file.
-async fn walk(sftp: &RawSftpSession, root: &str, every: bool) -> Result<Vec<Node>> {
-    let mut out = Vec::new();
-    let mut level = vec![root.to_owned()];
-    let mut depth = 1;
-    while !level.is_empty() {
-        let reads: Vec<_> = level.iter().map(|d| async move { read_dir(sftp, d).await.map(|l| (d.clone(), l)) }).collect();
+/// A tree under a folder, one level at a time, parents before children. Links are entries, never
+/// followed. Some servers (not OpenSSH) fill READDIR attributes from stat(), so a link to a folder
+/// looks like a folder there: a folder is checked with lstat before going in. With `every`, all
+/// entries are, for callers that would act through a link to a file.
+struct Walker {
+    level: Vec<String>,
+    depth: usize,
+    every: bool,
+}
+
+impl Walker {
+    fn new(root: &str, every: bool) -> Self {
+        Self { level: vec![root.to_owned()], depth: 1, every }
+    }
+
+    /// The next level; the folders in it are read on the following call, so a caller may change
+    /// them in between.
+    async fn next(&mut self, sftp: &RawSftpSession) -> Result<Option<Vec<Node>>> {
+        if self.level.is_empty() {
+            return Ok(None);
+        }
+        let reads: Vec<_> = self.level.iter().map(|d| async move { read_dir(sftp, d).await.map(|l| (d.clone(), l)) }).collect();
         let found: Vec<(String, FileAttributes)> = ordered(reads, DIRS_IN_FLIGHT)
             .await?
             .into_iter()
             .flat_map(|(dir, files)| files.into_iter().map(move |f| (join(&dir, &f.filename), f.attrs)))
             .collect();
+        let every = self.every;
         let checks: Vec<_> = found
             .iter()
             .map(|(path, attrs)| {
@@ -189,16 +223,29 @@ async fn walk(sftp: &RawSftpSession, root: &str, every: bool) -> Result<Vec<Node
             })
             .collect();
         let own = ordered(checks, IN_FLIGHT).await?;
-        let mut next = Vec::new();
+        let (mut next, mut nodes) = (Vec::new(), Vec::new());
         for ((path, listed), own) in found.into_iter().zip(own) {
             let attrs = own.unwrap_or(listed);
-            if attrs.is_dir() && !attrs.is_symlink() {
+            if is_folder(&attrs) {
                 next.push(path.clone());
             }
-            out.push(Node { path, attrs, depth });
+            nodes.push(Node { path, attrs, depth: self.depth });
         }
-        level = next;
-        depth += 1;
+        self.level = next;
+        self.depth += 1;
+        Ok(Some(nodes))
+    }
+}
+
+fn is_folder(a: &FileAttributes) -> bool {
+    a.is_dir() && !a.is_symlink()
+}
+
+/// Everything under `root`, parents before children.
+async fn walk(sftp: &RawSftpSession, root: &str, every: bool) -> Result<Vec<Node>> {
+    let (mut w, mut out) = (Walker::new(root, every), Vec::new());
+    while let Some(level) = w.next(sftp).await? {
+        out.extend(level);
     }
     Ok(out)
 }
@@ -261,19 +308,33 @@ async fn exec(s: &Session, cmd: &str) -> Result<std::result::Result<(), String>>
     }
 }
 
-async fn chown(s: &Session, paths: &[String], owner: &str, group: &str, recursive: bool) -> Result<()> {
-    for name in [owner, group].into_iter().filter(|n| !n.is_empty()) {
-        if !valid_account(name) {
-            return Err(Error::Einval { reason: format!("chown: {name}") });
+/// Command lines stay well under the SSH packet limit (256 KB on OpenSSH).
+const CMD_MAX: usize = 64 * 1024;
+
+/// `chown` over the paths, in as many commands as the line length needs.
+async fn chown(s: &Session, paths: &[String], spec: &str, recursive: bool) -> Result<()> {
+    // `env` works from any login shell; `LC_ALL=C` keeps the error text we read in English.
+    let head = format!("env LC_ALL=C chown {}-- {}", if recursive { "-R " } else { "" }, sh_quote(spec));
+    let mut batch: Vec<&String> = Vec::new();
+    let mut len = head.len();
+    for (k, p) in paths.iter().enumerate() {
+        let q = sh_quote(p).len() + 1;
+        if !batch.is_empty() && len + q > CMD_MAX {
+            chown_run(s, &head, &batch).await?;
+            batch.clear();
+            len = head.len();
+        }
+        batch.push(p);
+        len += q;
+        if k + 1 == paths.len() {
+            chown_run(s, &head, &batch).await?;
         }
     }
-    let spec = if group.is_empty() { owner.to_owned() } else { format!("{owner}:{group}") };
-    let mut cmd = String::from("chown ");
-    if recursive {
-        cmd.push_str("-R ");
-    }
-    cmd.push_str("-- ");
-    cmd.push_str(&sh_quote(&spec));
+    Ok(())
+}
+
+async fn chown_run(s: &Session, head: &str, paths: &[&String]) -> Result<()> {
+    let mut cmd = head.to_owned();
     for p in paths {
         cmd.push(' ');
         cmd.push_str(&sh_quote(p));
@@ -281,7 +342,9 @@ async fn chown(s: &Session, paths: &[String], owner: &str, group: &str, recursiv
     match exec(s, &cmd).await? {
         Ok(()) => Ok(()),
         Err(text) if text.contains("Operation not permitted") || text.contains("Permission denied") => {
-            Err(Error::Eacces { path: paths.first().cloned().unwrap_or_default() })
+            // chown names the path it failed on: `chown: changing ownership of '/x': ...`.
+            let path = paths.iter().find(|p| text.contains(p.as_str())).or(paths.first()).map(|p| p.to_string()).unwrap_or_default();
+            Err(Error::Eacces { path })
         }
         Err(text) => Err(Error::Einval { reason: text.lines().next().unwrap_or_default().to_owned() }),
     }
@@ -294,46 +357,87 @@ struct Target {
     depth: usize,
 }
 
-/// Permission bits 0o777 for every path, and with `recursive` for everything under the folders.
-/// setuid, setgid and sticky stay as they were. Owner and group change through `chown` when given.
-pub async fn chmod(s: &Session, paths: &[String], mode: u32, owner: &str, group: &str, recursive: bool) -> Result<usize> {
+impl Target {
+    fn of(path: String, a: &FileAttributes, depth: usize) -> Self {
+        Self { path, old: a.permissions.unwrap_or(0), dir: a.is_dir(), depth }
+    }
+}
+
+/// Mode bits 0o777 (when `mode` is given) and owner or group (when not empty) for every path, and
+/// with `recursive` for everything under the folders. setuid, setgid and sticky stay as they were
+/// through the mode change; a chown afterwards clears setuid and setgid as the kernel decides.
+pub async fn chmod(s: &Session, paths: &[String], mode: Option<u32>, owner: &str, group: &str, recursive: bool) -> Result<usize> {
+    for name in [owner, group].into_iter().filter(|n| !n.is_empty()) {
+        if !valid_account(name) {
+            return Err(Error::Einval { reason: format!("chown: {name}") });
+        }
+    }
     let sftp = &s.sftp;
-    // Modes before chown: a chown by a non-root user clears setuid and setgid.
-    let mut targets: Vec<Target> = Vec::new();
+    let (mut roots, mut trees) = (Vec::new(), Vec::new());
     let (mut links, mut plain) = (Vec::new(), Vec::new());
     for p in paths {
         let own = sftp.lstat(p.as_str()).await.map_err(|e| fs_error(e, p))?.attrs;
-        // A link on the list changes its target, as chmod does; its tree is not walked.
-        let attrs = if own.is_symlink() { sftp.stat(p.as_str()).await.map_err(|e| fs_error(e, p))?.attrs } else { own.clone() };
-        targets.push(Target { path: p.clone(), old: attrs.permissions.unwrap_or(0), dir: attrs.is_dir(), depth: 0 });
         if own.is_symlink() {
+            // A link on the list changes its target, as chmod does; its tree is not walked.
+            // A broken one has nothing to change and does not stop the rest.
+            match sftp.stat(p.as_str()).await {
+                Ok(a) => roots.push(Target::of(p.clone(), &a.attrs, 0)),
+                Err(SftpError::Status(st)) if st.status_code == StatusCode::NoSuchFile => continue,
+                Err(e) => return Err(fs_error(e, p)),
+            }
             links.push(p.clone());
         } else {
+            roots.push(Target::of(p.clone(), &own, 0));
             plain.push(p.clone());
-        }
-        if recursive && own.is_dir() && !own.is_symlink() {
-            for n in walk(sftp, p, true).await? {
-                // A link's own mode means nothing, and setstat would follow it out of the tree.
-                if !n.attrs.is_symlink() {
-                    targets.push(Target { old: n.attrs.permissions.unwrap_or(0), dir: n.attrs.is_dir(), depth: n.depth, path: n.path });
-                }
+            if recursive && is_folder(&own) {
+                trees.push(p.clone());
             }
         }
     }
+    let (count, modes) = match mode {
+        None => (roots.len(), Ok(())),
+        Some(m) => set_tree(sftp, roots, &trees, m).await?,
+    };
     let mut owned = Ok(());
     if !owner.is_empty() || !group.is_empty() {
+        let spec = if group.is_empty() { owner.to_owned() } else { format!("{owner}:{group}") };
         // Links go without -R: `chown -R` would change the link itself, chmod changes its target.
         for (list, deep) in [(&plain, recursive), (&links, false)] {
             if !list.is_empty() && owned.is_ok() {
-                owned = chown(s, list, owner, group, deep).await;
+                owned = chown(s, list, &spec, deep).await;
             }
         }
     }
-    // Modes go on even after a failed chown: what it did change keeps its special bits.
-    let set = set_modes(sftp, &targets, mode).await;
+    modes?;
     owned?;
-    set?;
-    Ok(targets.len())
+    Ok(count)
+}
+
+/// Sets the mode on the roots and the trees under `trees`. Goes through everything, as `chmod -R`
+/// does: the outer error is a walk that could not go on, the inner one the first refused change.
+/// A mode that lets the owner into folders goes top-down, so folders without x open before they are
+/// read; any other mode goes bottom-up, so a folder loses its x after its children are done.
+async fn set_tree(sftp: &RawSftpSession, roots: Vec<Target>, trees: &[String], mode: u32) -> Result<(usize, Result<()>)> {
+    let mut count = roots.len();
+    if mode & 0o500 == 0o500 {
+        let mut first = set_modes(sftp, &roots, mode).await;
+        for t in trees {
+            let mut w = Walker::new(t, true);
+            while let Some(level) = w.next(sftp).await? {
+                let level: Vec<Target> = level.iter().filter(|n| !n.attrs.is_symlink()).map(|n| Target::of(n.path.clone(), &n.attrs, n.depth)).collect();
+                count += level.len();
+                first = first.and(set_modes(sftp, &level, mode).await);
+            }
+        }
+        return Ok((count, first));
+    }
+    let mut all = roots;
+    for t in trees {
+        // A link's own mode means nothing, and setstat would follow it out of the tree.
+        all.extend(walk(sftp, t, true).await?.iter().filter(|n| !n.attrs.is_symlink()).map(|n| Target::of(n.path.clone(), &n.attrs, n.depth)));
+    }
+    count = all.len();
+    Ok((count, set_modes(sftp, &all, mode).await))
 }
 
 /// Files first, then folders deepest first: a folder that loses its x must come after its children.

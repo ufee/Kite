@@ -206,7 +206,8 @@ export interface Backend {
   fsRename(src: Src, user: string, from: string, to: string): Promise<void>;
   fsDelete(src: Src, user: string, paths: string[]): Promise<void>;
   fsTrash(paths: string[]): Promise<void>;
-  fsChmod(src: Src, user: string, paths: string[], mode: number, owner: string, group: string, recursive: boolean): Promise<void>;
+  /** `mode` null: only owner or group change. */
+  fsChmod(src: Src, user: string, paths: string[], mode: number | null, owner: string, group: string, recursive: boolean): Promise<void>;
   fsReadText(src: Src, user: string, path: string): Promise<TextFile>;
   fsDrives(): Promise<string[]>;
 

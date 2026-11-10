@@ -29,8 +29,11 @@ pub fn fs_error(e: SftpError, path: &str) -> Error {
         // A slow reply is not a lost connection: the session stays, the operation fails.
         SftpError::Timeout => Error::Einval { reason: format!("{path}: no reply in {SFTP_TIMEOUT_SECS} s") },
         SftpError::IO(_) => Error::Disconnected,
-        // russh-sftp's word for a subsystem channel that is gone.
-        SftpError::UnexpectedBehavior(m) if m == "session closed" => Error::Disconnected,
+        // russh-sftp's words for a subsystem channel that is gone: closed before the request,
+        // closed while it waited, or the send itself failed.
+        SftpError::UnexpectedBehavior(m) if m == "session closed" || m == "sender dropped" || m.starts_with("SendError") => {
+            Error::Disconnected
+        }
         e => Error::Einval { reason: format!("{path}: {e}") },
     }
 }

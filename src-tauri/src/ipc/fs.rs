@@ -69,11 +69,23 @@ async fn logged<T>(log: &Log, p: &Place, text: String, work: impl Future<Output 
         Ok(v) => log.done(id, note(v), Row::Ok),
         Err(e) => log.done(id, e.to_string(), Row::Err),
     }
-    // The channel is gone but the connection may look alive: drop it, the reconnect follows.
-    if let (Err(Error::Disconnected), Place::Server(s)) = (&res, p) {
+    lost(p, &res).await;
+    res
+}
+
+/// The channel is gone but the connection may look alive: drop it, the reconnect follows.
+async fn lost<T>(p: &Place, res: &Result<T>) {
+    if let (Err(Error::Disconnected), Place::Server(s)) = (res, p) {
         s.sftp_lost().await;
     }
-    res
+}
+
+/// `first …` for a long list of paths in a log row.
+fn some(paths: &[String]) -> String {
+    match paths {
+        [one] => one.clone(),
+        _ => format!("{} …", paths.first().cloned().unwrap_or_default()),
+    }
 }
 
 fn objs(n: usize) -> Msg {
@@ -97,10 +109,13 @@ pub async fn fs_home(ssh: SshState<'_>, src: Src) -> Result<String> {
 
 #[tauri::command]
 pub async fn fs_resolve(ssh: SshState<'_>, src: Src, raw: String, base: Option<String>) -> Result<String> {
-    match place(&ssh, src)? {
+    let p = place(&ssh, src)?;
+    let res = match &p {
         Place::Local => blocking(move || local::resolve(&raw, base.as_deref())).await,
-        Place::Server(s) => remote::resolve(&s, &raw, base.as_deref()).await,
-    }
+        Place::Server(s) => remote::resolve(s, &raw, base.as_deref()).await,
+    };
+    lost(&p, &res).await;
+    res
 }
 
 #[tauri::command]
@@ -162,10 +177,7 @@ pub async fn fs_delete(ssh: SshState<'_>, log: LogState<'_>, src: Src, paths: Ve
 
 #[tauri::command]
 pub async fn fs_trash(log: LogState<'_>, paths: Vec<String>) -> Result<()> {
-    let text = match paths.as_slice() {
-        [one] => format!("TRASH {one}"),
-        _ => format!("TRASH {} …", paths.first().cloned().unwrap_or_default()),
-    };
+    let text = format!("TRASH {}", some(&paths));
     let n = paths.len();
     logged(&log, &Place::Local, text, blocking(move || local::trash(&paths)), |_| objs(n)).await
 }
@@ -177,14 +189,17 @@ pub async fn fs_chmod(
     log: LogState<'_>,
     src: Src,
     paths: Vec<String>,
-    mode: u32,
+    mode: Option<u32>,
     owner: String,
     group: String,
     recursive: bool,
 ) -> Result<()> {
     let p = place(&ssh, src)?;
     let Place::Server(s) = &p else { return Err(Error::Einval { reason: "no permissions on this PC".into() }) };
-    let mut text = format!("SETSTAT {:03o}", mode & 0o777);
+    let mut text = String::from("SETSTAT");
+    if let Some(m) = mode {
+        text.push_str(&format!(" {:03o}", m & 0o777));
+    }
     if !owner.is_empty() || !group.is_empty() {
         text.push_str(&format!(" {owner}:{group}"));
     }
@@ -192,7 +207,7 @@ pub async fn fs_chmod(
         text.push_str(" -R");
     }
     text.push(' ');
-    text.push_str(&paths.join(" "));
+    text.push_str(&some(&paths));
     logged(&log, &p, text, remote::chmod(s, &paths, mode, &owner, &group, recursive), |n| objs(*n)).await.map(|_| ())
 }
 

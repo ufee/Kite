@@ -156,7 +156,7 @@ export class TauriBackend extends MockBackend {
   override fsRename(src: Src, user: string, from: string, to: string) { return call<void>('fs_rename', { src: where(src, user), from, to }); }
   override fsDelete(src: Src, user: string, paths: string[]) { return call<void>('fs_delete', { src: where(src, user), paths }); }
   override fsTrash(paths: string[]) { return call<void>('fs_trash', { paths }); }
-  override fsChmod(src: Src, user: string, paths: string[], mode: number, owner: string, group: string, recursive: boolean) {
+  override fsChmod(src: Src, user: string, paths: string[], mode: number | null, owner: string, group: string, recursive: boolean) {
     return call<void>('fs_chmod', { src: where(src, user), paths, mode, owner, group, recursive });
   }
   override fsReadText(src: Src, user: string, path: string) { return call<TextFile>('fs_read_text', { src: where(src, user), path }); }

@@ -410,9 +410,9 @@ export class MockBackend implements Backend {
     }
   }
 
-  async fsChmod(src: Src, user: string, paths: string[], mode: number, owner: string, group: string, recursive: boolean) {
+  async fsChmod(src: Src, user: string, paths: string[], mode: number | null, owner: string, group: string, recursive: boolean) {
     this.live(src, user);
-    const oct = mode.toString(8).padStart(3, '0');
+    const oct = mode === null ? '' : mode.toString(8).padStart(3, '0');
     const tail = [...oct].map(c => { const n = +c; return (n & 4 ? 'r' : '-') + (n & 2 ? 'w' : '-') + (n & 1 ? 'x' : '-'); }).join('');
     const entries = paths.map(p => ({ p, e: this.fs.find(src, p) }));
     if (user !== 'root' && entries.some(x => x.e && x.e.owner !== user)) {
@@ -422,7 +422,8 @@ export class MockBackend implements Backend {
     for (const { p, e } of entries) {
       await this.op(src, 'SFTP', `SETSTAT ${p} ${oct} ${owner}:${group}${recursive ? ' -R' : ''}`, () => {
         if (!e) throw fail('ENOENT', tr('Нет такого файла: {p}', { p }));
-        e.perm = tail; if (owner) e.owner = owner; if (group) e.group = group;
+        if (tail) e.perm = tail;
+        if (owner) e.owner = owner; if (group) e.group = group;
       }, () => tr('готово'));
     }
   }
