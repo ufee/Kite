@@ -476,7 +476,7 @@ export function openChmod(i: number) {
   // Paths are fixed now: the pane may move on while the dialog is open.
   ask('chmod', {
     i, src: p.src, user: p.user, paths: list.map(x => childOf(p.src, p.path, x.name)), names: list.map(x => x.name),
-    bits, owner: e.owner, group: e.group, modeT: false, ownerT: false, groupT: false, recursive: false, hasDir: list.some(x => x.dir),
+    bits, owner: e.owner, group: e.group, owner0: e.owner, group0: e.group, modeT: false, ownerT: false, groupT: false, recursive: false, hasDir: list.some(x => x.dir),
   });
 }
 export const octal = (bits: boolean[][]) => bits.map(g => (g[0] ? 4 : 0) + (g[1] ? 2 : 0) + (g[2] ? 1 : 0)).join('');
@@ -488,8 +488,10 @@ export function setOctal(d: Record<string, any>, v: string) {
 // Only what the user touched goes out. The dialog shows the first object's mode and owner, so with
 // several objects or a tree an untouched mode is still sent: the intent is to align them to it.
 export function chmodPlan(d: Record<string, any>) {
-  const owner = d.ownerT ? d.owner.trim() : '', group = d.groupT ? d.group.trim() : '';
+  // An owner typed back to what it was is no change: chown on one file would still drop setuid.
   const spread = d.recursive || d.paths.length > 1;
+  const pick = (v: string, v0: string, t: boolean) => (t && (spread || v.trim() !== v0) ? v.trim() : '');
+  const owner = pick(d.owner, d.owner0, d.ownerT), group = pick(d.group, d.group0, d.groupT);
   const mode = d.modeT || (spread && !d.ownerT && !d.groupT) ? parseInt(octal(d.bits), 8) : null;
   return { mode, owner, group, empty: mode === null && !owner && !group };
 }

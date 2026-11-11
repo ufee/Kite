@@ -373,6 +373,19 @@ async fn chown(s: &Session, paths: &[String], spec: &str, recursive: bool) -> Re
     Ok(())
 }
 
+/// The path chown refused on, which with `-R` may be deep inside a root. GNU quotes it
+/// (`chown: changing ownership of '/x': Operation not permitted`), BusyBox and BSD do not (`chown: /x: ...`).
+fn denied_path(text: &str) -> Option<String> {
+    let line = text.lines().map(str::trim_end).find(|l| l.ends_with("Operation not permitted") || l.ends_with("Permission denied"))?;
+    let head = &line[..line.rfind(": ")?];
+    let path = match head.chars().last()? {
+        '\'' => head[..head.len() - 1].split_once('\'')?.1,
+        '’' => head[..head.len() - '’'.len_utf8()].split_once('‘')?.1,
+        _ => head.strip_prefix("chown: ")?,
+    };
+    (!path.is_empty()).then(|| path.to_owned())
+}
+
 async fn chown_run(s: &Session, head: &str, paths: &[&String]) -> Result<()> {
     let mut cmd = head.to_owned();
     for p in paths {
@@ -382,9 +395,7 @@ async fn chown_run(s: &Session, head: &str, paths: &[&String]) -> Result<()> {
     match exec(s, &cmd).await? {
         Ok(()) => Ok(()),
         Err(text) if text.contains("Operation not permitted") || text.contains("Permission denied") => {
-            // chown names the path it failed on, quoted: `chown: changing ownership of '/x': ...`.
-            let quoted = |p: &&&String| text.contains(&format!("'{p}'")) || text.contains(&format!("‘{p}’"));
-            let path = paths.iter().find(quoted).or(paths.first()).map(|p| p.to_string()).unwrap_or_default();
+            let path = denied_path(&text).or_else(|| paths.first().map(|p| p.to_string())).unwrap_or_default();
             Err(Error::Eacces { path })
         }
         Err(text) => Err(Error::Einval { reason: text.lines().next().unwrap_or_default().to_owned() }),
@@ -520,6 +531,10 @@ pub async fn read_text(s: &Session, path: &str) -> Result<TextFile> {
     if attrs.is_dir() {
         return Err(Error::Einval { reason: format!("{path}: is a folder") });
     }
+    // A FIFO blocks sftp-server's open() until a writer comes, and the whole channel with it.
+    if attrs.permissions.is_some() && !attrs.file_type().is_file() {
+        return Err(Error::Einval { reason: format!("{path}: not a regular file") });
+    }
     let size = attrs.size.unwrap_or(0);
     if size > MAX_TEXT {
         return Ok(TextFile::too_big());
@@ -563,5 +578,20 @@ async fn read_all(sftp: &RawSftpSession, handle: &str, path: &str, size: u64) ->
         if data.len() as u64 > MAX_TEXT {
             return Ok(None);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::denied_path;
+
+    #[test]
+    fn chown_denied_path() {
+        let gnu = "chown: changing ownership of '/srv/site2/deep/f': Operation not permitted\n";
+        assert_eq!(denied_path(gnu).as_deref(), Some("/srv/site2/deep/f"));
+        let curly = "chown: cannot read directory ‘/srv/a b’: Permission denied";
+        assert_eq!(denied_path(curly).as_deref(), Some("/srv/a b"));
+        assert_eq!(denied_path("chown: /srv/x: Operation not permitted").as_deref(), Some("/srv/x"));
+        assert_eq!(denied_path("chown: invalid user: 'x'"), None);
     }
 }
