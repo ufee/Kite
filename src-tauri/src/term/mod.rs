@@ -52,6 +52,9 @@ const COALESCE_MAX: usize = 256 * 1024;
 /// `COALESCE_WINDOW` (Windows rounds tokio timers up to its ~15.6 ms tick).
 const INTERACTIVE_BUDGET: usize = 4 * 1024;
 const LOCAL_READ_BUFFER: usize = 64 * 1024;
+/// Output a paused remote terminal keeps in the core. Only past this does its reader stop and the
+/// connection stall: a flood (`yes`) while the window is hidden and xterm parses nothing.
+const REMOTE_HOLD: usize = 8 * 1024 * 1024;
 /// How long a finished local shell waits for the rest of its output before it reports the exit.
 /// A background process that keeps the PTY open must not hold the exit forever.
 const LOCAL_DRAIN: Duration = Duration::from_millis(500);
@@ -68,8 +71,10 @@ pub type Handle = mpsc::UnboundedSender<Command>;
 
 /* ---------- Flow control ---------- */
 
-/// The UI pauses output while its terminal is behind. The reader then stops reading, so the
-/// SSH channel window or the ConPTY pipe holds the producer back instead of memory growing.
+/// The UI pauses output while its terminal is behind. A local reader stops, and the ConPTY pipe
+/// holds the shell back. A remote reader keeps reading into its own buffer up to `REMOTE_HOLD`:
+/// russh hands channel data over from the session loop, so a reader that stops stalls the whole
+/// connection (file panels, other tabs, keepalive), not just this channel.
 #[derive(Default)]
 pub struct Flow {
     paused: Mutex<bool>,
@@ -167,9 +172,8 @@ impl Terms {
     pub fn ended(&self, id: u32) -> bool {
         match self.map().remove(&id) {
             Some(open) => {
-                // A paused reader must still reach its end.
                 if let Some(open) = open {
-                    open.flow.set(false);
+                    release(&open);
                 }
                 true
             }
@@ -202,11 +206,17 @@ impl Terms {
     }
 }
 
-fn close(open: Open) {
+/// Lets the reader and the writer reach their ends: a paused reader, and a writer waiting for the
+/// channel window, which never learns that the channel or the connection is gone.
+fn release(open: &Open) {
     open.flow.set(false);
-    if let Some(stop) = open.stop {
+    if let Some(stop) = &open.stop {
         stop.notify_one();
     }
+}
+
+fn close(open: Open) {
+    release(&open);
     if let Some(mut kill) = open.kill {
         let _ = kill.kill();
     }
@@ -302,15 +312,19 @@ async fn run_remote(
     };
 
     loop {
-        if flow.is_paused() {
-            flush(&mut buffer);
-            deadline = None;
+        let paused = flow.is_paused();
+        if paused && buffer.len() >= REMOTE_HOLD {
             flow.wait().await;
+            continue;
         }
         tokio::select! {
             msg = reader.wait() => match msg {
                 Some(ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. }) => {
                     buffer.extend_from_slice(&data);
+                    if paused {
+                        deadline = None;
+                        continue;
+                    }
                     let idle = last_flush.elapsed() >= COALESCE_WINDOW;
                     if idle {
                         burst = 0;
@@ -337,6 +351,12 @@ async fn run_remote(
                 Some(_) => {}
             },
             _ = time::sleep_until(deadline.unwrap_or_else(time::Instant::now)), if deadline.is_some() => {
+                flush(&mut buffer);
+                last_flush = Instant::now();
+                deadline = None;
+            }
+            // Caught up: what was held goes out at once.
+            _ = flow.wait(), if paused => {
                 flush(&mut buffer);
                 last_flush = Instant::now();
                 deadline = None;

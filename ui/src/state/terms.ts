@@ -198,7 +198,7 @@ export function fitTerm(t: Term | null = curTerm.value) {
  * What a program that died mid-screen (vim, htop, mc, tmux) left on: the alternate screen, mouse reports,
  * focus events, bracketed paste, application keys, a hidden cursor, colors. The next shell needs none of it.
  */
-const RESET_MODES = '\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1004l\x1b[?2004l\x1b[?1l\x1b>\x1b[?25h\x1b[0m';
+const RESET_MODES = '\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1004l\x1b[?2004l\x1b[?1l\x1b>\x1b[?25h\x1b[0m';
 const DIM = (s: string) => `\x1b[90m${s}\x1b[0m\r\n`, RED = (s: string) => `\x1b[31m${s}\x1b[0m\r\n`;
 
 /** A shell that ends sooner than this after start (a bad setting, a broken profile) keeps its tab to show why. */
@@ -261,7 +261,10 @@ function exited(t: Term, reason: PtyExit, age: number) {
     : reason === 'killed' ? tr('Оболочка завершена сигналом')
     : reason === 'exit' ? tr('Оболочка завершилась сразу после запуска')
     : tr('Соединение с {c} закрыто', { c: label(t.src) });
-  v.xt.write(RESET_MODES + '\r\n' + RED(why) + DIM(tr('Enter: подключиться снова')));
+  // Leaving the alternate screen restores the cursor even when it is not active: on a plain prompt
+  // that would move the red line to the top of the screen.
+  const leave = v.xt.buffer.active.type === 'alternate' ? '\x1b[?1049l' : '';
+  v.xt.write(leave + RESET_MODES + '\r\n' + RED(why) + DIM(tr('Enter: подключиться снова')));
 }
 
 export async function openTerm(src: Src, user?: string, cwd?: string, quiet = false): Promise<Term | null> {

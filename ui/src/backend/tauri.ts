@@ -75,9 +75,9 @@ export const uiError = (e: unknown): BackendError => {
 /** Every core call: errors cross as BackendError with ready words. */
 const call = <T>(cmd: string, args?: Record<string, unknown>) => invoke<T>(cmd, args).catch((e: unknown) => { throw uiError(e); });
 
-/** A file source as the core takes it. */
 /** Terminal input from this size on (a paste) keeps its place in line by waiting for the reply. */
 const BIG_WRITE = 4096;
+/** A file source as the core takes it. */
 const where = (src: Src, user: string) => (isLocal(src) ? 'local' : { server: src, user });
 
 const notYet = (stage: number): BackendError => ({ code: 'NOT_YET', title: tr('Будет на этапе {n}', { n: stage }), text: '' });
