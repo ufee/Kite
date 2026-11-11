@@ -262,9 +262,11 @@ function exited(t: Term, reason: PtyExit, age: number) {
     : reason === 'exit' ? tr('Оболочка завершилась сразу после запуска')
     : tr('Соединение с {c} закрыто', { c: label(t.src) });
   // Leaving the alternate screen restores the cursor even when it is not active: on a plain prompt
-  // that would move the red line to the top of the screen.
-  const leave = v.xt.buffer.active.type === 'alternate' ? '\x1b[?1049l' : '';
-  v.xt.write(leave + RESET_MODES + '\r\n' + RED(why) + DIM(tr('Enter: подключиться снова')));
+  // that would move the red line to the top of the screen. Checked once the pending output is parsed.
+  v.xt.write('', () => {
+    const leave = v.xt.buffer.active.type === 'alternate' ? '\x1b[?1049l' : '';
+    v.xt.write(leave + RESET_MODES + '\r\n' + RED(why) + DIM(tr('Enter: подключиться снова')));
+  });
 }
 
 export async function openTerm(src: Src, user?: string, cwd?: string, quiet = false): Promise<Term | null> {

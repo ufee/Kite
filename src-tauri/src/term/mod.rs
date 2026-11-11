@@ -305,14 +305,27 @@ async fn run_remote(
     let mut exited = false;
     let mut killed = false;
     let mut refused = false;
+    // Held output goes in coalescing-sized pieces: xterm parses one write in a single pass,
+    // and megabytes in one piece would freeze input and drawing for a frame or more.
     let flush = |buffer: &mut Vec<u8>| {
-        if !buffer.is_empty() {
-            output(std::mem::take(buffer));
+        let data = std::mem::take(buffer);
+        if data.len() <= COALESCE_MAX {
+            if !data.is_empty() {
+                output(data);
+            }
+        } else {
+            data.chunks(COALESCE_MAX).for_each(|piece| output(piece.to_vec()));
         }
     };
 
     loop {
         let paused = flow.is_paused();
+        // Resumed without the select branch seeing it (after the hold limit, or between two polls):
+        // outside a pause a non-empty buffer always has a deadline, so this is held output.
+        if !paused && !buffer.is_empty() && deadline.is_none() {
+            flush(&mut buffer);
+            last_flush = Instant::now();
+        }
         if paused && buffer.len() >= REMOTE_HOLD {
             flow.wait().await;
             continue;
