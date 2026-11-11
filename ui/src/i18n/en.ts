@@ -164,7 +164,7 @@ export const EN: Record<string, string> = {
   'Проверка соединения · {u}': 'Checking connection · {u}', 'Подключение к {addr}': 'Connecting to {addr}', 'нет ответа за 10 с': 'no reply in 10 s',
   'Сервер не отвечает': 'Server not responding', '{addr}: нет ответа за 10 с. Проверьте адрес или сеть.': '{addr}: no reply in 10 s. Check the address or network.',
   'активно': 'alive', 'соединение установлено': 'connected', 'Соединение закрыто': 'Connection closed', 'Отключено от {c}': 'Disconnected from {c}',
-  'Подключение к {who}…': 'Connecting to {who}…', 'Запуск терминала': 'Starting terminal', 'прервано': 'interrupted',
+  'Подключение к {who}…': 'Connecting to {who}…', 'Запуск терминала': 'Starting terminal', 'Запуск терминала · {u}': 'Starting terminal · {u}', 'прервано': 'interrupted',
 
   // Files
   'Для {n} нет просмотра': 'No preview for {n}', 'системном редакторе': 'the default editor',
@@ -206,6 +206,9 @@ export const EN: Record<string, string> = {
   'подсчёт…': 'counting…', 'Загрузка…': 'Loading…', '{n} больше 10 МБ: откройте в редакторе': '{n} is over 10 MB: open it in an editor',
   'Проверяем агент OpenSSH…': 'Checking the OpenSSH agent…', 'Агент OpenSSH не запущен': 'OpenSSH agent is not running', 'Агент OpenSSH не ответил': 'OpenSSH agent did not respond',
   'Соединение с {c} закрыто': 'Connection to {c} closed',
+  'Сервер отказал в терминале': 'The server refused a terminal',
+  'Оболочка завершилась сразу после запуска': 'The shell exited right after start',
+  'Оболочка завершена сигналом': 'The shell was killed by a signal',
 
   // Mock backend
   'Ключ хоста не проверяется': 'Host key not verified', 'проверка выключена': 'verification off',

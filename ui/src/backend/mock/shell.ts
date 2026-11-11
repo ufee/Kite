@@ -8,7 +8,7 @@ import { homeOf, LOCAL_WIN } from '../../util/paths';
 import { tr } from '../../i18n';
 import { DOCKER, LOCAL_PROJECT_WIN } from './data';
 import type { MockFs } from './fs';
-import type { Src } from '../types';
+import type { PtyExit, Src } from '../types';
 
 const C = {
   r: '\x1b[0m', bold: '\x1b[1m', g: '\x1b[32m', gb: '\x1b[1;32m', b: '\x1b[34m', bb: '\x1b[1;34m',
@@ -26,7 +26,7 @@ interface Ctx {
 export interface ShellHost {
   fs: MockFs;
   out(data: string): void;
-  exit(reason: string): void;
+  exit(reason: PtyExit): void;
   /** Resolves `ssh name` typed in the local shell. */
   server(name: string): { src: Src; code: string; defaultUser: string } | null;
   later(ms: number, fn: () => void): void;

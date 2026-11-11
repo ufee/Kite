@@ -5,16 +5,27 @@ import { isLocal } from '../util/paths';
 import { ui } from '../state/prefs';
 import { label, srvState } from '../state/servers';
 import { panes } from '../state/panes';
-import { attach, closeTerm, curTerm, fitTerm, newTermHere, selectTerm, terms, termTitle } from '../state/terms';
+import { attach, closeTerm, curTerm, fitTerm, newTermHere, selectTerm, shellName, terms, termTitle } from '../state/terms';
 import { setView, startTermDrag, termHeight } from '../state/layout';
 import Icon from './Icon.vue';
 
 const host = ref<HTMLElement | null>(null);
 const focusPane = computed(() => panes[ui.focus]);
-const newTitle = computed(() => tr('Новый терминал') + ': ' + (isLocal(focusPane.value.src) ? 'PowerShell' : `${focusPane.value.user}@${label(focusPane.value.src)}`));
+const newTitle = computed(() => tr('Новый терминал') + ': ' + (isLocal(focusPane.value.src) ? shellName() : `${focusPane.value.user}@${label(focusPane.value.src)}`));
 
 // The tab's xterm element moves into the host; switching tabs keeps every instance alive.
-watch(() => curTerm.value?.id, () => nextTick(() => host.value && attach(host.value, curTerm.value)));
+watch(() => curTerm.value?.id, () => nextTick(() => {
+  if (host.value) attach(host.value, curTerm.value);
+  tabsEl.value?.querySelector('.ttab.on')?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+}));
+const tabsEl = ref<HTMLElement | null>(null);
+/** A vertical wheel scrolls the tab strip sideways. */
+function wheelTabs(e: WheelEvent) {
+  const el = tabsEl.value;
+  if (!el || el.scrollWidth <= el.clientWidth) return;
+  el.scrollLeft += Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY;
+  e.preventDefault();
+}
 let ro: ResizeObserver | null = null, fitTimer = 0;
 onMounted(() => {
   if (curTerm.value) attach(host.value!, curTerm.value);
@@ -31,7 +42,7 @@ const tabTip = (t: (typeof terms)[number]) => (isLocal(t.src) ? `${termTitle(t)}
   <div class="tpanel" :class="{ split: ui.view === 'both' }" :style="{ height: termHeight + 'px' }" :aria-hidden="ui.view === 'files'">
     <div v-if="ui.view === 'both'" class="handle-h" :title="tr('Изменить высоту · двойной щелчок: только терминал')" @mousedown.prevent="startTermDrag" @dblclick="setView('term')"></div>
     <div class="thead">
-      <div class="ttabs">
+      <div ref="tabsEl" class="ttabs" @wheel="wheelTabs">
         <div v-for="t in terms" :key="t.id" class="ttab" :class="{ on: t.id === ui.term }">
           <button class="ttab-main" :title="tabTip(t)" @click="selectTerm(t.id)" @mousedown.middle.prevent="closeTerm(t.id)">
             <Icon v-if="isLocal(t.src)" n="pc" s="xs" class="faint" />

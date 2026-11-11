@@ -6,7 +6,7 @@
  */
 import type {
   AgentStatus, Backend, BackendError, BatchReport, ConflictPolicy, Endpoint, Entry, HostKeyRequest, LogRow, PassphraseRequest,
-  Server, ServerConfig, ServerDraft, ServerId, SessionState, Src, StateDoc, TestResult, TextFile, TransferItem, Unlisten,
+  PtyExit, Server, ServerConfig, ServerDraft, ServerId, SessionState, Src, StateDoc, TestResult, TextFile, TransferItem, Unlisten,
 } from '../types';
 import type { Store } from '../store';
 import { isBackendError } from '../types';
@@ -30,6 +30,7 @@ interface Pty {
   shell: MockShell;
   session: string | null;
   onData: (d: string) => void;
+  onExit: (reason: PtyExit) => void;
 }
 
 const EDITORS: Record<string, string> = { system: 'системном редакторе', npp: 'Notepad++', code: 'VS Code' };
@@ -101,7 +102,6 @@ export class MockBackend implements Backend {
   onPromptGone(cb: (reqIds: number[]) => void) { return this.on('promptGone', cb); }
   onTransferState(cb: (items: TransferItem[]) => void) { return this.on('transfer', cb); }
   onTransferBatch(cb: (r: BatchReport) => void) { return this.on('batch', cb); }
-  onPtyExit(cb: (id: number, reason: string) => void) { return this.on('ptyExit', cb); }
   onEditChanged(cb: (src: Src, user: string, path: string, uploaded: boolean) => void) { return this.on('edit', cb); }
   onLogRow(cb: (row: LogRow) => void) { return this.on('log', cb); }
   onLogUpdate(cb: (row: LogRow) => void) { return this.on('logUpdate', cb); }
@@ -295,7 +295,7 @@ export class MockBackend implements Backend {
       if (id !== server || (user !== undefined && u !== user)) continue;
       this.setState(id, u, null);
       this.add(id, 'SSH', tr('Соединение закрыто · {u}', { u }));
-      for (const [pid, pty] of this.ptys) if (pty.session === k) { this.ptys.delete(pid); this.emit('ptyExit', pid, 'disconnected'); }
+      for (const [pid, pty] of this.ptys) if (pty.session === k) { this.ptys.delete(pid); pty.onExit('disconnected'); }
     }
   }
 
@@ -654,7 +654,8 @@ export class MockBackend implements Backend {
   }
 
   /* ---------- Terminal ---------- */
-  async ptyOpen(src: Src, user: string, cwd: string, _cols: number, _rows: number, onData: (d: string) => void) {
+  async ptyOpen(src: Src, user: string, cwd: string, _shell: string, _cols: number, _rows: number,
+    onData: (d: string | Uint8Array) => void, onExit: (reason: PtyExit) => void) {
     let session: string | null = null, code = '';
     if (!isLocal(src)) {
       const s = this.servers.get(src);
@@ -670,19 +671,20 @@ export class MockBackend implements Backend {
     const shell = new MockShell({
       fs: this.fs,
       out: d => this.ptys.get(id)?.onData(d),
-      exit: reason => { if (this.ptys.delete(id)) this.emit('ptyExit', id, reason); },
+      exit: reason => { const p = this.ptys.get(id); if (p) { this.ptys.delete(id); p.onExit(reason); } },
       server: name => {
         const s = [...this.servers.values()].find(x => x.code === name);
         return s ? { src: s.id, code: s.code, defaultUser: s.defaultUser } : null;
       },
       later: (ms, fn) => { setTimeout(fn, ms); },
     }, { src, user, code, cwd });
-    this.ptys.set(id, { shell, session, onData });
+    this.ptys.set(id, { shell, session, onData, onExit });
     shell.start(true);
     return id;
   }
   ptyWrite(id: number, data: string) { this.ptys.get(id)?.shell.write(data); }
-  ptyResize() { /* the mock shell does not wrap lines itself */ }
+  ptyResize(_id: number, _cols: number, _rows: number) { /* the mock shell does not wrap lines itself */ }
+  ptyPause(_id: number, _paused: boolean) { /* the mock shell writes little */ }
   ptyClose(id: number) { this.ptys.delete(id); }
 
   /* ---------- Demo state on the first launch ---------- */

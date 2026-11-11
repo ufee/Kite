@@ -11,6 +11,7 @@ mod log;
 mod secrets;
 mod ssh;
 mod store;
+mod term;
 mod webview;
 
 use std::sync::Arc;
@@ -51,6 +52,7 @@ pub fn run() {
             let log = Arc::new(log::Log::new(Some(app.handle().clone())));
             app.manage(log.clone());
             app.manage(ssh::Ssh::new(app.handle().clone(), log));
+            app.manage(Arc::new(term::Terms::default()));
             if let Some(w) = app.get_webview_window("main") {
                 webview::harden(&w);
             }
@@ -92,6 +94,11 @@ pub fn run() {
             ipc::fs::fs_chmod,
             ipc::fs::fs_read_text,
             ipc::fs::fs_drives,
+            ipc::term::pty_open,
+            ipc::term::pty_write,
+            ipc::term::pty_resize,
+            ipc::term::pty_pause,
+            ipc::term::pty_close,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Kite");

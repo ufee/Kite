@@ -1,9 +1,9 @@
 /*
  * TauriBackend: the Rust core takes over method by method. Stage 3 brought SSH, host keys, the keychain,
- * keys and the agent and the core's log; stage 4 the files of this PC and of servers. Everything else
+ * keys and the agent and the core's log; stage 4 the files of this PC and of servers; stage 5 terminals. Everything else
  * still runs on the mock underneath; operations the core does not have yet reject with NOT_YET.
  */
-import { invoke } from '@tauri-apps/api/core';
+import { Channel, invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { tr, trn } from '../i18n';
 import { isLocal, LOCAL_WIN } from '../util/paths';
@@ -11,7 +11,7 @@ import { MockBackend } from './mock';
 import type { Store } from './store';
 import type {
   AgentStatus, BackendError, Entry, ErrCode, HostKeyRequest, LogRow, PassphraseRequest,
-  Server, ServerConfig, ServerDraft, ServerId, SessionState, Src, TestResult, TextFile,
+  PtyExit, Server, ServerConfig, ServerDraft, ServerId, SessionState, Src, TestResult, TextFile,
 } from './types';
 
 /** Error as the core sends it: the code and its facts, no words. */
@@ -75,6 +75,8 @@ export const uiError = (e: unknown): BackendError => {
 /** Every core call: errors cross as BackendError with ready words. */
 const call = <T>(cmd: string, args?: Record<string, unknown>) => invoke<T>(cmd, args).catch((e: unknown) => { throw uiError(e); });
 
+/** Terminal input from this size on (a paste) keeps its place in line by waiting for the reply. */
+const BIG_WRITE = 4096;
 /** A file source as the core takes it. */
 const where = (src: Src, user: string) => (isLocal(src) ? 'local' : { server: src, user });
 
@@ -165,8 +167,41 @@ export class TauriBackend extends MockBackend {
   // The mock's editor and queue work on its own files, not on the real ones the panes now show.
   override async editOpen() { throw notYet(7); }
   override async transferEnqueue(): Promise<number> { throw notYet(6); }
-  override async ptyOpen(src: Src, user: string, cwd: string, cols: number, rows: number, onData: (data: string) => void) {
-    if (!isLocal(src)) throw notYet(5);
-    return super.ptyOpen(src, user, cwd, cols, rows, onData);
+
+  /* ---------- Terminal ---------- */
+  override async ptyOpen(src: Src, user: string, cwd: string, shell: string, cols: number, rows: number,
+    onData: (data: string | Uint8Array) => void, onExit: (reason: PtyExit) => void) {
+    if (!isLocal(src)) {
+      const s = this.servers.get(src);
+      if (!s) throw { code: 'ENOENT', title: tr('Сервер удалён из списка'), text: '' } satisfies BackendError;
+      await this.sshConnect(s, user);
+    }
+    // One ordered channel: bytes as ArrayBuffers (xterm keeps UTF-8 split between chunks), then `{exit}`.
+    // Messages can beat the reply with the id: they wait until the caller has it.
+    let held: (() => void)[] | null = [];
+    const deliver = (fn: () => void) => (held ? held.push(fn) : fn());
+    const channel = new Channel<ArrayBuffer | { exit: PtyExit }>(m => {
+      if (m instanceof ArrayBuffer) { const b = new Uint8Array(m); deliver(() => onData(b)); } else deliver(() => onExit(m.exit));
+    });
+    const id = await call<number>('pty_open', { src: where(src, user), cwd, shell, cols, rows, onData: channel });
+    setTimeout(() => { const queue = held ?? []; held = null; queue.forEach(fn => fn()); }, 0);
+    return id;
   }
+  /** Per terminal: the last big write still on its way. */
+  private bigWrite = new Map<number, Promise<unknown>>();
+  /**
+   * Keys go out at once: one sync command each keeps them in order. A big paste is a separate request
+   * the webview may deliver later than the next key, so writes after it wait for its reply.
+   */
+  override ptyWrite(id: number, data: string) {
+    const prev = this.bigWrite.get(id);
+    const send = () => invoke('pty_write', { id, data });
+    if (!prev && data.length < BIG_WRITE) { void send(); return; }
+    const p = (prev ?? Promise.resolve()).then(send, send).catch(() => undefined);
+    this.bigWrite.set(id, p);
+    void p.then(() => { if (this.bigWrite.get(id) === p) this.bigWrite.delete(id); });
+  }
+  override ptyResize(id: number, cols: number, rows: number) { void invoke('pty_resize', { id, cols, rows }); }
+  override ptyPause(id: number, paused: boolean) { void invoke('pty_pause', { id, paused }); }
+  override ptyClose(id: number) { this.bigWrite.delete(id); void invoke('pty_close', { id }); }
 }
