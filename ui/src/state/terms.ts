@@ -4,7 +4,7 @@ import { Terminal, type ITheme } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { WebglAddon } from '@xterm/addon-webgl';
 import { SerializeAddon } from '@xterm/addon-serialize';
-import { backend, isBackendError, type Src } from '../backend';
+import { backend, isBackendError, type PtyExit, type Src } from '../backend';
 import { tr } from '../i18n';
 import { copyText, sleep } from '../util/format';
 import { childOf, isLocal, LOCAL_WIN, parentOf } from '../util/paths';
@@ -179,9 +179,12 @@ export function fitTerm(t: Term | null = curTerm.value) {
 /* ---------- Lifecycle ---------- */
 const DIM = (s: string) => `\x1b[90m${s}\x1b[0m\r\n`, RED = (s: string) => `\x1b[31m${s}\x1b[0m\r\n`;
 
+/** A shell that ends sooner than this after start (a bad setting, a broken profile) keeps its tab to show why. */
+const QUICK_EXIT_MS = 1000;
+
 function input(t: Term, d: string) {
   if (t.dead) {
-    if (d === '\r' && !isLocal(t.src)) connect(t);
+    if (d === '\r') connect(t);
     return;
   }
   if (!t.pty || t.busy) return;
@@ -198,9 +201,18 @@ async function connect(t: Term, quiet = false): Promise<boolean> {
     v.xt.write(DIM(tr('Подключение к {who} ({host})…', { who: `${t.user}@${s.code}`, host: s.host })));
   }
   v.line = ''; v.secret = false; v.lastOut = 0;
+  let started = 0;
   try {
-    t.pty = await backend.ptyOpen(t.src, t.user, t.cwd, settings.shell, v.xt.cols, v.xt.rows, d => output(v, d));
+    // Output and the exit wait until the id is here, so `started` is set by then.
+    const id = await backend.ptyOpen(t.src, t.user, t.cwd, settings.shell, v.xt.cols, v.xt.rows,
+      d => { if (views.has(t.id)) output(v, d); },
+      reason => exited(t, reason, performance.now() - started));
+    // Closed while connecting: nobody shows this shell.
+    if (!views.has(t.id)) { backend.ptyClose(id); return false; }
+    t.pty = id;
+    started = performance.now();
   } catch (e) {
+    if (!views.has(t.id)) return false;
     const err = isBackendError(e) ? e : { title: String(e), text: '' };
     v.xt.write(RED(`${err.title}.${err.text ? ' ' + err.text : ''}`) + DIM(tr('Enter: подключиться снова')));
     t.busy = false; t.dead = true; t.pty = null;
@@ -211,6 +223,18 @@ async function connect(t: Term, quiet = false): Promise<boolean> {
   fitTerm(t);
   if (!quiet) focusTerm();
   return true;
+}
+
+function exited(t: Term, reason: PtyExit, age: number) {
+  const v = views.get(t.id);
+  if (!v) return;
+  t.pty = null;
+  if (reason === 'exit' && age >= QUICK_EXIT_MS) { closeTerm(t.id); return; }
+  t.dead = true;
+  const why = reason === 'refused' ? tr('Сервер отказал в терминале')
+    : reason === 'exit' ? tr('Оболочка завершилась сразу после запуска')
+    : tr('Соединение с {c} закрыто', { c: label(t.src) });
+  v.xt.write('\r\n' + RED(why) + DIM(tr('Enter: подключиться снова')));
 }
 
 export async function openTerm(src: Src, user?: string, cwd?: string, quiet = false): Promise<Term | null> {
@@ -296,14 +320,6 @@ function pruneHistory() {
 }
 
 export async function initTerms(demo: boolean) {
-  backend.onPtyExit((pty, reason) => {
-    const t = terms.find(x => x.pty === pty);
-    if (!t) return;
-    t.pty = null;
-    if (reason === 'exit') { closeTerm(t.id); return; }
-    t.dead = true;
-    views.get(t.id)?.xt.write('\r\n' + RED(tr('Соединение с {c} закрыто', { c: label(t.src) })) + DIM(tr('Enter: подключиться снова')));
-  });
   watch(() => settings.termFont, n => { for (const [, v] of views) v.xt.options.fontSize = n; nextTick(() => fitTerm()); });
   watch(theme, () => nextTick(() => { const th = xtTheme(); for (const [, v] of views) v.xt.options.theme = th; }));
   // Turning history on saves what is on screen now; turning it off deletes the files.

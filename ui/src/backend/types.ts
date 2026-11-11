@@ -62,6 +62,8 @@ export const isBackendError = (e: unknown): e is BackendError =>
   !!e && typeof e === 'object' && 'code' in e && 'title' in e;
 
 export type SessionState = 'wait' | 'live' | 'bad';
+/** The shell exited (the tab closes), the connection went away, or the server refused the terminal. */
+export type PtyExit = 'exit' | 'disconnected' | 'refused';
 
 export interface HostKeyRequest {
   reqId: number;
@@ -229,7 +231,8 @@ export interface Backend {
   // Terminal: bytes go through `onData`, not through events
   /** `shell` is the setting (pwsh, powershell, cmd, or a path on Linux); servers run the user's login shell. */
   /** Output is UTF-8 bytes from the core (xterm parses them faster than strings) or text from the mock. */
-  ptyOpen(src: Src, user: string, cwd: string, shell: string, cols: number, rows: number, onData: (data: string | Uint8Array) => void): Promise<number>;
+  /** `onExit` comes after the last output and only for a terminal the UI did not close itself. */
+  ptyOpen(src: Src, user: string, cwd: string, shell: string, cols: number, rows: number, onData: (data: string | Uint8Array) => void, onExit: (reason: PtyExit) => void): Promise<number>;
   ptyWrite(id: number, data: string): void;
   ptyResize(id: number, cols: number, rows: number): void;
   ptyClose(id: number): void;
@@ -247,7 +250,6 @@ export interface Backend {
   onPromptGone(cb: (reqIds: number[]) => void): Unlisten;
   onTransferState(cb: (items: TransferItem[]) => void): Unlisten;
   onTransferBatch(cb: (r: BatchReport) => void): Unlisten;
-  onPtyExit(cb: (id: number, reason: string) => void): Unlisten;
   /** A watched file was saved in the editor; `uploaded` is true when autosave already sent it. */
   onEditChanged(cb: (src: Src, user: string, path: string, uploaded: boolean) => void): Unlisten;
   onLogRow(cb: (row: LogRow) => void): Unlisten;

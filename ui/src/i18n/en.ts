@@ -206,6 +206,8 @@ export const EN: Record<string, string> = {
   'подсчёт…': 'counting…', 'Загрузка…': 'Loading…', '{n} больше 10 МБ: откройте в редакторе': '{n} is over 10 MB: open it in an editor',
   'Проверяем агент OpenSSH…': 'Checking the OpenSSH agent…', 'Агент OpenSSH не запущен': 'OpenSSH agent is not running', 'Агент OpenSSH не ответил': 'OpenSSH agent did not respond',
   'Соединение с {c} закрыто': 'Connection to {c} closed',
+  'Сервер отказал в терминале': 'The server refused a terminal',
+  'Оболочка завершилась сразу после запуска': 'The shell exited right after start',
 
   // Mock backend
   'Ключ хоста не проверяется': 'Host key not verified', 'проверка выключена': 'verification off',

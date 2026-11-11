@@ -1,10 +1,11 @@
 //! Terminals. Output travels as `InvokeResponseBody::Raw`: an `ArrayBuffer` in JS, no JSON or base64 step.
+//! The exit goes as `{exit}` on the same channel, which keeps its order: it never overtakes the last output.
 
 use std::sync::Arc;
 
 use serde::Serialize;
 use tauri::{
-    AppHandle, Emitter, State,
+    State,
     ipc::{Channel, InvokeResponseBody},
 };
 
@@ -19,10 +20,9 @@ use crate::{
 
 type TermsState<'a> = State<'a, Arc<Terms>>;
 
-#[derive(Clone, Serialize)]
-struct ExitEvent {
-    id: u32,
-    reason: Exit,
+#[derive(Serialize)]
+struct ExitMsg {
+    exit: Exit,
 }
 
 fn sink(channel: Channel<InvokeResponseBody>) -> term::Output {
@@ -32,10 +32,12 @@ fn sink(channel: Channel<InvokeResponseBody>) -> term::Output {
 }
 
 /// Tells the UI, unless the tab was closed first: then nobody is waiting.
-fn on_exit(app: AppHandle, terms: Arc<Terms>, id: u32) -> term::OnExit {
+fn on_exit(channel: Channel<InvokeResponseBody>, terms: Arc<Terms>, id: u32) -> term::OnExit {
     Box::new(move |reason| {
-        if terms.ended(id) {
-            let _ = app.emit("pty://exit", ExitEvent { id, reason });
+        if terms.ended(id)
+            && let Ok(json) = serde_json::to_string(&ExitMsg { exit: reason })
+        {
+            let _ = channel.send(InvokeResponseBody::Json(json));
         }
     })
 }
@@ -43,7 +45,6 @@ fn on_exit(app: AppHandle, terms: Arc<Terms>, id: u32) -> term::OnExit {
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub async fn pty_open(
-    app: AppHandle,
     ssh: State<'_, Arc<Ssh>>,
     terms: TermsState<'_>,
     log: State<'_, Arc<Log>>,
@@ -56,7 +57,7 @@ pub async fn pty_open(
 ) -> Result<u32> {
     let terms = terms.inner().clone();
     let id = terms.allocate();
-    let exit = on_exit(app, terms.clone(), id);
+    let exit = on_exit(on_data.clone(), terms.clone(), id);
     let res = match src {
         Src::Local(_) => {
             let row = log.run("local", "PTY", msg!("Запуск терминала · {u}", u = shell));

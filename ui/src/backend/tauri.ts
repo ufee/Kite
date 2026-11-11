@@ -11,7 +11,7 @@ import { MockBackend } from './mock';
 import type { Store } from './store';
 import type {
   AgentStatus, BackendError, Entry, ErrCode, HostKeyRequest, LogRow, PassphraseRequest,
-  Server, ServerConfig, ServerDraft, ServerId, SessionState, Src, TestResult, TextFile,
+  PtyExit, Server, ServerConfig, ServerDraft, ServerId, SessionState, Src, TestResult, TextFile,
 } from './types';
 
 /** Error as the core sends it: the code and its facts, no words. */
@@ -92,9 +92,7 @@ export class TauriBackend extends MockBackend {
     // A reloaded window lost the dialogs of the page before: their connections stop waiting.
     void invoke('prompts_reset').catch(() => undefined);
     void listen<CoreRow>('log://row', e => this.emit('log', row(e.payload)));
-    void listen<CoreRow>('log://update', e => this.emit('logUpdate', row(e.payload)));
-    void listen<{ id: number; reason: string }>('pty://exit', e => this.ptyExited(e.payload.id, e.payload.reason));
-  }
+    void listen<CoreRow>('log://update', e => this.emit('logUpdate', row(e.payload)));  }
 
   /** Real servers only: the demo list belongs to the mock. */
   override async serversLoad(): Promise<ServerConfig> {
@@ -168,51 +166,25 @@ export class TauriBackend extends MockBackend {
   override async transferEnqueue(): Promise<number> { throw notYet(6); }
 
   /* ---------- Terminal ---------- */
-  /** Ids the core reported ended before `pty_open` returned them. */
-  private earlyExit = new Map<number, string>();
-  private opening = 0;
-
-  override async ptyOpen(src: Src, user: string, cwd: string, shell: string, cols: number, rows: number, onData: (data: string | Uint8Array) => void) {
+  override async ptyOpen(src: Src, user: string, cwd: string, shell: string, cols: number, rows: number,
+    onData: (data: string | Uint8Array) => void, onExit: (reason: PtyExit) => void) {
     if (!isLocal(src)) {
       const s = this.servers.get(src);
       if (!s) throw { code: 'ENOENT', title: tr('Сервер удалён из списка'), text: '' } satisfies BackendError;
       await this.sshConnect(s, user);
     }
-    // Bytes arrive as ArrayBuffers and go to xterm as they are: it keeps UTF-8 split between chunks.
-    // The first ones can beat the reply with the id: they wait until the caller has it.
-    let held: Uint8Array[] | null = [];
-    const channel = new Channel<ArrayBuffer>(buf => {
-      const b = new Uint8Array(buf);
-      if (held) held.push(b); else onData(b);
+    // One ordered channel: bytes as ArrayBuffers (xterm keeps UTF-8 split between chunks), then `{exit}`.
+    // Messages can beat the reply with the id: they wait until the caller has it.
+    let held: (() => void)[] | null = [];
+    const deliver = (fn: () => void) => (held ? held.push(fn) : fn());
+    const channel = new Channel<ArrayBuffer | { exit: PtyExit }>(m => {
+      if (m instanceof ArrayBuffer) { const b = new Uint8Array(m); deliver(() => onData(b)); } else deliver(() => onExit(m.exit));
     });
-    this.opening++;
-    let id: number;
-    try {
-      id = await call<number>('pty_open', { src: where(src, user), cwd, shell, cols, rows, onData: channel });
-    } finally {
-      this.opening--;
-    }
-    setTimeout(() => {
-      const queue = held ?? [];
-      held = null;
-      queue.forEach(onData);
-      const reason = this.earlyExit.get(id);
-      if (reason) { this.earlyExit.delete(id); this.emit('ptyExit', id, reason); }
-    }, 0);
+    const id = await call<number>('pty_open', { src: where(src, user), cwd, shell, cols, rows, onData: channel });
+    setTimeout(() => { const queue = held ?? []; held = null; queue.forEach(fn => fn()); }, 0);
     return id;
   }
   override ptyWrite(id: number, data: string) { void invoke('pty_write', { id, data }); }
   override ptyResize(id: number, cols: number, rows: number) { void invoke('pty_resize', { id, cols, rows }); }
   override ptyClose(id: number) { void invoke('pty_close', { id }); }
-  private ptyExited(id: number, reason: string) {
-    // Not known yet to the caller while some `pty_open` is still waiting for its reply.
-    if (this.opening) { this.earlyExit.set(id, reason); setTimeout(() => this.ptyExitLate(id), 0); return; }
-    this.emit('ptyExit', id, reason);
-  }
-  /** An early exit whose open already returned: the open's own timer may have handled it. */
-  private ptyExitLate(id: number) {
-    if (this.opening) { setTimeout(() => this.ptyExitLate(id), 50); return; }
-    const reason = this.earlyExit.get(id);
-    if (reason) { this.earlyExit.delete(id); this.emit('ptyExit', id, reason); }
-  }
 }

@@ -27,12 +27,15 @@ use crate::{
 pub type Output = Arc<dyn Fn(Vec<u8>) + Send + Sync>;
 pub type OnExit = Box<dyn FnOnce(Exit) + Send>;
 
-/// Why a terminal ended: the shell exited (the tab closes) or the connection went away (Enter reconnects).
+/// Why a terminal ended: the shell exited (the tab closes), the connection went away,
+/// or the server refused the PTY or the command (`no-pty`, `PermitTTY no`). Enter reconnects the last two.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Exit {
-    Exit,
+    #[serde(rename = "exit")]
+    Exited,
     Disconnected,
+    Refused,
 }
 
 /// Each IPC message costs a round trip through the webview, so a flood is coalesced.
@@ -128,22 +131,29 @@ fn close(open: Open) {
 
 /* ---------- Server ---------- */
 
-/// `'…'` for a POSIX shell (also fish and tcsh): a quote inside becomes `'\''`.
+/// `'…'` with a quote inside as `'\''`: one meaning in sh, bash, zsh, fish and tcsh
+/// as long as the text has no backslash (fish unescapes `\\` and `\'` inside quotes).
 fn quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
-/// What the channel runs to start in `cwd`. None: the login shell in the home folder.
-/// `cd` failing (the folder is gone) leaves its message and falls back to home; no extra
-/// command lands in the shell's history because the shell itself starts after `exec`.
+/// What the channel runs to start in `cwd`, in whatever login shell the user has.
+/// None: the login shell in the home folder, also for a folder no quoting suits every shell
+/// (a backslash or a control character: fish and csh read those differently).
+/// `cd` failing (the folder is gone) leaves its message and the shell starts in home;
+/// no extra command lands in the shell's history because the shell itself starts after `exec`.
+/// The path is absolute or under `~/`, so it never starts with `-` and needs no `--`.
 pub fn start_command(cwd: &str) -> Option<String> {
-    let cwd = cwd.trim();
+    if cwd.chars().any(|c| c == '\\' || c.is_control()) {
+        return None;
+    }
     let target = match cwd {
         "" | "~" | "~/" => return None,
         _ if cwd.starts_with("~/") => format!("~/{}", quote(&cwd[2..])),
-        _ => quote(cwd),
+        _ if cwd.starts_with('/') => quote(cwd),
+        _ => return None,
     };
-    Some(format!("cd -- {target} || cd; exec \"$SHELL\" -l"))
+    Some(format!("cd {target}; exec \"$SHELL\" -l"))
 }
 
 pub async fn open_remote(session: Arc<Session>, cwd: &str, cols: u16, rows: u16, output: Output, on_exit: OnExit) -> Result<Handle> {
@@ -181,6 +191,7 @@ async fn run_remote(session: Arc<Session>, channel: Channel<Msg>, mut commands: 
     let mut deadline: Option<time::Instant> = None;
     let mut burst = 0usize;
     let mut exited = false;
+    let mut refused = false;
     let flush = |buffer: &mut Vec<u8>| {
         if !buffer.is_empty() {
             output(std::mem::take(buffer));
@@ -207,6 +218,12 @@ async fn run_remote(session: Arc<Session>, channel: Channel<Msg>, mut commands: 
                 }
                 // OpenSSH sends EOF before the exit status: keep reading until the channel closes.
                 Some(ChannelMsg::ExitStatus { .. } | ChannelMsg::ExitSignal { .. }) => exited = true,
+                // Only the PTY and exec/shell requests want a reply: a refusal of either leaves no usable terminal.
+                // The UI forgets the id on exit; the dropped queue then closes the channel.
+                Some(ChannelMsg::Failure) => {
+                    refused = true;
+                    break;
+                }
                 Some(ChannelMsg::Close) | None => break,
                 Some(_) => {}
             },
@@ -218,9 +235,13 @@ async fn run_remote(session: Arc<Session>, channel: Channel<Msg>, mut commands: 
         }
     }
     flush(&mut buffer);
+    if refused {
+        on_exit(Exit::Refused);
+        return;
+    }
     // A channel that ends without an exit status on a dead connection was cut, not exited.
     let gone = !exited && (session.is_closed() || wait_closed(&session).await);
-    on_exit(if gone { Exit::Disconnected } else { Exit::Exit });
+    on_exit(if gone { Exit::Disconnected } else { Exit::Exited });
 }
 
 /// A dropped connection may close its channels a moment before the handle reports it.
@@ -287,8 +308,16 @@ pub fn open_local(shell: &str, cwd: &str, cols: u16, rows: u16, output: Output, 
     drop(pty.slave);
 
     let master = pty.master;
-    let mut reader = master.try_clone_reader().map_err(|e| Error::Einval { reason: e.to_string() })?;
-    let mut writer = master.take_writer().map_err(|e| Error::Einval { reason: e.to_string() })?;
+    let ends = master.try_clone_reader().and_then(|r| master.take_writer().map(|w| (r, w)));
+    let (mut reader, mut writer) = match ends {
+        Ok(ends) => ends,
+        Err(e) => {
+            // Nobody would own the shell otherwise.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(Error::Einval { reason: e.to_string() });
+        }
+    };
     let killer = child.clone_killer();
     let (tx, mut rx) = mpsc::unbounded_channel();
 
@@ -320,7 +349,7 @@ pub fn open_local(shell: &str, cwd: &str, cols: u16, rows: u16, output: Output, 
 
     std::thread::spawn(move || {
         let _ = child.wait();
-        on_exit(Exit::Exit);
+        on_exit(Exit::Exited);
     });
 
     Ok((tx, killer))
@@ -346,8 +375,12 @@ mod tests {
     fn start_command_quotes() {
         assert_eq!(start_command(""), None);
         assert_eq!(start_command("~"), None);
-        assert_eq!(start_command("/var/www"), Some("cd -- '/var/www' || cd; exec \"$SHELL\" -l".into()));
-        assert_eq!(start_command("~/my site"), Some("cd -- ~/'my site' || cd; exec \"$SHELL\" -l".into()));
-        assert_eq!(start_command("/tmp/it's; rm -rf /"), Some("cd -- '/tmp/it'\\''s; rm -rf /' || cd; exec \"$SHELL\" -l".into()));
+        assert_eq!(start_command("www"), None);
+        assert_eq!(start_command("/var/www"), Some("cd '/var/www'; exec \"$SHELL\" -l".into()));
+        assert_eq!(start_command("~/my site "), Some("cd ~/'my site '; exec \"$SHELL\" -l".into()));
+        assert_eq!(start_command("/tmp/it's; rm -rf /"), Some("cd '/tmp/it'\\''s; rm -rf /'; exec \"$SHELL\" -l".into()));
+        // fish would unescape these inside quotes: such folders start in home instead.
+        assert_eq!(start_command(r"/tmp/x\'; rm -rf ~; echo \'"), None);
+        assert_eq!(start_command("/tmp/a\nb"), None);
     }
 }
