@@ -208,6 +208,7 @@ export const EN: Record<string, string> = {
   'Соединение с {c} закрыто': 'Connection to {c} closed',
   'Сервер отказал в терминале': 'The server refused a terminal',
   'Оболочка завершилась сразу после запуска': 'The shell exited right after start',
+  'Оболочка завершена сигналом': 'The shell was killed by a signal',
 
   // Mock backend
   'Ключ хоста не проверяется': 'Host key not verified', 'проверка выключена': 'verification off',

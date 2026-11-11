@@ -76,6 +76,8 @@ export const uiError = (e: unknown): BackendError => {
 const call = <T>(cmd: string, args?: Record<string, unknown>) => invoke<T>(cmd, args).catch((e: unknown) => { throw uiError(e); });
 
 /** A file source as the core takes it. */
+/** Terminal input from this size on (a paste) keeps its place in line by waiting for the reply. */
+const BIG_WRITE = 4096;
 const where = (src: Src, user: string) => (isLocal(src) ? 'local' : { server: src, user });
 
 const notYet = (stage: number): BackendError => ({ code: 'NOT_YET', title: tr('Будет на этапе {n}', { n: stage }), text: '' });
@@ -92,7 +94,8 @@ export class TauriBackend extends MockBackend {
     // A reloaded window lost the dialogs of the page before: their connections stop waiting.
     void invoke('prompts_reset').catch(() => undefined);
     void listen<CoreRow>('log://row', e => this.emit('log', row(e.payload)));
-    void listen<CoreRow>('log://update', e => this.emit('logUpdate', row(e.payload)));  }
+    void listen<CoreRow>('log://update', e => this.emit('logUpdate', row(e.payload)));
+  }
 
   /** Real servers only: the demo list belongs to the mock. */
   override async serversLoad(): Promise<ServerConfig> {
@@ -184,7 +187,21 @@ export class TauriBackend extends MockBackend {
     setTimeout(() => { const queue = held ?? []; held = null; queue.forEach(fn => fn()); }, 0);
     return id;
   }
-  override ptyWrite(id: number, data: string) { void invoke('pty_write', { id, data }); }
+  /** Per terminal: the last big write still on its way. */
+  private bigWrite = new Map<number, Promise<unknown>>();
+  /**
+   * Keys go out at once: one sync command each keeps them in order. A big paste is a separate request
+   * the webview may deliver later than the next key, so writes after it wait for its reply.
+   */
+  override ptyWrite(id: number, data: string) {
+    const prev = this.bigWrite.get(id);
+    const send = () => invoke('pty_write', { id, data });
+    if (!prev && data.length < BIG_WRITE) { void send(); return; }
+    const p = (prev ?? Promise.resolve()).then(send, send).catch(() => undefined);
+    this.bigWrite.set(id, p);
+    void p.then(() => { if (this.bigWrite.get(id) === p) this.bigWrite.delete(id); });
+  }
   override ptyResize(id: number, cols: number, rows: number) { void invoke('pty_resize', { id, cols, rows }); }
-  override ptyClose(id: number) { void invoke('pty_close', { id }); }
+  override ptyPause(id: number, paused: boolean) { void invoke('pty_pause', { id, paused }); }
+  override ptyClose(id: number) { this.bigWrite.delete(id); void invoke('pty_close', { id }); }
 }

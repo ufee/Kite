@@ -15,7 +15,7 @@ use crate::{
     log::Log,
     msg,
     ssh::Ssh,
-    term::{self, Command, Exit, Terms},
+    term::{self, Command, Exit, Flow, Terms},
 };
 
 type TermsState<'a> = State<'a, Arc<Terms>>;
@@ -58,12 +58,13 @@ pub async fn pty_open(
     let terms = terms.inner().clone();
     let id = terms.allocate();
     let exit = on_exit(on_data.clone(), terms.clone(), id);
+    let flow = Arc::new(Flow::default());
     let res = match src {
         Src::Local(_) => {
             let row = log.run("local", "PTY", msg!("Запуск терминала · {u}", u = shell));
             let (shell, t) = (shell.clone(), terms.clone());
             let opened = tauri::async_runtime::spawn_blocking(move || {
-                term::open_local(&shell, &cwd, cols, rows, sink(on_data), exit).map(|(h, kill)| t.register_local(id, h, kill))
+                term::open_local(&shell, &cwd, cols, rows, flow, sink(on_data), exit).map(|open| t.register(id, open))
             })
             .await
             .map_err(crate::error::Error::ssh)
@@ -77,7 +78,7 @@ pub async fn pty_open(
                 Err(e) => Err(e),
                 Ok(session) => {
                     let row = log.run(&session.code, "PTY", msg!("Запуск терминала · {u}", u = user));
-                    let opened = term::open_remote(session, &cwd, cols, rows, sink(on_data), exit).await.map(|h| terms.register_remote(id, h));
+                    let opened = term::open_remote(session, &cwd, cols, rows, flow, sink(on_data), exit).await.map(|open| terms.register(id, open));
                     log.done(row, opened.as_ref().map_or_else(|e| e.to_string(), |_| String::new()), state(&opened));
                     opened
                 }
@@ -107,6 +108,12 @@ pub fn pty_write(terms: TermsState<'_>, id: u32, data: String) {
 #[tauri::command]
 pub fn pty_resize(terms: TermsState<'_>, id: u32, cols: u16, rows: u16) {
     terms.send(id, Command::Resize(cols, rows));
+}
+
+/// The UI's terminal is behind (`true`) or caught up (`false`): see `term::Flow`.
+#[tauri::command]
+pub fn pty_pause(terms: TermsState<'_>, id: u32, paused: bool) {
+    terms.pause(id, paused);
 }
 
 #[tauri::command]

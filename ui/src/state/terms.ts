@@ -35,6 +35,11 @@ interface View {
   /** Output since the last history save. */
   dirty: boolean;
   lastOut: number;
+  /** Output handed to xterm and not parsed yet; above the high mark the core pauses. */
+  pending: number;
+  paused: boolean;
+  /** The end of the output as text across chunks, for the password prompt check. */
+  tail: string;
 }
 /** A tab as session.json keeps it. */
 export interface SavedTerm { id: number; src: Src; user: string; cwd: string; input: string; dead: boolean }
@@ -106,7 +111,7 @@ function makeView(t: Term): View {
     if (text) xt.paste(text);
     xt.focus();
   });
-  return { xt, fit, serial, el, opened: false, line: '', secret: false, dirty: false, lastOut: 0 };
+  return { xt, fit, serial, el, opened: false, line: '', secret: false, dirty: false, lastOut: 0, pending: 0, paused: false, tail: '' };
 }
 
 /**
@@ -135,15 +140,27 @@ function trackLine(v: View, d: string) {
   else if (/[\x00-\x1f\x7f]/.test(d)) v.line = null;
   else v.line += d;
 }
-const ASKS_SECRET = /(password|passphrase|пароль)[^\r\n]*:\s*$/i;
+/** Matched on the last line of the output with escape sequences cut out: ConPTY adds some after the prompt. */
+const ASKS_SECRET = /(password|passphrase|пароль)[^\r\n]*:[ \t]*$/i;
+const ESCAPES = /\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][0-9A-Za-z]|\x1b[=>78]/g;
+const TAIL = 512;
+/** Flow control after xterm's guide: pause the core above the high mark, resume below the low one. */
+const HIGH_MARK = 3 << 20, LOW_MARK = 1536 << 10;
 const utf8 = new TextDecoder();
-function output(v: View, d: string | Uint8Array) {
-  v.xt.write(d);
+function output(t: Term, v: View, d: string | Uint8Array) {
+  const n = d.length;
+  v.pending += n;
+  v.xt.write(d, () => {
+    v.pending -= n;
+    if (v.paused && v.pending < LOW_MARK) { v.paused = false; if (t.pty) backend.ptyPause(t.pty, false); }
+  });
+  if (!v.paused && v.pending > HIGH_MARK && t.pty) { v.paused = true; backend.ptyPause(t.pty, true); }
   v.dirty = true;
   v.lastOut = performance.now();
-  // Only the end of the chunk matters; a character cut at its start decodes as U+FFFD, which is fine here.
-  const end = typeof d === 'string' ? d.slice(-120) : utf8.decode(d.subarray(-240));
-  if (ASKS_SECRET.test(end)) { v.secret = true; v.line = ''; }
+  // A character cut at the start of the slice decodes as U+FFFD, which is fine here.
+  const text = typeof d === 'string' ? d : utf8.decode(d.length > TAIL ? d.subarray(-TAIL) : d);
+  v.tail = (text.length >= TAIL ? text : v.tail + text).slice(-TAIL);
+  if (ASKS_SECRET.test(v.tail.replace(ESCAPES, ''))) { v.secret = true; v.line = ''; }
 }
 /** The shell is ready once it has printed something and then stayed quiet for a moment. */
 async function shellReady(v: View) {
@@ -177,6 +194,11 @@ export function fitTerm(t: Term | null = curTerm.value) {
 }
 
 /* ---------- Lifecycle ---------- */
+/**
+ * What a program that died mid-screen (vim, htop, mc, tmux) left on: the alternate screen, mouse reports,
+ * focus events, bracketed paste, application keys, a hidden cursor, colors. The next shell needs none of it.
+ */
+const RESET_MODES = '\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1004l\x1b[?2004l\x1b[?1l\x1b>\x1b[?25h\x1b[0m';
 const DIM = (s: string) => `\x1b[90m${s}\x1b[0m\r\n`, RED = (s: string) => `\x1b[31m${s}\x1b[0m\r\n`;
 
 /** A shell that ends sooner than this after start (a bad setting, a broken profile) keeps its tab to show why. */
@@ -200,13 +222,17 @@ async function connect(t: Term, quiet = false): Promise<boolean> {
     if (!s) { v.xt.write(RED(tr('Сервер удалён из списка'))); t.dead = true; t.busy = false; return false; }
     v.xt.write(DIM(tr('Подключение к {who} ({host})…', { who: `${t.user}@${s.code}`, host: s.host })));
   }
-  v.line = ''; v.secret = false; v.lastOut = 0;
-  let started = 0;
+  v.line = ''; v.secret = false; v.lastOut = 0; v.tail = '';
+  // The shell and its profile (motd, tmux) should see the real size, not xterm's 80×24 before it is laid out.
+  // The panel attaches a new tab a tick after it becomes current; a frame covers that (the timer: a hidden window has no frames).
+  await Promise.race([new Promise(requestAnimationFrame), sleep(50)]);
+  if (v.opened && v.el.clientHeight >= 20) v.fit.fit();
+  let started = 0, over = false;
   try {
     // Output and the exit wait until the id is here, so `started` is set by then.
     const id = await backend.ptyOpen(t.src, t.user, t.cwd, settings.shell, v.xt.cols, v.xt.rows,
-      d => { if (views.has(t.id)) output(v, d); },
-      reason => exited(t, reason, performance.now() - started));
+      d => { if (!over && views.has(t.id)) output(t, v, d); },
+      reason => { over = true; exited(t, reason, performance.now() - started); });
     // Closed while connecting: nobody shows this shell.
     if (!views.has(t.id)) { backend.ptyClose(id); return false; }
     t.pty = id;
@@ -232,9 +258,10 @@ function exited(t: Term, reason: PtyExit, age: number) {
   if (reason === 'exit' && age >= QUICK_EXIT_MS) { closeTerm(t.id); return; }
   t.dead = true;
   const why = reason === 'refused' ? tr('Сервер отказал в терминале')
+    : reason === 'killed' ? tr('Оболочка завершена сигналом')
     : reason === 'exit' ? tr('Оболочка завершилась сразу после запуска')
     : tr('Соединение с {c} закрыто', { c: label(t.src) });
-  v.xt.write('\r\n' + RED(why) + DIM(tr('Enter: подключиться снова')));
+  v.xt.write(RESET_MODES + '\r\n' + RED(why) + DIM(tr('Enter: подключиться снова')));
 }
 
 export async function openTerm(src: Src, user?: string, cwd?: string, quiet = false): Promise<Term | null> {

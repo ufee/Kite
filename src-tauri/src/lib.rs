@@ -97,6 +97,7 @@ pub fn run() {
             ipc::term::pty_open,
             ipc::term::pty_write,
             ipc::term::pty_resize,
+            ipc::term::pty_pause,
             ipc::term::pty_close,
         ])
         .run(tauri::generate_context!())

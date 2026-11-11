@@ -62,8 +62,8 @@ export const isBackendError = (e: unknown): e is BackendError =>
   !!e && typeof e === 'object' && 'code' in e && 'title' in e;
 
 export type SessionState = 'wait' | 'live' | 'bad';
-/** The shell exited (the tab closes), the connection went away, or the server refused the terminal. */
-export type PtyExit = 'exit' | 'disconnected' | 'refused';
+/** The shell exited (the tab closes), the connection went away, the server refused the terminal, or a signal killed the shell. */
+export type PtyExit = 'exit' | 'disconnected' | 'refused' | 'killed';
 
 export interface HostKeyRequest {
   reqId: number;
@@ -235,6 +235,8 @@ export interface Backend {
   ptyOpen(src: Src, user: string, cwd: string, shell: string, cols: number, rows: number, onData: (data: string | Uint8Array) => void, onExit: (reason: PtyExit) => void): Promise<number>;
   ptyWrite(id: number, data: string): void;
   ptyResize(id: number, cols: number, rows: number): void;
+  /** The terminal is behind on output: the core stops reading until it catches up. */
+  ptyPause(id: number, paused: boolean): void;
   ptyClose(id: number): void;
 
   // State the core already holds (after a UI reload), fetched once after subscribing

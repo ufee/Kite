@@ -684,6 +684,7 @@ export class MockBackend implements Backend {
   }
   ptyWrite(id: number, data: string) { this.ptys.get(id)?.shell.write(data); }
   ptyResize(_id: number, _cols: number, _rows: number) { /* the mock shell does not wrap lines itself */ }
+  ptyPause(_id: number, _paused: boolean) { /* the mock shell writes little */ }
   ptyClose(id: number) { this.ptys.delete(id); }
 
   /* ---------- Demo state on the first launch ---------- */
