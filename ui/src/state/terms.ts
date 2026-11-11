@@ -46,7 +46,7 @@ const views = new Map<number, View>();
 let termId = 0;
 export const curTerm = computed(() => terms.find(t => t.id === ui.term) || null);
 export const termTitle = (t: Term) => (isLocal(t.src) ? shellName() : `${t.user}@${label(t.src)}`);
-const shellName = () => (settings.shell === 'cmd' ? 'cmd' : settings.shell === 'powershell' ? 'Windows PowerShell' : 'PowerShell');
+export const shellName = () => (settings.shell === 'cmd' ? 'cmd' : settings.shell === 'powershell' ? 'Windows PowerShell' : 'PowerShell');
 
 /** Keys the app handles even when the terminal has focus: xterm must not send them to the shell. */
 export function appKey(e: KeyboardEvent): boolean {
@@ -73,7 +73,7 @@ const MONO = "'JetBrains Mono Variable', 'Cascadia Mono', Consolas, monospace";
 function makeView(t: Term): View {
   const xt = new Terminal({
     fontFamily: MONO, fontSize: settings.termFont, lineHeight: 1.2, cursorBlink: true, cursorStyle: 'bar',
-    scrollback: 5000, allowProposedApi: false, theme: xtTheme(), drawBoldTextInBrightColors: false,
+    scrollback: HISTORY_LINES, allowProposedApi: false, theme: xtTheme(), drawBoldTextInBrightColors: false,
     macOptionIsMeta: true, rightClickSelectsWord: false,
   });
   const fit = new FitAddon(), serial = new SerializeAddon();
@@ -125,7 +125,8 @@ function osc7Path(t: Term, data: string): string | null {
 
 /** Follows what is typed, so an unsent command survives a restart. Best effort: unknown edits give up. */
 function trackLine(v: View, d: string) {
-  d = d.replace(/\x1b\[20[01]~/g, ''); // bracketed paste markers
+  // Bracketed paste markers, and xterm's own replies (cursor position for ConPTY, device attributes, focus).
+  d = d.replace(/\x1b\[20[01]~|\x1b\[\d+;\d+R|\x1b\[[?>][\d;]*c|\x1b\[[IO]/g, '');
   const k = d.lastIndexOf('\r');
   if (k >= 0) { v.line = ''; v.secret = false; d = d.slice(k + 1); }
   if (!d || v.secret || v.line === null) return;
@@ -135,11 +136,14 @@ function trackLine(v: View, d: string) {
   else v.line += d;
 }
 const ASKS_SECRET = /(password|passphrase|пароль)[^\r\n]*:\s*$/i;
-function output(v: View, d: string) {
+const utf8 = new TextDecoder();
+function output(v: View, d: string | Uint8Array) {
   v.xt.write(d);
   v.dirty = true;
   v.lastOut = performance.now();
-  if (ASKS_SECRET.test(d.slice(-120))) { v.secret = true; v.line = ''; }
+  // Only the end of the chunk matters; a character cut at its start decodes as U+FFFD, which is fine here.
+  const end = typeof d === 'string' ? d.slice(-120) : utf8.decode(d.subarray(-240));
+  if (ASKS_SECRET.test(end)) { v.secret = true; v.line = ''; }
 }
 /** The shell is ready once it has printed something and then stayed quiet for a moment. */
 async function shellReady(v: View) {
@@ -195,7 +199,7 @@ async function connect(t: Term, quiet = false): Promise<boolean> {
   }
   v.line = ''; v.secret = false; v.lastOut = 0;
   try {
-    t.pty = await backend.ptyOpen(t.src, t.user, t.cwd, v.xt.cols, v.xt.rows, d => output(v, d));
+    t.pty = await backend.ptyOpen(t.src, t.user, t.cwd, settings.shell, v.xt.cols, v.xt.rows, d => output(v, d));
   } catch (e) {
     const err = isBackendError(e) ? e : { title: String(e), text: '' };
     v.xt.write(RED(`${err.title}.${err.text ? ' ' + err.text : ''}`) + DIM(tr('Enter: подключиться снова')));

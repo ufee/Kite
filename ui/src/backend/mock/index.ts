@@ -654,7 +654,7 @@ export class MockBackend implements Backend {
   }
 
   /* ---------- Terminal ---------- */
-  async ptyOpen(src: Src, user: string, cwd: string, _cols: number, _rows: number, onData: (d: string) => void) {
+  async ptyOpen(src: Src, user: string, cwd: string, _shell: string, _cols: number, _rows: number, onData: (d: string | Uint8Array) => void) {
     let session: string | null = null, code = '';
     if (!isLocal(src)) {
       const s = this.servers.get(src);
@@ -682,7 +682,7 @@ export class MockBackend implements Backend {
     return id;
   }
   ptyWrite(id: number, data: string) { this.ptys.get(id)?.shell.write(data); }
-  ptyResize() { /* the mock shell does not wrap lines itself */ }
+  ptyResize(_id: number, _cols: number, _rows: number) { /* the mock shell does not wrap lines itself */ }
   ptyClose(id: number) { this.ptys.delete(id); }
 
   /* ---------- Demo state on the first launch ---------- */

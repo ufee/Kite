@@ -1,9 +1,9 @@
 /*
  * TauriBackend: the Rust core takes over method by method. Stage 3 brought SSH, host keys, the keychain,
- * keys and the agent and the core's log; stage 4 the files of this PC and of servers. Everything else
+ * keys and the agent and the core's log; stage 4 the files of this PC and of servers; stage 5 terminals. Everything else
  * still runs on the mock underneath; operations the core does not have yet reject with NOT_YET.
  */
-import { invoke } from '@tauri-apps/api/core';
+import { Channel, invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { tr, trn } from '../i18n';
 import { isLocal, LOCAL_WIN } from '../util/paths';
@@ -93,6 +93,7 @@ export class TauriBackend extends MockBackend {
     void invoke('prompts_reset').catch(() => undefined);
     void listen<CoreRow>('log://row', e => this.emit('log', row(e.payload)));
     void listen<CoreRow>('log://update', e => this.emit('logUpdate', row(e.payload)));
+    void listen<{ id: number; reason: string }>('pty://exit', e => this.ptyExited(e.payload.id, e.payload.reason));
   }
 
   /** Real servers only: the demo list belongs to the mock. */
@@ -165,8 +166,53 @@ export class TauriBackend extends MockBackend {
   // The mock's editor and queue work on its own files, not on the real ones the panes now show.
   override async editOpen() { throw notYet(7); }
   override async transferEnqueue(): Promise<number> { throw notYet(6); }
-  override async ptyOpen(src: Src, user: string, cwd: string, cols: number, rows: number, onData: (data: string) => void) {
-    if (!isLocal(src)) throw notYet(5);
-    return super.ptyOpen(src, user, cwd, cols, rows, onData);
+
+  /* ---------- Terminal ---------- */
+  /** Ids the core reported ended before `pty_open` returned them. */
+  private earlyExit = new Map<number, string>();
+  private opening = 0;
+
+  override async ptyOpen(src: Src, user: string, cwd: string, shell: string, cols: number, rows: number, onData: (data: string | Uint8Array) => void) {
+    if (!isLocal(src)) {
+      const s = this.servers.get(src);
+      if (!s) throw { code: 'ENOENT', title: tr('Сервер удалён из списка'), text: '' } satisfies BackendError;
+      await this.sshConnect(s, user);
+    }
+    // Bytes arrive as ArrayBuffers and go to xterm as they are: it keeps UTF-8 split between chunks.
+    // The first ones can beat the reply with the id: they wait until the caller has it.
+    let held: Uint8Array[] | null = [];
+    const channel = new Channel<ArrayBuffer>(buf => {
+      const b = new Uint8Array(buf);
+      if (held) held.push(b); else onData(b);
+    });
+    this.opening++;
+    let id: number;
+    try {
+      id = await call<number>('pty_open', { src: where(src, user), cwd, shell, cols, rows, onData: channel });
+    } finally {
+      this.opening--;
+    }
+    setTimeout(() => {
+      const queue = held ?? [];
+      held = null;
+      queue.forEach(onData);
+      const reason = this.earlyExit.get(id);
+      if (reason) { this.earlyExit.delete(id); this.emit('ptyExit', id, reason); }
+    }, 0);
+    return id;
+  }
+  override ptyWrite(id: number, data: string) { void invoke('pty_write', { id, data }); }
+  override ptyResize(id: number, cols: number, rows: number) { void invoke('pty_resize', { id, cols, rows }); }
+  override ptyClose(id: number) { void invoke('pty_close', { id }); }
+  private ptyExited(id: number, reason: string) {
+    // Not known yet to the caller while some `pty_open` is still waiting for its reply.
+    if (this.opening) { this.earlyExit.set(id, reason); setTimeout(() => this.ptyExitLate(id), 0); return; }
+    this.emit('ptyExit', id, reason);
+  }
+  /** An early exit whose open already returned: the open's own timer may have handled it. */
+  private ptyExitLate(id: number) {
+    if (this.opening) { setTimeout(() => this.ptyExitLate(id), 50); return; }
+    const reason = this.earlyExit.get(id);
+    if (reason) { this.earlyExit.delete(id); this.emit('ptyExit', id, reason); }
   }
 }

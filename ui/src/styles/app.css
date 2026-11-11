@@ -275,7 +275,9 @@ svg { flex: none; display: block; }
 .handle-h::after { content: ''; position: absolute; left: 0; right: 0; top: 2px; height: 2px; background: var(--ac); opacity: 0; transition: opacity .15s ease-out; }
 .handle-h:hover::after, .app.drag-term .handle-h::after { opacity: 1; }
 .thead { height: 36px; flex: none; display: flex; align-items: center; gap: 2px; padding: 0 8px 0 10px; }
-.ttabs { display: flex; gap: 2px; min-width: 0; overflow: hidden; }
+/* Extra tabs scroll sideways (wheel or the active one coming into view), without a scrollbar. */
+.ttabs { display: flex; gap: 2px; min-width: 0; overflow-x: auto; overflow-y: hidden; scrollbar-width: none; overscroll-behavior: contain; }
+.ttabs::-webkit-scrollbar { display: none; }
 .ttab { height: 28px; display: flex; align-items: center; border-radius: 6px; color: var(--tx2); flex: none; transition: background-color .12s ease-out, color .12s ease-out; }
 .ttab:hover { background: var(--hover); }
 .ttab.on { background: var(--hover); color: var(--tx); }

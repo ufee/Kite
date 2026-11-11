@@ -227,7 +227,9 @@ export interface Backend {
   editUpload(src: Src, user: string, path: string): Promise<void>;
 
   // Terminal: bytes go through `onData`, not through events
-  ptyOpen(src: Src, user: string, cwd: string, cols: number, rows: number, onData: (data: string) => void): Promise<number>;
+  /** `shell` is the setting (pwsh, powershell, cmd, or a path on Linux); servers run the user's login shell. */
+  /** Output is UTF-8 bytes from the core (xterm parses them faster than strings) or text from the mock. */
+  ptyOpen(src: Src, user: string, cwd: string, shell: string, cols: number, rows: number, onData: (data: string | Uint8Array) => void): Promise<number>;
   ptyWrite(id: number, data: string): void;
   ptyResize(id: number, cols: number, rows: number): void;
   ptyClose(id: number): void;

@@ -164,7 +164,7 @@ export const EN: Record<string, string> = {
   'Проверка соединения · {u}': 'Checking connection · {u}', 'Подключение к {addr}': 'Connecting to {addr}', 'нет ответа за 10 с': 'no reply in 10 s',
   'Сервер не отвечает': 'Server not responding', '{addr}: нет ответа за 10 с. Проверьте адрес или сеть.': '{addr}: no reply in 10 s. Check the address or network.',
   'активно': 'alive', 'соединение установлено': 'connected', 'Соединение закрыто': 'Connection closed', 'Отключено от {c}': 'Disconnected from {c}',
-  'Подключение к {who}…': 'Connecting to {who}…', 'Запуск терминала': 'Starting terminal', 'прервано': 'interrupted',
+  'Подключение к {who}…': 'Connecting to {who}…', 'Запуск терминала': 'Starting terminal', 'Запуск терминала · {u}': 'Starting terminal · {u}', 'прервано': 'interrupted',
 
   // Files
   'Для {n} нет просмотра': 'No preview for {n}', 'системном редакторе': 'the default editor',
