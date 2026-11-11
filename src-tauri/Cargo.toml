@@ -39,6 +39,13 @@ windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 webview2-com = "0.39"
 windows-core = "0.62"
 
+# Line tables only: keeps file/line in backtraces, shrinks target/debug several times
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
 [profile.release]
 opt-level = 3
 lto = "thin"
