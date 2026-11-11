@@ -231,12 +231,22 @@ pub struct Session {
     pub handle: Handle<Client>,
     pub sftp: RawSftpSession,
     pub home: String,
+    /// The server's code at connect time: the log's source column.
+    pub code: String,
     closing: AtomicBool,
 }
 
 impl Session {
     pub fn is_closed(&self) -> bool {
         self.handle.is_closed()
+    }
+
+    /// The SFTP channel died under a live connection (sftp-server killed): the connection is dropped
+    /// on purpose, so the reconnect brings both back instead of every operation failing.
+    pub async fn sftp_lost(&self) {
+        if !self.is_closed() {
+            let _ = self.handle.disconnect(Disconnect::ByApplication, "sftp channel lost", "en").await;
+        }
     }
 
     async fn close(&self) {
@@ -519,7 +529,7 @@ impl Ssh {
             }
         };
         self.log.ok(&t.code, "SFTP", msg!("Подсистема запущена, протокол v{v}", v = version));
-        Ok((Arc::new(Session { handle, sftp, home, closing: AtomicBool::new(false) }), dropped))
+        Ok((Arc::new(Session { handle, sftp, home, code: t.code.clone(), closing: AtomicBool::new(false) }), dropped))
     }
 
     /* ----- saved servers ----- */

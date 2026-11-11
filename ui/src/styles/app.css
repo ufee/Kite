@@ -251,7 +251,7 @@ svg { flex: none; display: block; }
 .ffile { color: var(--tx3); }
 .fup { color: var(--tx3); }
 .row.up { color: var(--tx2); }
-.flink { color: var(--tx3); }
+.flink { flex: none; margin-left: -4px; color: var(--tx3); }
 .num { text-align: right; color: var(--tx2); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .perm { font-family: var(--mono); font-size: 12px; color: var(--tx3); white-space: nowrap; }
 .cell { color: var(--tx2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }

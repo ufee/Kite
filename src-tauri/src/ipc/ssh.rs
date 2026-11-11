@@ -1,4 +1,4 @@
-//! SSH, secrets, keys, the log and server folders. Errors go to the UI as `{ code, ...facts }`.
+//! SSH, secrets, keys and the log. Errors go to the UI as `{ code, ...facts }`.
 
 use std::sync::Arc;
 
@@ -9,7 +9,6 @@ use zeroize::Zeroizing;
 
 use crate::{
     error::{Error, Result},
-    fs::{self, Entry},
     log::{Log, Row},
     secrets,
     ssh::{Draft, SessionState, Ssh, TestReport, keys},
@@ -135,23 +134,4 @@ pub async fn pick_key_file(app: AppHandle) -> Result<Option<String>> {
         let _ = tx.send(f.and_then(|f| f.into_path().ok()));
     });
     Ok(rx.await.ok().flatten().map(|p| keys::contract(&p)))
-}
-
-/* ---------- Server folders ---------- */
-
-#[tauri::command]
-pub async fn fs_home(ssh: SshState<'_>, server: String, user: String) -> Result<String> {
-    Ok(ssh.session_live(&server, &user)?.home.clone())
-}
-
-#[tauri::command]
-pub async fn fs_resolve(ssh: SshState<'_>, server: String, user: String, raw: String, base: Option<String>) -> Result<String> {
-    let s = ssh.session_live(&server, &user)?;
-    fs::resolve(&s, &raw, base.as_deref()).await
-}
-
-#[tauri::command]
-pub async fn fs_list(ssh: SshState<'_>, server: String, user: String, path: String) -> Result<Vec<Entry>> {
-    let s = ssh.session_live(&server, &user)?;
-    fs::list(&s, &path).await
 }

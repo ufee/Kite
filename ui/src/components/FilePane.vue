@@ -118,6 +118,7 @@ const isGhost = (name: string) => !!ui.dnd && ui.dnd.from === props.i && ui.dnd.
           <input v-if="p.edit && !p.edit.isNew && p.edit.name === e.name" v-model="p.edit.value" class="edit-in" spellcheck="false"
                  @keydown.enter.stop="commitEdit(i)" @keydown.esc.stop="cancelEdit(i)" @blur="commitEdit(i)" @click.stop @dblclick.stop>
           <span v-else :title="e.name.length > 28 ? e.name : undefined">{{ e.name }}</span>
+          <Icon v-if="e.link" n="link" s="xs" class="flink" />
         </div>
         <div v-if="vis[i].size" class="num">{{ e.dir ? '' : fmtSize(e.size) }}</div>
         <div v-if="vis[i].date" class="cell">{{ fmtDate(e.mtime) }}</div>

@@ -47,6 +47,8 @@ export const other = (i: number) => 1 - i;
 export const listApi: { scrollTo?: (name: string | null) => void; scrollTop?: (y?: number) => number; focus?: () => void }[] = [{}, {}];
 
 const errOf = (e: unknown): BackendError => (isBackendError(e) ? e : { code: 'EINVAL', title: String(e), text: '' });
+/** A failed operation as a toast: the title and, when there is one, the real reason. */
+const errToast = (e: unknown) => { const x = errOf(e); toast(x.text ? `${x.title} · ${x.text}` : x.title, 'bad'); return x; };
 
 /* ---------- Rows, columns, footer ---------- */
 function rowsOf(p: Pane): Entry[] {
@@ -99,7 +101,8 @@ export function idleInfo() {
   const s = srvBy(p.src);
   if (!s) return '';
   const u = s.users.find(x => x.name === p.user);
-  const key = s.authPass ? tr('вход по паролю') : !u || u.key === 'auto' ? tr('ключ из агента') : tr('ключ {k}', { k: u.key });
+  const file = u && u.key !== 'auto' ? u.key : s.keyMode === 'file' ? s.keyFile.split(/[\\/]/).pop() : '';
+  const key = s.authPass ? tr('вход по паролю') : file ? tr('ключ {k}', { k: file }) : tr('ключ из агента');
   return `${p.user}@${s.code} · ${s.host}${s.port !== 22 ? ':' + s.port : ''} · ${key}`;
 }
 export const hasUp = (i: number) => panes[i].state === 'ok' && !!parentOf(panes[i].src, panes[i].path);
@@ -190,7 +193,8 @@ export async function go(i: number, raw: string, push = true, quiet = false): Pr
   const nav = ++p.nav, src = p.src, user = p.user;
   let path: string, list: Entry[];
   try {
-    path = await backend.fsResolve(src, user, raw);
+    // A relative path is taken from the folder on screen.
+    path = await backend.fsResolve(src, user, raw, p.path || undefined);
     list = await backend.fsList(src, user, path);
   } catch (e) {
     if (p.nav !== nav) return false;
@@ -222,7 +226,7 @@ export async function reload(i: number) {
     const has = (n: string) => list.some(e => e.name === n);
     p.sel = p.sel.filter(has);
     if (p.cur && p.cur !== '..' && !has(p.cur)) p.cur = rows(i)[0]?.name ?? null;
-  } catch (e) { toast(errOf(e).title, 'bad'); }
+  } catch (e) { errToast(e); }
 }
 export const goUp = (i: number) => { const par = parentOf(panes[i].src, panes[i].path); if (par) go(i, par); };
 export const goBack = (i: number) => { const b = panes[i].back.pop(); if (b) go(i, b, false); };
@@ -313,7 +317,7 @@ export async function openFile(i: number, e: Entry | undefined, mode: 'view' | '
     if (f.tooBig) { toast(tr('{n} больше 10 МБ: откройте в редакторе', { n: e.name }), 'info'); return; }
     ask('file', { name: e.name, src, user, path, where: `${label(src)} · ${path}`, text: f.text });
     nextTick(() => document.querySelector<HTMLElement>('.file-text')?.focus());
-  } catch (err) { toast(errOf(err).title, 'bad'); }
+  } catch (err) { errToast(err); }
 }
 export function fileEdit(d: Record<string, any>) {
   const { src, user, path, name } = d;
@@ -324,7 +328,7 @@ export function fileEdit(d: Record<string, any>) {
 async function editExternal(src: Src, user: string, path: string, name: string) {
   const app = tr(EDITORS[settings.editor]);
   try { await backend.editOpen(src, user, childOf(src, path, name), settings.editor, settings.autosave); } catch (e) {
-    toast(errOf(e).title, 'bad'); return;
+    errToast(e); return;
   }
   if (isLocal(src)) { toast(tr('{n} открыт в {app}', { n: name, app }), 'info'); return; }
   const where = label(src);
@@ -335,7 +339,7 @@ async function editChanged(src: Src, user: string, path: string, uploaded: boole
   if (!uploaded) {
     // Queued in the dialog stack: a second save waits for its turn instead of being dropped.
     if (!(await confirmBox(tr('Загрузить {n}?', { n: name }), tr('Файл изменён в редакторе. Загрузить на {src}?', { src: where }), 'Загрузить'))) return;
-    try { await backend.editUpload(src, user, path); } catch (e) { toast(errOf(e).title, 'bad'); return; }
+    try { await backend.editUpload(src, user, path); } catch (e) { errToast(e); return; }
   }
   toast(tr('{n} загружен на {src}', { n: name, src: where }));
 }
@@ -367,7 +371,7 @@ export function destBlocked(d: Record<string, any>) {
   return '';
 }
 export async function destGo(d: Record<string, any>, raw: string) {
-  try { d.path = await backend.fsResolve(d.src, d.user, raw); } catch (e) { d.err = errOf(e).title; return; }
+  try { d.path = await backend.fsResolve(d.src, d.user, raw, d.path || undefined); } catch (e) { d.err = errOf(e).title; return; }
   d.input = d.path; d.err = '';
   destList(d);
 }
@@ -432,8 +436,7 @@ export async function commitEdit(i: number) {
     if (ed.isNew) await backend.fsMkdir(p.src, p.user, childOf(p.src, p.path, v));
     else await backend.fsRename(p.src, p.user, childOf(p.src, p.path, ed.name!), childOf(p.src, p.path, v));
   } catch (e) {
-    const err = errOf(e);
-    toast(err.title, 'bad');
+    const err = errToast(e);
     if (err.code !== 'EEXIST') { p.edit = null; focusList(i); }
     return;
   } finally { committing = false; }
@@ -448,38 +451,65 @@ export function cancelEdit(i: number) { panes[i].edit = null; focusList(i); }
 export async function removeSel(i: number) {
   const p = panes[i], list = selEntries(i);
   if (!list.length) return;
-  const what = list.length === 1 ? list[0].name : objs(list.length), where = label(p.src);
-  const ok = isLocal(p.src)
-    ? await confirmBox('Удалить в корзину?', tr('{what} из {p}', { what, p: p.path }), 'В корзину')
-    : await confirmBox(tr('Удалить с {src}?', { src: where }), tr('{what} из {p}. Это нельзя отменить.', { what, p: p.path }), 'Удалить', true);
+  // The pane may move on while the dialog is open: delete exactly what the dialog named.
+  const { src, user, path } = p, local = isLocal(src);
+  const what = list.length === 1 ? list[0].name : objs(list.length), where = label(src);
+  const paths = list.map(e => childOf(src, path, e.name));
+  const ok = local
+    ? await confirmBox('Удалить в корзину?', tr('{what} из {p}', { what, p: path }), 'В корзину')
+    : await confirmBox(tr('Удалить с {src}?', { src: where }), tr('{what} из {p}. Это нельзя отменить.', { what, p: path }), 'Удалить', true);
   if (!ok) return;
-  const paths = list.map(e => childOf(p.src, p.path, e.name));
   try {
-    if (isLocal(p.src)) await backend.fsTrash(paths); else await backend.fsDelete(p.src, p.user, paths);
-  } catch (e) { toast(errOf(e).title, 'bad'); await reload(i); return; }
+    if (local) await backend.fsTrash(paths); else await backend.fsDelete(src, user, paths);
+  } catch (e) { errToast(e); await reload(i); return; }
   await reload(i);
   p.sel = []; p.cur = rows(i)[0]?.name || null;
-  toast(tr(isLocal(p.src) ? 'В корзине: {what}' : 'Удалено: {what}', { what }), 'ok');
+  toast(tr(local ? 'В корзине: {what}' : 'Удалено: {what}', { what }), 'ok');
   focusList(i);
 }
 
 export function openChmod(i: number) {
   const p = panes[i], list = selEntries(i);
   if (isLocal(p.src) || !list.length) return;
-  const e = list[0], bits = [0, 1, 2].map(g => [0, 1, 2].map(b => e.perm[g * 3 + b] !== '-'));
-  ask('chmod', { i, names: list.map(x => x.name), bits, owner: e.owner, group: e.group, recursive: false, hasDir: list.some(x => x.dir) });
+  // `S` and `T` are setuid/setgid/sticky without x: the execute box stays off.
+  const e = list[0], bits = [0, 1, 2].map(g => [0, 1, 2].map(b => !/[-ST]/.test(e.perm[g * 3 + b] ?? '-')));
+  // Paths are fixed now: the pane may move on while the dialog is open.
+  ask('chmod', {
+    i, src: p.src, user: p.user, paths: list.map(x => childOf(p.src, p.path, x.name)), names: list.map(x => x.name),
+    bits, owner: e.owner, group: e.group, owner0: e.owner, group0: e.group, modeT: false, ownerT: false, groupT: false, recursive: false, hasDir: list.some(x => x.dir),
+  });
 }
 export const octal = (bits: boolean[][]) => bits.map(g => (g[0] ? 4 : 0) + (g[1] ? 2 : 0) + (g[2] ? 1 : 0)).join('');
 export function setOctal(d: Record<string, any>, v: string) {
   if (!/^[0-7]{3}$/.test(v)) return;
   d.bits = [...v].map(c => [+c & 4, +c & 2, +c & 1].map(Boolean));
+  d.modeT = true;
+}
+// Only what the user touched goes out. The dialog shows the first object's mode and owner, so with
+// several objects or a tree an untouched mode is still sent: the intent is to align them to it.
+export function chmodPlan(d: Record<string, any>) {
+  // An owner typed back to what it was is no change: chown on one file would still drop setuid.
+  const spread = d.recursive || d.paths.length > 1;
+  const pick = (v: string, v0: string, t: boolean) => (t && (spread || v.trim() !== v0) ? v.trim() : '');
+  const owner = pick(d.owner, d.owner0, d.ownerT), group = pick(d.group, d.group0, d.groupT);
+  const mode = d.modeT || (spread && !d.ownerT && !d.groupT) ? parseInt(octal(d.bits), 8) : null;
+  return { mode, owner, group, empty: mode === null && !owner && !group };
 }
 export async function applyChmod(d: Record<string, any>) {
-  const p = panes[d.i];
+  const { mode, owner, group, empty } = chmodPlan(d);
+  if (empty || d.busy) return;
+  d.busy = true;
   try {
-    await backend.fsChmod(p.src, p.user, d.names.map((n: string) => childOf(p.src, p.path, n)), parseInt(octal(d.bits), 8), d.owner, d.group, d.recursive);
-  } catch (e) { toast(errOf(e).title, 'bad'); return; }
-  toast(tr('Права {m} · {o}', { m: octal(d.bits), o: `${d.owner}:${d.group}` }) + (d.recursive ? tr(' · рекурсивно') : ''), 'ok');
+    await backend.fsChmod(d.src, d.user, d.paths, mode, owner, group, d.recursive);
+  } catch (e) {
+    // Part of the tree may have changed before the error.
+    errToast(e);
+    reload(d.i);
+    return;
+  } finally { d.busy = false; }
+  const who = owner || group ? owner + (group ? `:${group}` : '') : '';
+  const what = [mode === null ? '' : octal(d.bits), who].filter(Boolean).join(' · ');
+  toast(tr('Права · {what}', { what }) + (d.recursive ? tr(' · рекурсивно') : ''), 'ok');
   closeDlg(true);
   reload(d.i);
 }

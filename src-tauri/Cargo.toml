@@ -29,8 +29,10 @@ data-encoding = "2"
 ring = "0.17"
 keyring = "4.2.0"
 tauri-plugin-dialog = "=2.8.4"
+trash = "=5.3.0"
 
 [target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 # Must match the versions wry uses, so the COM interfaces are the same types.
 webview2-com = "0.39"
 windows-core = "0.62"

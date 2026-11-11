@@ -1,17 +1,16 @@
-//! Folders on a server through the session's SFTP channel. Read-only for now: listing, resolving a
-//! typed path, the home folder. Changing operations and the local file system arrive in stage 4.
+//! Files of a pane: "This PC" (`local`) and server folders over the session's SFTP channel.
+//! Rights are the file system's business: nothing here guesses from permission bits, the real
+//! error (`EACCES`, `ENOENT`, ...) goes to the UI.
 
-use futures::stream::{self, StreamExt};
-use russh_sftp::{
-    client::error::Error as SftpError,
-    protocol::{File, StatusCode},
-};
+pub mod local;
+pub mod remote;
+
 use serde::Serialize;
 
-use crate::{
-    error::{Error, Result},
-    ssh::{Session, sftp::fs_error},
-};
+use crate::error::Error;
+
+/// Files bigger than this are not shown in the viewer: open them in an editor.
+pub const MAX_TEXT: u64 = 10 * 1024 * 1024;
 
 #[derive(Debug, Serialize)]
 pub struct Entry {
@@ -23,12 +22,34 @@ pub struct Entry {
     pub size: u64,
     /// Milliseconds, like the UI's Date.
     pub mtime: u64,
-    /// `rwxr-xr-x`, without the type letter.
+    /// `rwxr-xr-x`, without the type letter; empty locally.
     pub perm: String,
     pub owner: String,
     pub group: String,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub hidden: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextFile {
+    pub text: String,
+    pub binary: bool,
+    pub too_big: bool,
+}
+
+impl TextFile {
+    pub fn too_big() -> Self {
+        Self { text: String::new(), binary: false, too_big: true }
+    }
+
+    /// A NUL byte near the start means binary, like git decides it.
+    pub fn from_bytes(data: &[u8]) -> Self {
+        if data[..data.len().min(8000)].contains(&0) {
+            return Self { text: String::new(), binary: true, too_big: false };
+        }
+        Self { text: String::from_utf8_lossy(data).into_owned(), binary: false, too_big: false }
+    }
 }
 
 /// POSIX path from what the user typed: `~` is the home folder, a relative path hangs off `base`
@@ -57,7 +78,11 @@ pub fn normalize(raw: &str, home: &str, base: Option<&str>) -> String {
     format!("/{}", parts.join("/"))
 }
 
-fn perm_text(mode: u32) -> String {
+pub fn join(dir: &str, name: &str) -> String {
+    if dir.ends_with('/') { format!("{dir}{name}") } else { format!("{dir}/{name}") }
+}
+
+pub fn perm_text(mode: u32) -> String {
     const BITS: [(u32, char); 9] =
         [(0o400, 'r'), (0o200, 'w'), (0o100, 'x'), (0o040, 'r'), (0o020, 'w'), (0o010, 'x'), (0o004, 'r'), (0o002, 'w'), (0o001, 'x')];
     let mut s: Vec<char> = BITS.iter().map(|&(b, c)| if mode & b != 0 { c } else { '-' }).collect();
@@ -70,80 +95,28 @@ fn perm_text(mode: u32) -> String {
     s.into_iter().collect()
 }
 
-/// `longname` is `ls -l` output: names of the owner and group are fields 3 and 4.
-fn owner_group(f: &File) -> (String, String) {
-    let mut it = f.longname.split_whitespace().skip(2);
-    match (it.next(), it.next()) {
-        (Some(o), Some(g)) if !f.longname.is_empty() => (o.to_owned(), g.to_owned()),
-        _ => (
-            f.attrs.user.clone().or(f.attrs.uid.map(|u| u.to_string())).unwrap_or_default(),
-            f.attrs.group.clone().or(f.attrs.gid.map(|g| g.to_string())).unwrap_or_default(),
-        ),
-    }
+/// One argument for a POSIX shell: single quotes, a quote inside becomes `'\''`.
+pub fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
 }
 
-pub async fn list(s: &Session, path: &str) -> Result<Vec<Entry>> {
-    let sftp = &s.sftp;
-    let handle = sftp.opendir(path).await.map_err(|e| fs_error(e, path))?.handle;
-    let mut files = Vec::new();
-    loop {
-        match sftp.readdir(handle.as_str()).await {
-            Ok(name) => files.extend(name.files.into_iter().filter(|f| f.filename != "." && f.filename != "..")),
-            Err(SftpError::Status(st)) if st.status_code == StatusCode::Eof => break,
-            Err(e) => {
-                let _ = sftp.close(handle).await;
-                return Err(fs_error(e, path));
-            }
-        }
-    }
-    let _ = sftp.close(handle).await;
-    // Links: one stat each for the target type, pipelined on the channel, at most 16 in flight.
-    let dir = path.trim_end_matches('/');
-    let stats: Vec<_> = files
-        .iter()
-        .map(|f| {
-            let link = f.attrs.is_symlink().then(|| format!("{dir}/{}", f.filename));
-            async move {
-                match link {
-                    Some(p) => sftp.stat(p).await.ok().map(|a| a.attrs.is_dir()),
-                    None => None,
-                }
-            }
-        })
-        .collect();
-    let targets: Vec<Option<bool>> = stream::iter(stats)
-        .buffered(16)
-    .collect()
-    .await;
-    Ok(files
-        .iter()
-        .zip(targets)
-        .map(|(f, target)| {
-            let link = f.attrs.is_symlink();
-            let (owner, group) = owner_group(f);
-            Entry {
-                hidden: f.filename.starts_with('.'),
-                dir: if link { target.unwrap_or(false) } else { f.attrs.is_dir() },
-                link,
-                size: f.attrs.size.unwrap_or(0),
-                mtime: u64::from(f.attrs.mtime.unwrap_or(0)) * 1000,
-                perm: perm_text(f.attrs.permissions.unwrap_or(0)),
-                owner,
-                group,
-                name: f.filename.clone(),
-            }
-        })
-        .collect())
+/// A user or group name as chown takes it: no colon, space or shell character can get through.
+pub fn valid_account(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && !name.starts_with('-')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '$'))
 }
 
-/// A typed path that must be an existing folder.
-pub async fn resolve(s: &Session, raw: &str, base: Option<&str>) -> Result<String> {
-    let path = normalize(raw, &s.home, base);
-    let attrs = s.sftp.stat(path.as_str()).await.map_err(|e| fs_error(e, &path))?.attrs;
-    if !attrs.is_dir() {
-        return Err(Error::Enotdir { path });
+pub fn io_error(e: &std::io::Error, path: &str) -> Error {
+    use std::io::ErrorKind as K;
+    match e.kind() {
+        K::NotFound => Error::Enoent { path: path.into() },
+        K::PermissionDenied => Error::Eacces { path: path.into() },
+        K::AlreadyExists => Error::Eexist { path: path.into() },
+        K::NotADirectory => Error::Enotdir { path: path.into() },
+        _ => Error::Einval { reason: format!("{path}: {e}") },
     }
-    Ok(path)
 }
 
 #[cfg(test)]
@@ -167,5 +140,31 @@ mod tests {
         assert_eq!(perm_text(0o4755), "rwsr-xr-x");
         assert_eq!(perm_text(0o1777), "rwxrwxrwt");
         assert_eq!(perm_text(0o2640), "rw-r-S---");
+    }
+
+    #[test]
+    fn quotes_for_the_shell() {
+        assert_eq!(sh_quote("/var/www"), "'/var/www'");
+        assert_eq!(sh_quote("it's; rm -rf /"), r"'it'\''s; rm -rf /'");
+        assert_eq!(sh_quote("$(id)`x`"), "'$(id)`x`'");
+    }
+
+    #[test]
+    fn accounts() {
+        assert!(valid_account("www-data"));
+        assert!(valid_account("1000"));
+        assert!(valid_account("svc$"));
+        assert!(!valid_account(""));
+        assert!(!valid_account("-R"));
+        assert!(!valid_account("a:b"));
+        assert!(!valid_account("a b"));
+        assert!(!valid_account("a;id"));
+    }
+
+    #[test]
+    fn text_or_binary() {
+        assert!(TextFile::from_bytes(b"\x7fELF\0\0").binary);
+        let t = TextFile::from_bytes("строка\n".as_bytes());
+        assert!(!t.binary && t.text == "строка\n");
     }
 }

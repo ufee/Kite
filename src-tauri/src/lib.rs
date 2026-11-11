@@ -1,7 +1,7 @@
 //! Kite: SSH and SFTP in one window.
 //!
 //! The shell (one window, plugins, WebView hardening), the file store, SSH sessions with their
-//! host keys, keys and secrets, and read-only server folders. The rest still runs in the UI's
+//! host keys, keys and secrets, local and server files. The rest still runs in the UI's
 //! `MockBackend`; the core modules arrive stage by stage.
 
 mod error;
@@ -82,9 +82,16 @@ pub fn run() {
             ipc::ssh::agent_status,
             ipc::ssh::keys_list,
             ipc::ssh::pick_key_file,
-            ipc::ssh::fs_home,
-            ipc::ssh::fs_resolve,
-            ipc::ssh::fs_list,
+            ipc::fs::fs_home,
+            ipc::fs::fs_resolve,
+            ipc::fs::fs_list,
+            ipc::fs::fs_mkdir,
+            ipc::fs::fs_rename,
+            ipc::fs::fs_delete,
+            ipc::fs::fs_trash,
+            ipc::fs::fs_chmod,
+            ipc::fs::fs_read_text,
+            ipc::fs::fs_drives,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Kite");

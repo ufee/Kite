@@ -181,7 +181,7 @@ export const EN: Record<string, string> = {
   'нет прав на удаление для {u}': 'no delete access for {u}', 'Нет прав на удаление в {p} для {u}': 'No delete access to {p} for {u}',
   'В корзине: {what}': 'In Trash: {what}', 'Удалено: {what}': 'Deleted: {what}',
   'чужие файлы, нужен root (сейчас {u})': 'not your files, root required (now {u})', 'Права чужих файлов меняет только root (сейчас {u})': 'Only root can change these files (now {u})',
-  'Права {m} · {o}': 'Permissions {m} · {o}', ' · рекурсивно': ' · recursive', 'Путь скопирован': 'Path copied',
+  'Права · {what}': 'Permissions · {what}', ' · рекурсивно': ' · recursive', 'Путь скопирован': 'Path copied',
   'Это та же папка': 'Same folder', 'Нельзя поместить {n} в саму себя': "Can't put {n} inside itself", 'Всё уже на месте': 'Already there',
   'Нет прав на запись: {u} в {p}': 'No write access: {u} in {p}', 'Передано {ok} из {n}, ошибок: {bad}': 'Transferred {ok} of {n}, errors: {bad}',
   'Перемещено: {what} в {to}': 'Moved: {what} to {to}', 'Скопировано: {what} в {to}': 'Copied: {what} to {to}',
@@ -264,4 +264,9 @@ export const EN: Record<string, string> = {
   'Сервер закрыл соединение': 'The server closed the connection',
   '{addr}: сервер закрыл соединение до входа. Так бывает при блокировке после неудачных входов.': '{addr}: the server closed the connection before login. This happens when it bans after failed logins.', 'Сервер закрыл вход, пока ждали ответа · повтор': 'The server ended the login while waiting for an answer · retrying',
   'Контрольный вход по ключу прошёл':'Check login with the key passed', 'Контрольный вход по ключу не прошёл': 'Check login with the key failed',
+
+  // Files in the core
+  'Не найдено: {p}': 'Not found: {p}', 'Операция не выполнена': 'Operation failed',
+  'Владелец не изменён': 'Owner not changed', 'Сервер не выполняет команды: только SFTP.': 'The server runs no commands: SFTP only.',
+  'больше 10 МБ': 'over 10 MB', 'двоичный': 'binary', '{n} байт': '{n} bytes',
 };

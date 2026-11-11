@@ -46,6 +46,12 @@ pub enum Error {
     Enotdir { path: String },
     #[serde(rename = "EACCES")]
     Eacces { path: String },
+    #[serde(rename = "EEXIST")]
+    Eexist { path: String },
+    /// The server runs no commands (`ForceCommand internal-sftp`): no chown there.
+    NoExec,
+    /// A typed path that is not a path of this source (`folder` on Windows without a drive).
+    BadPath,
     #[serde(rename = "EINVAL")]
     Einval { reason: String },
 }
@@ -105,7 +111,10 @@ impl std::fmt::Display for Error {
             Self::KeyFile { path, reason } => write!(f, "{path}: {reason}"),
             Self::KeyCheck { reason } => write!(f, "key check: {reason}"),
             Self::AuthMethods { methods } => write!(f, "methods: {methods}"),
-            Self::Enoent { path } | Self::Enotdir { path } | Self::Eacces { path } => write!(f, "{path}"),
+            Self::Enoent { path } => write!(f, "ENOENT {path}"),
+            Self::Enotdir { path } => write!(f, "ENOTDIR {path}"),
+            Self::Eacces { path } => write!(f, "EACCES {path}"),
+            Self::Eexist { path } => write!(f, "EEXIST {path}"),
             e => write!(f, "{}", serde_json::to_value(e).ok().and_then(|v| v["code"].as_str().map(str::to_owned)).unwrap_or_default()),
         }
     }

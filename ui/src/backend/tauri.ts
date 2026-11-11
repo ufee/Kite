@@ -1,16 +1,16 @@
 /*
- * TauriBackend: the Rust core takes over method by method. Stage 3 brings SSH, host keys, the keychain,
- * keys and the agent, the core's log and a read-only listing of server folders. Everything else still
- * runs on the mock underneath; server operations the core does not have yet reject with NOT_YET.
+ * TauriBackend: the Rust core takes over method by method. Stage 3 brought SSH, host keys, the keychain,
+ * keys and the agent and the core's log; stage 4 the files of this PC and of servers. Everything else
+ * still runs on the mock underneath; operations the core does not have yet reject with NOT_YET.
  */
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { tr } from '../i18n';
-import { isLocal } from '../util/paths';
+import { tr, trn } from '../i18n';
+import { isLocal, LOCAL_WIN } from '../util/paths';
 import { MockBackend } from './mock';
 import type { Store } from './store';
 import type {
-  AgentStatus, BackendError, ConflictPolicy, Endpoint, Entry, ErrCode, HostKeyRequest, LogRow, PassphraseRequest,
+  AgentStatus, BackendError, Entry, ErrCode, HostKeyRequest, LogRow, PassphraseRequest,
   Server, ServerConfig, ServerDraft, ServerId, SessionState, Src, TestResult, TextFile,
 } from './types';
 
@@ -21,12 +21,17 @@ interface CoreMsg { text: string; vars?: [string, string][] }
 interface CoreRow { id: number; ts: number; src: string; tag: string; text: CoreMsg; note: CoreMsg; state: LogRow['state'] }
 interface TestReport { login: boolean; password: boolean; ms: number; unverified: string | null }
 
-const msg = (m: CoreMsg) => (m.text ? tr(m.text, m.vars ? Object.fromEntries(m.vars) : undefined) : '');
+/** `a|b|c` with a var `n` is a count in plural forms. */
+function msg(m: CoreMsg) {
+  if (!m.text) return '';
+  const vars = m.vars ? Object.fromEntries(m.vars) : undefined;
+  return vars?.n != null && m.text.includes('|') ? trn(Number(vars.n), m.text) : tr(m.text, vars);
+}
 const stamp = (ms: number) => {
   const d = new Date(ms), z = (n: number, w = 2) => String(n).padStart(w, '0');
   return `${z(d.getHours())}:${z(d.getMinutes())}:${z(d.getSeconds())}.${z(d.getMilliseconds(), 3)}`;
 };
-const row = (r: CoreRow): LogRow => ({ id: r.id, time: stamp(r.ts), src: r.src, tag: r.tag, text: msg(r.text), note: msg(r.note), state: r.state });
+const row = (r: CoreRow): LogRow => ({ id: r.id, time: stamp(r.ts), src: r.src === 'local' ? tr('Этот ПК') : r.src, tag: r.tag, text: msg(r.text), note: msg(r.note), state: r.state });
 
 /** Words for the core's error codes; the table of spec section 5 where it has one. */
 function words(e: CoreError): [string, string] {
@@ -48,10 +53,13 @@ function words(e: CoreError): [string, string] {
     case 'CANCELLED': return [tr('Отменено'), ''];
     case 'DISCONNECTED': return [tr('Соединение потеряно'), ''];
     case 'KEYCHAIN': return [tr('Хранилище паролей недоступно'), e.reason];
-    case 'ENOENT': return [tr('Нет такой папки: {p}', { p: e.path }), ''];
+    case 'ENOENT': return [tr('Не найдено: {p}', { p: e.path }), ''];
     case 'ENOTDIR': return [tr('Это файл: {p}', { p: e.path }), ''];
     case 'EACCES': return [tr('Нет доступа: {p}', { p: e.path }), ''];
-    case 'EINVAL': return [tr('Ошибка сервера'), e.reason];
+    case 'EEXIST': return [tr('{v} уже есть в этой папке', { v: e.path.split(/[\\/]/).pop() ?? e.path }), ''];
+    case 'BAD_PATH': return [tr(LOCAL_WIN ? 'Нужен путь вида D:\\папка' : 'Путь начинается с / или ~'), ''];
+    case 'NO_EXEC': return [tr('Владелец не изменён'), tr('Сервер не выполняет команды: только SFTP.')];
+    case 'EINVAL': return [tr('Операция не выполнена'), e.reason];
     default: return [tr('Ошибка SSH'), e.reason ?? ''];
   }
 }
@@ -66,6 +74,9 @@ export const uiError = (e: unknown): BackendError => {
 
 /** Every core call: errors cross as BackendError with ready words. */
 const call = <T>(cmd: string, args?: Record<string, unknown>) => invoke<T>(cmd, args).catch((e: unknown) => { throw uiError(e); });
+
+/** A file source as the core takes it. */
+const where = (src: Src, user: string) => (isLocal(src) ? 'local' : { server: src, user });
 
 const notYet = (stage: number): BackendError => ({ code: 'NOT_YET', title: tr('Будет на этапе {n}', { n: stage }), text: '' });
 
@@ -130,44 +141,30 @@ export class TauriBackend extends MockBackend {
   override keysList() { return call<string[]>('keys_list'); }
   override pickKeyFile() { return call<string | null>('pick_key_file'); }
 
-  /* ---------- Server folders: read-only listing now, the rest in stage 4 ---------- */
-  override fsList(src: Src, user: string, path: string) {
-    return isLocal(src) ? super.fsList(src, user, path) : call<Entry[]>('fs_list', { server: src, user, path });
-  }
+  /* ---------- Files: this PC and servers ---------- */
+  override fsList(src: Src, user: string, path: string) { return call<Entry[]>('fs_list', { src: where(src, user), path }); }
   override fsResolve(src: Src, user: string, raw: string, base?: string) {
-    return isLocal(src) ? super.fsResolve(src, user, raw, base) : call<string>('fs_resolve', { server: src, user, raw, base: base ?? null });
+    return invoke<string>('fs_resolve', { src: where(src, user), raw, base: base ?? null }).catch((e: unknown) => {
+      // A typed path that is not there is a folder the user looked for.
+      const c = e as CoreError;
+      if (c?.code === 'ENOENT') throw { code: 'ENOENT', title: tr('Нет такой папки: {p}', { p: c.path }), text: '' } satisfies BackendError;
+      throw uiError(e);
+    });
   }
-  override fsHome(src: Src, user: string) {
-    return isLocal(src) ? super.fsHome(src, user) : call<string>('fs_home', { server: src, user });
+  override fsHome(src: Src, user: string) { return call<string>('fs_home', { src: where(src, user) }); }
+  override fsMkdir(src: Src, user: string, path: string) { return call<void>('fs_mkdir', { src: where(src, user), path }); }
+  override fsRename(src: Src, user: string, from: string, to: string) { return call<void>('fs_rename', { src: where(src, user), from, to }); }
+  override fsDelete(src: Src, user: string, paths: string[]) { return call<void>('fs_delete', { src: where(src, user), paths }); }
+  override fsTrash(paths: string[]) { return call<void>('fs_trash', { paths }); }
+  override fsChmod(src: Src, user: string, paths: string[], mode: number | null, owner: string, group: string, recursive: boolean) {
+    return call<void>('fs_chmod', { src: where(src, user), paths, mode, owner, group, recursive });
   }
-  override async fsMkdir(src: Src, user: string, path: string) {
-    if (!isLocal(src)) throw notYet(4);
-    return super.fsMkdir(src, user, path);
-  }
-  override async fsRename(src: Src, user: string, from: string, to: string) {
-    if (!isLocal(src)) throw notYet(4);
-    return super.fsRename(src, user, from, to);
-  }
-  override async fsDelete(src: Src, user: string, paths: string[]) {
-    if (!isLocal(src)) throw notYet(4);
-    return super.fsDelete(src, user, paths);
-  }
-  override async fsChmod(src: Src, user: string, paths: string[], mode: number, owner: string, group: string, recursive: boolean) {
-    if (!isLocal(src)) throw notYet(4);
-    return super.fsChmod(src, user, paths, mode, owner, group, recursive);
-  }
-  override async fsReadText(src: Src, user: string, path: string): Promise<TextFile> {
-    if (!isLocal(src)) throw notYet(4);
-    return super.fsReadText(src, user, path);
-  }
-  override async editOpen(src: Src, user: string, path: string, editor: string, autosave: boolean) {
-    if (!isLocal(src)) throw notYet(7);
-    return super.editOpen(src, user, path, editor, autosave);
-  }
-  override async transferEnqueue(from: Endpoint, names: Entry[], to: Endpoint, move: boolean, policy: ConflictPolicy) {
-    if ([from.src, to.src].some(s => s !== 'ext' && !isLocal(s))) throw notYet(6);
-    return super.transferEnqueue(from, names, to, move, policy);
-  }
+  override fsReadText(src: Src, user: string, path: string) { return call<TextFile>('fs_read_text', { src: where(src, user), path }); }
+  override fsDrives() { return call<string[]>('fs_drives'); }
+
+  // The mock's editor and queue work on its own files, not on the real ones the panes now show.
+  override async editOpen() { throw notYet(7); }
+  override async transferEnqueue(): Promise<number> { throw notYet(6); }
   override async ptyOpen(src: Src, user: string, cwd: string, cols: number, rows: number, onData: (data: string) => void) {
     if (!isLocal(src)) throw notYet(5);
     return super.ptyOpen(src, user, cwd, cols, rows, onData);
