@@ -11,7 +11,12 @@ import Icon from '../Icon.vue';
 
 defineProps<{ d: Record<string, any> }>();
 const agent = ref<AgentStatus | null>(null);
-onMounted(async () => { agent.value = await backend.agentStatus(); });
+// Editors that are not installed stay in the list but cannot be picked.
+const editors = ref<string[]>(['system', 'npp', 'code']);
+onMounted(async () => {
+  backend.editEditors().then(list => { editors.value = list; }).catch(() => undefined);
+  agent.value = await backend.agentStatus();
+});
 const VIEW_SHORT = { files: 'Файлы', both: 'Оба', term: 'Терминал' } as const;
 </script>
 
@@ -66,7 +71,7 @@ const VIEW_SHORT = { files: 'Файлы', both: 'Оба', term: 'Термина�
         <h3 class="h3">{{ tr('Редактор') }}</h3>
         <div class="set-grid">
           <span class="muted">{{ tr('Программа') }}</span>
-          <div><select v-model="settings.editor" class="fld" style="width:220px"><option value="system">{{ tr('Системный') }}</option><option value="npp">Notepad++</option><option value="code">VS Code</option></select></div>
+          <div><select v-model="settings.editor" class="fld" style="width:220px"><option value="system">{{ tr('Системный') }}</option><option value="npp" :disabled="!editors.includes('npp')">Notepad++</option><option value="code" :disabled="!editors.includes('code')">VS Code</option></select></div>
         </div>
         <label class="chk" style="margin-top:12px"><input v-model="settings.autosave" type="checkbox" class="cb">{{ tr('Сразу загружать правки на сервер') }}</label>
       </div>

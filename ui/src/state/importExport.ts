@@ -1,13 +1,13 @@
 /* Import and export of the server list as servers.json. Servers are matched by code. */
 import { computed } from 'vue';
-import { backend, type Server, type ServerUser } from '../backend';
+import { backend, isBackendError, type ImportServer, type Server, type ServerUser } from '../backend';
 import { lang, tr } from '../i18n';
 import { collator, copyText, MB } from '../util/format';
 import { ask, closeDlg, dlg, toast } from './overlay';
-import { groupOrder, newServerId, saveServers, servers, sideGroups, sortedServers, srvByCode } from './servers';
+import { groupOrder, newServerId, saveServers, servers, srvByCode } from './servers';
 import { dropServer } from './serverCard';
 
-type Parsed = { code: string; desc: string; host: string; port: number; users: ServerUser[]; defUser: string; group: string };
+type Parsed = ImportServer;
 type Status = 'new' | 'changed' | 'same' | 'removed';
 
 /** Shown as an example in the import tab. It overlaps the demo list, so the diff has every kind of row. */
@@ -49,31 +49,33 @@ ${AGENT_FORMAT}
 Rules. code: unique server name. description: briefly what runs on the server. key: only the key file name from ~/.ssh, no path. No passwords, tokens or private keys.`,
 };
 
+/** Every group with servers in the sidebar's group order, whatever the search: the export takes them all. */
+export const allGroups = computed(() => {
+  const names = [...groupOrder, ...new Set(servers.map(s => s.group).filter(g => !groupOrder.includes(g)))];
+  return names.map(name => ({ name, total: servers.filter(s => s.group === name).length })).filter(g => g.total);
+});
+
 export function openImport(tab: 'import' | 'export' = 'import') {
   const sel: Record<string, boolean> = {};
-  for (const g of sideGroups.value) sel[g.name] = true;
+  for (const g of allGroups.value) sel[g.name] = true;
   ask('import', { tab, fileName: '', text: '', parsed: null, err: '', removeMissing: false, over: false, exportGroups: sel, exportUsers: true });
 }
 
-export function parseImport(text: string, fileName: string) {
+/** The core checks the file (version, code, duplicates); the diff with the list is made here. */
+export async function parseImport(text: string, fileName: string) {
   const d = dlg.value!.data;
   d.text = text; d.fileName = fileName; d.parsed = null; d.err = '';
-  let json: any;
-  try { json = JSON.parse(text); } catch (e) { d.err = tr('Это не JSON: {e}', { e: (e as Error).message }); return; }
-  const groups = Array.isArray(json?.groups) ? json.groups : Array.isArray(json?.servers) ? [{ name: tr('Без группы'), servers: json.servers }] : null;
-  if (!groups) { d.err = tr('Нет списка groups'); return; }
-  const list: Parsed[] = [];
-  for (const g of groups) for (const s of g.servers || []) {
-    if (!s.code || !s.host) { d.err = tr('У сервера {c} нет code или host', { c: s.code || tr('(без code)') }); return; }
-    const raw: { name: string; key?: string; default?: boolean }[] = s.users?.length ? s.users : [{ name: 'root', default: true }];
-    const users = raw.map(u => ({ name: String(u.name), key: u.key || 'auto' }));
-    list.push({
-      code: String(s.code), desc: s.description || '', host: String(s.host), port: +s.port || 22, users,
-      defUser: raw.find(u => u.default)?.name || users[0].name, group: s.group || g.name || tr('Без группы'),
-    });
+  const read = ++reads;
+  try {
+    const list = await backend.importRead(text);
+    if (read !== reads) return;
+    d.parsed = list.map(s => ({ ...s, group: s.group || tr('Без группы') }));
+  } catch (e) {
+    if (read === reads) d.err = isBackendError(e) ? e.title : String(e);
   }
-  d.parsed = list;
 }
+/** A slower read of an earlier file must not land over a newer one. */
+let reads = 0;
 
 export const impDiff = computed(() => {
   const d = dlg.value;
@@ -143,9 +145,10 @@ export async function applyImport() {
 export const exportJson = computed(() => {
   const d = dlg.value;
   if (d?.kind !== 'import') return '';
-  const groups = sideGroups.value.map(g => g.name).filter(n => d.data.exportGroups[n]).map(name => ({
+  // By code, not by the sidebar's sort: the same list gives the same file.
+  const groups = allGroups.value.map(g => g.name).filter(n => d.data.exportGroups[n]).map(name => ({
     name,
-    servers: sortedServers(servers.filter(s => s.group === name)).map(s => ({
+    servers: servers.filter(s => s.group === name).sort((a, b) => collator.compare(a.code, b.code)).map(s => ({
       code: s.code, description: s.description, host: s.host, port: s.port,
       ...(d.data.exportUsers ? { users: s.users.map(u => ({ name: u.name, ...(u.name === s.defaultUser ? { default: true } : {}), ...(u.key !== 'auto' ? { key: u.key } : {}) })) } : {}),
     })),
@@ -156,13 +159,11 @@ export const exportCount = computed(() => {
   const d = dlg.value;
   return d?.kind === 'import' ? servers.filter(s => d.data.exportGroups[s.group]).length : 0;
 });
-export function saveExport() {
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(new Blob([exportJson.value], { type: 'application/json' }));
-  a.download = 'servers.json';
-  a.click();
-  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
-  toast('servers.json сохранён', 'ok');
+export async function saveExport() {
+  try {
+    const path = await backend.exportWrite(exportJson.value);
+    if (path) toast(tr('Сохранено: {p}', { p: path }), 'ok');
+  } catch (e) { toast(isBackendError(e) ? e.title : String(e), 'bad'); }
 }
 export async function copyExport() { await copyText(exportJson.value); toast('JSON скопирован', 'ok'); }
 export async function copyAgent() { await copyText(AGENT_PROMPT[lang.value]); toast('Задание скопировано', 'ok'); }

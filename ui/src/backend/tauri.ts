@@ -8,10 +8,12 @@ import { listen } from '@tauri-apps/api/event';
 import { tr, trn } from '../i18n';
 import { fmtSize } from '../util/format';
 import { isLocal, LOCAL_WIN } from '../util/paths';
+import { type ImportFail, importWords } from './importCheck';
 import { MockBackend } from './mock';
+import { fail } from './mock/fs';
 import type { Store } from './store';
 import type {
-  AgentStatus, BackendError, BatchReport, ConflictPolicy, Endpoint, Entry, ErrCode, HostKeyRequest, LogRow, PassphraseRequest,
+  AgentStatus, BackendError, BatchReport, ConflictPolicy, Endpoint, Entry, ErrCode, HostKeyRequest, ImportServer, LogRow, PassphraseRequest,
   PtyExit, Server, ServerConfig, ServerDraft, ServerId, SessionState, Src, TestResult, TextFile, TransferItem,
 } from './types';
 
@@ -67,8 +69,12 @@ function words(e: CoreError): [string, string] {
     case 'BAD_NAME': return [tr('Имя не подходит для Windows: {p}', { p: e.path }), tr('Файл пропущен.')];
     case 'NAME_CLASH': return [tr('Имя отличается от соседнего только регистром: {p}', { p: e.path }), tr('В Windows это один файл, второй пропущен.')];
     case 'SOURCE_CHANGED': return [tr('Файл изменился во время передачи: {p}', { p: e.path }), tr('Источник оставлен на месте.')];
+    case 'SERVER_CHANGED': return [tr('Файл на сервере изменился: {p}', { p: e.path }), tr('Правка не загружена: решите, чья версия важнее.')];
+    case 'EDIT_WAITS': return [tr('Правка ждёт: {p}', { p: e.path }), tr('Загрузка в этот файл стоит на паузе в очереди; правка уйдёт после неё.')];
     case 'NOT_REGULAR': return [tr('Не обычный файл: {p}', { p: e.path }), tr('Каналы, сокеты и устройства не передаются.')];
-    default: return [tr('Ошибка SSH'), e.reason ?? ''];
+    default:
+      if (e.code.startsWith('IMPORT_')) return [importWords(e as ImportFail).title, ''];
+      return [tr('Ошибка SSH'), e.reason ?? ''];
   }
 }
 
@@ -88,7 +94,6 @@ const BIG_WRITE = 4096;
 /** A file source as the core takes it. */
 const where = (src: Src, user: string) => (isLocal(src) ? 'local' : { server: src, user });
 
-const notYet = (stage: number): BackendError => ({ code: 'NOT_YET', title: tr('Будет на этапе {n}', { n: stage }), text: '' });
 
 /** A queue item as the core sends it: the error is a code with facts. */
 type CoreItem = Omit<TransferItem, 'err'> & { err: CoreError | null };
@@ -123,6 +128,13 @@ export class TauriBackend extends MockBackend {
     });
     void listen<BatchReport>('transfer://batch', e => this.emit('batch', e.payload));
     void listen<{ src: Src; path: string }>('fs://changed', e => this.emit('fs', e.payload.src, e.payload.path));
+    type EditAt = { server: ServerId; user: string; path: string };
+    void listen<EditAt & { uploaded: boolean }>('edit://changed', e => this.emit('edit', e.payload.server, e.payload.user, e.payload.path, e.payload.uploaded));
+    void listen<EditAt>('edit://conflict', e => this.emit('editConflict', e.payload.server, e.payload.user, e.payload.path));
+    void listen<EditAt & { err: CoreError }>('edit://failed', e => this.emit('editFailed', e.payload.server, e.payload.user, e.payload.path, uiError(e.payload.err)));
+    void listen<{ id: number; groups: { path: string; entries: Entry[] }[] }>('drop://files', e => {
+      this.dropWait.get(e.payload.id)?.(e.payload.groups.map(g => ({ from: { src: 'local', user: '', path: g.path }, entries: g.entries })));
+    });
   }
 
   /** Real servers only: the demo list belongs to the mock. */
@@ -192,13 +204,37 @@ export class TauriBackend extends MockBackend {
   override fsReadText(src: Src, user: string, path: string) { return call<TextFile>('fs_read_text', { src: where(src, user), path }); }
   override fsDrives() { return call<string[]>('fs_drives'); }
 
-  // The mock's editor works on its own files, not on the real ones the panes now show.
-  override async editOpen() { throw notYet(7); }
+  /* ---------- Editing in an external program ---------- */
+  override editOpen(src: Src, user: string, path: string, editor: string, autosave: boolean) {
+    return call<void>('edit_open', { src: where(src, user), path, editor, autosave });
+  }
+  override editUpload(src: Src, user: string, path: string, force = false) { return call<void>('edit_upload', { src: where(src, user), path, force }); }
+  override editReload(src: Src, user: string, path: string) { return call<void>('edit_reload', { src: where(src, user), path }); }
+  override editEditors() { return call<string[]>('edit_editors'); }
+  override editAutosave(on: boolean) { void invoke('edit_autosave', { on }); }
+  override editUnsent() { return call<{ server: string; name: string }[]>('edit_unsent'); }
+
+  /* ---------- Import and export ---------- */
+  override importRead(text: string) { return call<ImportServer[]>('import_read', { text }); }
+  override exportWrite(json: string) { return call<string | null>('export_write', { json }); }
 
   /* ---------- Transfers: the core owns the queue and keeps it on disk ---------- */
+  /** WebView2 gives the core the real paths of the dropped files; the core answers with their rows. */
+  override dropFiles(files: File[]) {
+    const wv = (window as { chrome?: { webview?: { postMessageWithAdditionalObjects?: (msg: string, objs: File[]) => void } } }).chrome?.webview;
+    if (!files.length) return Promise.resolve([]);
+    if (!wv?.postMessageWithAdditionalObjects) return Promise.reject(fail('EINVAL', tr('Перетаскивание из файлового менеджера пока только в Windows')));
+    const id = ++this.drops;
+    return new Promise<{ from: Endpoint; entries: Entry[] }[]>((resolve, reject) => {
+      const timer = setTimeout(() => { this.dropWait.delete(id); reject(fail('EINVAL', tr('Файлы не прочитались'))); }, 15000);
+      this.dropWait.set(id, list => { clearTimeout(timer); this.dropWait.delete(id); resolve(list); });
+      wv.postMessageWithAdditionalObjects!(JSON.stringify({ kite: 'drop', id }), files);
+    });
+  }
+  private drops = 0;
+  private dropWait = new Map<number, (list: { from: Endpoint; entries: Entry[] }[]) => void>();
+
   override transferEnqueue(from: Endpoint, entries: Entry[], to: Endpoint, move: boolean, policy: ConflictPolicy) {
-    // Files dropped from Explorer arrive with stage 7.
-    if (from.src === 'ext') return Promise.reject(notYet(7));
     const picks = entries.map(e => ({ name: e.name, dir: e.dir, size: e.size }));
     return call<number>('transfer_enqueue', { from, picks, to, mv: move, policy });
   }

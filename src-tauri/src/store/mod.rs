@@ -7,6 +7,7 @@
 //! Settings and session are owned by the UI and stored as opaque JSON. Servers are typed here:
 //! the core will connect with them, and unknown fields (a password by mistake) never reach the disk.
 
+pub mod import;
 mod servers;
 
 use std::fs;

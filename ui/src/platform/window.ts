@@ -2,6 +2,7 @@
 import { isTauri } from '@tauri-apps/api/core';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { saveWindowState, StateFlags } from '@tauri-apps/plugin-window-state';
+import { backend } from '../backend';
 import { tr } from '../i18n';
 import { confirmBox, toast } from '../state/overlay';
 import { active } from '../state/queue';
@@ -11,8 +12,13 @@ export const inTauri = isTauri();
 const win = () => getCurrentWindow();
 
 async function confirmClose(): Promise<boolean> {
-  if (!active.value.length) return true;
-  return !!(await confirmBox('Закрыть Kite?', tr('Идут передачи: {n}. Они прервутся.', { n: active.value.length }), 'Закрыть', true));
+  // Saves the editor made that went nowhere yet (not confirmed, or a conflict left open): their copies go with the app.
+  const unsent = await backend.editUnsent().catch(() => []);
+  const why: string[] = [];
+  if (active.value.length) why.push(tr('Идут передачи: {n}. Они прервутся.', { n: active.value.length }));
+  if (unsent.length) why.push(tr('Не загружены правки: {list}. Они пропадут.', { list: unsent.map(u => u.name).join(', ') }));
+  if (!why.length) return true;
+  return !!(await confirmBox('Закрыть Kite?', why.join(' '), 'Закрыть', true));
 }
 /**
  * The session is written before the window goes: a failed write must not keep the app open.

@@ -16,6 +16,7 @@ import { tr } from '../../i18n';
 import { DEMO_AGENT_KEYS, DEMO_GROUPS, DEMO_KEYS, DEMO_SERVERS, LOCAL_HOME_WIN, ld, rd, SAMPLE_TEXT, type DemoServer } from './data';
 import { fail, fingerprint, hash, MockFs } from './fs';
 import { MockShell } from './shell';
+import { type ImportFail, importWords, parseServers } from '../importCheck';
 
 type Listener = (...args: never[]) => void;
 
@@ -103,6 +104,8 @@ export class MockBackend implements Backend {
   onTransferState(cb: (items: TransferItem[]) => void) { return this.on('transfer', cb); }
   onTransferBatch(cb: (r: BatchReport) => void) { return this.on('batch', cb); }
   onEditChanged(cb: (src: Src, user: string, path: string, uploaded: boolean) => void) { return this.on('edit', cb); }
+  onEditConflict(cb: (src: Src, user: string, path: string) => void) { return this.on('editConflict', cb); }
+  onEditFailed(cb: (src: Src, user: string, path: string, err: BackendError) => void) { return this.on('editFailed', cb); }
   onLogRow(cb: (row: LogRow) => void) { return this.on('log', cb); }
   onLogUpdate(cb: (row: LogRow) => void) { return this.on('logUpdate', cb); }
   onFsChanged(cb: (src: Src, path: string) => void) { return this.on('fs', cb); }
@@ -455,6 +458,12 @@ export class MockBackend implements Backend {
     for (let n = 2; ; n++) { const c = `${stem} (${n})${ext}`; if (!list.some(e => e.name === c)) return c; }
   }
 
+  /** A page File has no path: the demo copies made-up files from "Explorer". */
+  async dropFiles(files: File[]): Promise<{ from: Endpoint; entries: Entry[] }[]> {
+    const entries: Entry[] = files.map(f => ({ name: f.name, dir: false, size: f.size || 1, mtime: f.lastModified || Date.now(), perm: '', owner: '', group: '' }));
+    return entries.length ? [{ from: { src: 'ext', user: '', path: tr('Проводник') }, entries }] : [];
+  }
+
   async transferEnqueue(from: Endpoint, entries: Entry[], to: Endpoint, move: boolean, policy: ConflictPolicy) {
     if (!entries.length) return 0;
     const toSrc = to.src as Src;
@@ -645,19 +654,43 @@ export class MockBackend implements Backend {
     if (isLocal(src)) { this.add(src, 'EDIT', `${path} · ${app}`); return; }
     await this.op(src, 'SFTP', `READ ${path}`, () => null, () => tr('временная копия'));
     this.add(src, 'EDIT', tr('Слежу за {n} · {app}', { n: name, app }));
+    this.autosave = autosave;
     // Mock: pretends the user saved the file in the editor five seconds later.
     setTimeout(async () => {
       this.add(src, 'EDIT', tr('{n} изменён в редакторе', { n: name }));
-      if (autosave) await this.editUpload(src, user, path).catch(() => undefined);
-      this.emit('edit', src, user, path, autosave);
+      const now = this.autosave;
+      if (now) await this.editUpload(src, user, path).catch(() => undefined);
+      this.emit('edit', src, user, path, now);
     }, 5000);
   }
+  private autosave = true;
+  editAutosave(on: boolean) { this.autosave = on; }
 
   async editUpload(src: Src, user: string, path: string) {
     this.live(src, user);
     const e = this.fs.find(src, path);
     await this.op(src, 'SFTP', `WRITE ${path}`, () => { if (e) e.mtime = Date.now(); }, () => (e ? fmtSize(e.size) : tr('готово')));
     this.emit('fs', src, parentOf(src, path)!);
+  }
+  async editReload(src: Src, user: string, path: string) {
+    this.live(src, user);
+    await this.op(src, 'SFTP', `READ ${path}`, () => null, () => tr('временная копия'));
+  }
+  async editEditors() { return ['system', 'npp', 'code']; }
+  // The mock uploads within editUpload: nothing is ever left unsent.
+  async editUnsent(): Promise<{ server: string; name: string }[]> { return []; }
+
+  /* ---------- Import and export ---------- */
+  async importRead(text: string) {
+    try { return parseServers(text); } catch (e) { throw importWords(e as ImportFail); }
+  }
+  async exportWrite(json: string): Promise<string | null> {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([json], { type: 'application/json' }));
+    a.download = 'servers.json';
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+    return 'servers.json';
   }
 
   /* ---------- Terminal ---------- */

@@ -62,6 +62,10 @@ pub enum Error {
     NameClash { path: String },
     /// The source changed while it was being sent; a move keeps it.
     SourceChanged { path: String },
+    /// An edit going back met another version of the server file than the copy was checked against.
+    ServerChanged { path: String },
+    /// An edit waits for another upload to the same file, and that one is paused.
+    EditWaits { path: String },
     /// A FIFO, socket or device: never transferred.
     NotRegular { path: String },
     /// A transfer was paused or cancelled; never reaches the UI.
@@ -120,6 +124,8 @@ impl std::fmt::Display for Error {
             Self::BadName { .. } => f.write_str("имя не подходит для Windows, пропущен"),
             Self::NameClash { .. } => f.write_str("имя отличается от соседнего только регистром, пропущен"),
             Self::SourceChanged { .. } => f.write_str("источник изменился во время передачи"),
+            Self::ServerChanged { .. } => f.write_str("файл на сервере изменился, правка не загружена"),
+            Self::EditWaits { .. } => f.write_str("правка ждёт загрузку на паузе"),
             Self::NotRegular { .. } => f.write_str("не обычный файл, пропущен"),
             Self::Net { reason, .. } | Self::Ssh { reason } | Self::Keychain { reason } | Self::Einval { reason } => {
                 f.write_str(reason)

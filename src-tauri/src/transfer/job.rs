@@ -119,14 +119,28 @@ impl Run<'_> {
         self.q.part_started(self.id, rel, meta.size, meta.mtime);
         self.done().fetch_add(offset, Ordering::Relaxed);
         let relay = !from.is_local() && !to.is_local();
-        let finish = Finish { mtime: self.keep_time.then_some(meta.mtime), private: relay };
+        // An edit may carry secrets (`.env` 0600): its part is never wider than the user's own.
+        let edit = self.item.keep.is_some() || self.item.expect.is_some();
+        let finish = Finish { mtime: self.keep_time.then_some(meta.mtime), private: relay || edit };
         if offset == 0 && io::fetch_small(from, src, to, &part, dst, meta.size, finish.mtime, self.done()).await? {
             self.q.part_done(self.id, rel);
             return Ok(());
         }
         io::copy(from, src, to, &part, offset, meta.size, finish, self.done(), self.stop).await?;
+        if edit {
+            self.edit_ready(to, &part, dst, meta).await?;
+        }
         to.rename_over(&part, dst).await?;
         self.q.part_done(self.id, rel);
+        // An edit: the file is the user's again, with its mode. A refusal (another owner, not root)
+        // is logged: the text is there, only the owner changed.
+        if let Some(k) = &self.item.keep {
+            match to.restore(dst, k).await {
+                Ok(()) => {}
+                Err(e @ Error::Disconnected) => return Err(e),
+                Err(e) => self.q.log_path(to, dst, e.to_string(), Row::Err),
+            }
+        }
         // Server to server the mode goes along, exact past the umask. A refusal costs only the
         // mode: the file stays 0600, narrower than its source.
         if relay {
@@ -135,6 +149,29 @@ impl Run<'_> {
                 Err(e @ Error::Disconnected) => return Err(e),
                 Err(e) => self.q.log_path(to, dst, e.to_string(), Row::Err),
             }
+        }
+        Ok(())
+    }
+
+    /// An edit's part, right before it replaces the file: the file must still be the one the copy was
+    /// checked against (a retry after a break may come hours later), and the part takes the file's
+    /// owner and mode first, so the name never shows the edit with another mode. A part that would
+    /// turn read-only waits for the mode after the rename: a resume must still write it.
+    async fn edit_ready(&self, to: &Side, part: &str, dst: &str, meta: &Meta) -> Result<()> {
+        // Our own write, when the link broke right after the rename: the copy's size and date (kept
+        // dates only, the server's own clock says nothing).
+        if let Some(want) = self.item.expect
+            && let Some(m) = to.lstat(dst).await?
+            && (m.size, m.mtime) != want
+            && !(self.keep_time && m.size == meta.size && m.mtime == meta.mtime)
+        {
+            return Err(Error::ServerChanged { path: dst.into() });
+        }
+        // Refused (another owner, not root): the restore after the rename logs it.
+        if let Some(k) = self.item.keep.filter(|k| k.mode & 0o200 != 0)
+            && let Err(e @ Error::Disconnected) = to.restore(part, &k).await
+        {
+            return Err(e);
         }
         Ok(())
     }
