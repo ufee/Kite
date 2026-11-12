@@ -1,7 +1,7 @@
 //! "This PC": the local file system. Blocking calls; the IPC layer runs them on the blocking pool.
 //! Windows paths are `C:\folder` with any drive the system has; Linux paths start at `/`.
 
-use std::{fs, time::UNIX_EPOCH};
+use std::{fs, path::Path, time::UNIX_EPOCH};
 
 use super::{Entry, MAX_TEXT, TextFile, io_error};
 use crate::error::{Error, Result};
@@ -37,24 +37,37 @@ pub fn list(path: &str) -> Result<Vec<Entry>> {
             out.push(Entry { hidden: name.starts_with('.'), name, dir: false, link: false, size: 0, mtime: 0, perm: String::new(), owner: String::new(), group: String::new() });
             continue;
         };
-        let link = own.file_type().is_symlink();
-        // A link (or a junction) takes the type of its target; a broken one is a file.
-        let target = if link { fs::metadata(item.path()).ok() } else { None };
-        let meta = target.as_ref().unwrap_or(&own);
-        let dir = meta.is_dir() && (!link || target.is_some());
-        out.push(Entry {
-            hidden: name.starts_with('.') || hidden_attr(&own),
-            dir,
-            link,
-            size: if dir { 0 } else { meta.len() },
-            mtime: mtime_ms(meta),
-            perm: String::new(),
-            owner: String::new(),
-            group: String::new(),
-            name,
-        });
+        out.push(entry(name, &item.path(), &own));
     }
     Ok(out)
+}
+
+fn entry(name: String, path: &Path, own: &fs::Metadata) -> Entry {
+    let link = own.file_type().is_symlink();
+    // A link (or a junction) takes the type of its target; a broken one is a file.
+    let target = if link { fs::metadata(path).ok() } else { None };
+    let meta = target.as_ref().unwrap_or(own);
+    let dir = meta.is_dir() && (!link || target.is_some());
+    Entry {
+        hidden: name.starts_with('.') || hidden_attr(own),
+        dir,
+        link,
+        size: if dir { 0 } else { meta.len() },
+        mtime: mtime_ms(meta),
+        perm: String::new(),
+        owner: String::new(),
+        group: String::new(),
+        name,
+    }
+}
+
+/// One path as its parent folder lists it: the folder and the row. None for a missing path or a drive root.
+#[cfg_attr(not(windows), allow(dead_code, reason = "only the Explorer drop uses it"))]
+pub fn stat(path: &Path) -> Option<(String, Entry)> {
+    let own = fs::symlink_metadata(path).ok()?;
+    let parent = path.parent()?.to_str()?.to_owned();
+    let name = path.file_name()?.to_str()?.to_owned();
+    Some((parent, entry(name, path, &own)))
 }
 
 /// A typed path as this platform writes it, `.` and `..` folded. Not checked against the disk.

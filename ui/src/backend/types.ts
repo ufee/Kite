@@ -49,7 +49,9 @@ export type ErrCode =
   | 'ENOENT' | 'ENOTDIR' | 'EACCES' | 'EEXIST' | 'EINVAL' | 'BAD_PATH' | 'NO_EXEC'
   | 'TIMEOUT' | 'NET' | 'DROPPED' |'AUTH_KEY' | 'AUTH_PASS' | 'NO_SECRET' | 'AUTH_MULTI' | 'AUTH_METHODS' | 'HOSTKEY_REJECTED' | 'HOSTKEY_CHANGED'
   | 'KEY_FILE' | 'NO_PUBKEY' | 'KEY_CHECK' | 'PASSPHRASE' | 'KEYCHAIN' | 'SSH' | 'CANCELLED' | 'DISCONNECTED'
-  | 'SERVER_GONE' | 'BAD_NAME' | 'NAME_CLASH' | 'SOURCE_CHANGED' | 'NOT_REGULAR'
+  | 'SERVER_GONE' | 'BAD_NAME' | 'NAME_CLASH' | 'SOURCE_CHANGED' | 'SERVER_CHANGED' | 'EDIT_WAITS' | 'NOT_REGULAR'
+  | 'IMPORT_BIG' | 'IMPORT_JSON' | 'IMPORT_VERSION' | 'IMPORT_NO_GROUPS' | 'IMPORT_CODE' | 'IMPORT_HOST' | 'IMPORT_PORT'
+  | 'IMPORT_USER' | 'IMPORT_KEY' | 'IMPORT_DUP'
   /** The operation arrives in a later stage. */
   | 'NOT_YET';
 
@@ -148,6 +150,17 @@ export interface BatchReport {
   total: number;
 }
 
+/** A server of an imported servers.json, checked. An empty group: the file has none. */
+export interface ImportServer {
+  code: string;
+  desc: string;
+  host: string;
+  port: number;
+  users: ServerUser[];
+  defUser: string;
+  group: string;
+}
+
 export interface TextFile {
   text: string;
   binary: boolean;
@@ -218,6 +231,8 @@ export interface Backend {
 
   // Transfers
   transferEnqueue(from: Endpoint, names: Entry[], to: Endpoint, move: boolean, policy: ConflictPolicy): Promise<number>;
+  /** Files dropped from Explorer as rows of the folders they came from. */
+  dropFiles(files: File[]): Promise<{ from: Endpoint; entries: Entry[] }[]>;
   transferPause(id: number): void;
   transferResume(id: number): void;
   transferCancel(id: number): void;
@@ -231,7 +246,22 @@ export interface Backend {
 
   // Editing in an external program
   editOpen(src: Src, user: string, path: string, editor: string, autosave: boolean): Promise<void>;
-  editUpload(src: Src, user: string, path: string): Promise<void>;
+  /** A save goes up; `force` overrides a change on the server the core reported with onEditConflict. */
+  editUpload(src: Src, user: string, path: string, force?: boolean): Promise<void>;
+  /** The server's version replaces the copy in the editor. */
+  editReload(src: Src, user: string, path: string): Promise<void>;
+  /** Settings values of the editors installed here; 'system' is always there. */
+  editEditors(): Promise<string[]>;
+  /** The "upload at once" setting; it holds for the files already open too. */
+  editAutosave(on: boolean): void;
+  /** Saves made in the editor that are neither on the server nor in the queue: closing loses them. */
+  editUnsent(): Promise<{ server: string; name: string }[]>;
+
+  // Import and export of the server list
+  /** Parses and checks servers.json; rejects with words for the first problem. */
+  importRead(text: string): Promise<ImportServer[]>;
+  /** Saves the export where the user picks; the path, or null when the dialog was closed. */
+  exportWrite(json: string): Promise<string | null>;
 
   // Terminal: bytes go through `onData`, not through events
   /** `shell` is the setting (pwsh, powershell, cmd, or a path on Linux); servers run the user's login shell. */
@@ -257,8 +287,12 @@ export interface Backend {
   onPromptGone(cb: (reqIds: number[]) => void): Unlisten;
   onTransferState(cb: (items: TransferItem[]) => void): Unlisten;
   onTransferBatch(cb: (r: BatchReport) => void): Unlisten;
-  /** A watched file was saved in the editor; `uploaded` is true when autosave already sent it. */
+  /** A watched file was saved in the editor (`uploaded` false: ask, then editUpload) or its save reached the server. */
   onEditChanged(cb: (src: Src, user: string, path: string, uploaded: boolean) => void): Unlisten;
+  /** The server file changed since the copy was taken: the user picks whose version stays. */
+  onEditConflict(cb: (src: Src, user: string, path: string) => void): Unlisten;
+  /** An autosave could not go up. */
+  onEditFailed(cb: (src: Src, user: string, path: string, err: BackendError) => void): Unlisten;
   onLogRow(cb: (row: LogRow) => void): Unlisten;
   onLogUpdate(cb: (row: LogRow) => void): Unlisten;
   /** Folder contents changed by the core (transfer finished, move removed a source). */

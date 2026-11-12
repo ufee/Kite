@@ -4,6 +4,7 @@
 //! host keys, keys and secrets, local and server files. The rest still runs in the UI's
 //! `MockBackend`; the core modules arrive stage by stage.
 
+mod edit;
 mod error;
 mod fs;
 mod ipc;
@@ -56,9 +57,13 @@ pub fn run() {
             app.manage(ssh.clone());
             app.manage(Arc::new(term::Terms::default()));
             let store = app.state::<Arc<store::Store>>().inner().clone();
-            app.manage(transfer::Transfers::new(app.handle().clone(), ssh, log, store));
+            let q = transfer::Transfers::new(app.handle().clone(), ssh.clone(), log.clone(), store);
+            app.manage(q.clone());
+            let copies = app.path().app_local_data_dir()?.join("edit");
+            app.manage(edit::Edits::new(app.handle().clone(), ssh, q, log, copies));
             if let Some(w) = app.get_webview_window("main") {
                 webview::harden(&w);
+                webview::explorer_drop(&w);
             }
             Ok(())
         })
@@ -67,6 +72,8 @@ pub fn run() {
             ipc::state_save,
             ipc::servers_load,
             ipc::servers_save,
+            ipc::import_read,
+            ipc::export_write,
             ipc::term_load,
             ipc::term_save,
             ipc::term_prune,
@@ -115,15 +122,25 @@ pub fn run() {
             ipc::transfer::transfer_set_parallel,
             ipc::transfer::transfer_keep_time,
             ipc::transfer::transfer_detach,
+            ipc::edit::edit_open,
+            ipc::edit::edit_upload,
+            ipc::edit::edit_reload,
+            ipc::edit::edit_editors,
+            ipc::edit::edit_unsent,
+            ipc::edit::edit_autosave,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Kite")
         .run(|app, event| {
-            // The queue is saved at most every 2 s: what changed since must not be lost on closing.
-            if let tauri::RunEvent::Exit = event
-                && let Some(q) = app.try_state::<Arc<transfer::Transfers>>()
-            {
-                q.save_now();
+            if let tauri::RunEvent::Exit = event {
+                // The queue is saved at most every 2 s: what changed since must not be lost on closing.
+                if let Some(q) = app.try_state::<Arc<transfer::Transfers>>() {
+                    q.save_now();
+                }
+                // Edit copies go, except those an unfinished upload still reads.
+                if let Some(e) = app.try_state::<Arc<edit::Edits>>() {
+                    e.close();
+                }
             }
         });
 }

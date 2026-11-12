@@ -30,11 +30,12 @@ ring = "0.17"
 keyring = "4.2.0"
 tauri-plugin-dialog = "=2.8.4"
 trash = "=5.3.0"
+notify = { version = "=8.2.2", default-features = false }
 portable-pty = "=0.9.0"
 bytes = "1"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_UI_Shell"] }
 # Must match the versions wry uses, so the COM interfaces are the same types.
 webview2-com = "0.39"
 windows-core = "0.62"

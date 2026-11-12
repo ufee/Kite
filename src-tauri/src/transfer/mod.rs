@@ -25,8 +25,9 @@ use std::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::{AppHandle, Emitter};
-use tokio::sync::{Notify, watch};
+use tokio::sync::{Notify, broadcast, watch};
 
+pub use self::io::local_name_ok;
 use self::{
     conn::Pool,
     io::{Side, Stop},
@@ -83,7 +84,7 @@ pub enum St {
 }
 
 impl St {
-    fn active(self) -> bool {
+    pub fn active(self) -> bool {
         matches!(self, St::Wait | St::Count | St::Run | St::Pause)
     }
 }
@@ -128,10 +129,33 @@ pub struct Item {
     /// No rights on the target: the queue offers "as root".
     #[serde(default)]
     pub denied: bool,
+    /// An edit going back: the file it replaces keeps its mode and owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep: Option<Keep>,
+    /// An edit going back: the server file's size and date the copy was checked against. Anything
+    /// else there right before the rename means someone changed it meanwhile (`SERVER_CHANGED`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expect: Option<Stamp>,
+}
+
+/// Size in bytes and date in seconds of a file.
+pub type Stamp = (u64, u64);
+
+/// Mode and owner of a server file an edit replaces: rename-over makes a new file of the uploader.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Keep {
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
 }
 
 impl Item {
     /// Writes this target: the same server, folder and name as the file system compares them.
+    /// An editor save going back to its server file.
+    fn is_edit(&self) -> bool {
+        self.keep.is_some() || self.expect.is_some()
+    }
+
     fn writes(&self, to: &End, tname: &str) -> bool {
         self.to.src == to.src && to.key(&self.to.path) == to.key(&to.path) && to.key(&self.tname) == to.key(tname)
     }
@@ -220,6 +244,8 @@ struct Inner {
     gone: Vec<Rec>,
     /// Something changed that the disk does not have yet.
     dirty: bool,
+    /// Edit uploads the editor reports itself (`quiet`).
+    quiet: HashSet<u64>,
 }
 
 #[derive(Serialize)]
@@ -268,6 +294,8 @@ pub struct Transfers {
     settled: Notify,
     /// The UI took a fresh list: the next event carries every item.
     resend: AtomicBool,
+    /// Items that ended, with how: edits wait for their upload here.
+    ended: broadcast::Sender<(u64, St)>,
 }
 
 impl Transfers {
@@ -296,10 +324,11 @@ impl Transfers {
             log,
             store,
             me: me.clone(),
-            inner: Mutex::new(Inner { recs, next_id, next_batch, parallel: 3, keep_time: true, reported, gone: Vec::new(), dirty: false }),
+            inner: Mutex::new(Inner { recs, next_id, next_batch, parallel: 3, keep_time: true, reported, gone: Vec::new(), dirty: false, quiet: HashSet::new() }),
             kick: Notify::new(),
             settled: Notify::new(),
             resend: AtomicBool::new(false),
+            ended: broadcast::channel(64).0,
         });
         let w = Arc::downgrade(&me);
         me.ssh.on_live(move |server| {
@@ -353,9 +382,57 @@ impl Transfers {
     }
 
     pub async fn enqueue(&self, from: End, picks: Vec<Pick>, to: End, mv: bool, policy: Policy) -> Result<u64> {
-        if from.src == "ext" {
-            return Err(Error::Einval { reason: "drag and drop from Explorer comes in stage 7".into() });
+        Ok(self.enqueue_with(from, picks, to, mv, policy, (None, None)).await?.0)
+    }
+
+    /// An edited copy back to its server file, replacing it with its mode and owner kept; `expect` is
+    /// the server file the copy was checked against, compared again right before the rename.
+    /// The item id and true; or, when an upload to that file is still in the queue, its id and false.
+    pub async fn enqueue_edit(&self, from: End, pick: Pick, to: End, keep: Option<Keep>, expect: Option<Stamp>) -> Result<(u64, bool)> {
+        let name = pick.name.clone();
+        if let Some(id) = self.enqueue_with(from, vec![pick], to.clone(), false, Policy::Replace, (keep, expect)).await?.1 {
+            return Ok((id, true));
         }
+        let g = self.inner();
+        g.recs
+            .iter()
+            .find(|r| r.item.state.active() && r.item.writes(&to, &name))
+            .map(|r| (r.item.id, false))
+            .ok_or_else(|| Error::Einval { reason: format!("{name}: not queued") })
+    }
+
+    /// The state of an item; None when it is off the list.
+    pub fn state(&self, id: u64) -> Option<St> {
+        self.inner().recs.iter().find(|r| r.item.id == id).map(|r| r.item.state)
+    }
+
+    /// The code of the error an item ended with.
+    pub fn err_code(&self, id: u64) -> Option<String> {
+        let g = self.inner();
+        let r = g.recs.iter().find(|r| r.item.id == id)?;
+        r.item.err.as_ref()?["code"].as_str().map(str::to_owned)
+    }
+
+    /// An edit upload whose end the editor reports itself: its batch gets no "copied" toast. After a
+    /// restart nobody marks it, and the batch toast says it went.
+    pub fn quiet(&self, id: u64) {
+        self.inner().quiet.insert(id);
+    }
+
+    /// Items that ended from now on, with their state.
+    pub fn ended(&self) -> broadcast::Receiver<(u64, St)> {
+        self.ended.subscribe()
+    }
+
+    /// Local folders that unfinished items read from: their files must stay.
+    pub fn local_sources(&self) -> HashSet<String> {
+        let g = self.inner();
+        g.recs.iter().filter(|r| r.item.from.is_local() && r.item.state != St::Done).map(|r| r.item.from.path.clone()).collect()
+    }
+
+    /// The batch, and the id of the last item added.
+    async fn enqueue_with(&self, from: End, picks: Vec<Pick>, to: End, mv: bool, policy: Policy, edit: (Option<Keep>, Option<Stamp>)) -> Result<(u64, Option<u64>)> {
+        let (keep, expect) = edit;
         if from.src == to.src && from.path == to.path {
             return Err(Error::Einval { reason: "same folder".into() });
         }
@@ -409,21 +486,24 @@ impl Transfers {
                 state: if clash.is_some() { St::Err } else { St::Wait },
                 err: clash,
                 denied: false,
+                keep,
+                expect,
                 name: p.name,
             };
             g.recs.push(Rec::new(item, Resume::default()));
             added += 1;
         }
         if added == 0 {
-            return Ok(0);
+            return Ok((0, None));
         }
         g.next_batch = batch;
+        let last = g.next_id;
         drop(g);
         self.changed();
         self.schedule();
         // A batch of clashes only has ended already.
         self.report();
-        Ok(batch)
+        Ok((batch, Some(last)))
     }
 
     /// Names in the target folder as its file system compares them, for "skip" and "keep both".
@@ -505,6 +585,7 @@ impl Transfers {
         if let Some(row) = row {
             self.log.done(row, "отменено", Row::Ok);
         }
+        let _ = self.ended.send((id, St::Err));
         self.changed();
         self.schedule();
     }
@@ -524,6 +605,22 @@ impl Transfers {
         self.reopen(id);
         self.changed();
         self.schedule();
+    }
+
+    /// A failed edit upload goes again, checked against `expect` now; false when it is not failed.
+    pub fn resend(&self, id: u64, expect: Option<Stamp>) -> bool {
+        let failed = self.with(id, |r| {
+            let failed = r.item.state == St::Err;
+            if failed {
+                r.item.expect = expect;
+            }
+            failed
+        });
+        if failed != Some(true) {
+            return false;
+        }
+        self.retry(id, false);
+        true
     }
 
     /// Takes the ended items off the list; the parts failed ones leave are deleted.
@@ -591,6 +688,19 @@ impl Transfers {
             if ends.iter().all(|s| self.ssh.has_session(s)) {
                 self.resume(id);
             }
+        }
+        // An editor save that failed for the lack of a link goes up once the server is back.
+        const LINK: [&str; 4] = ["NET", "TIMEOUT", "DROPPED", "DISCONNECTED"];
+        let edits: Vec<u64> = self
+            .inner()
+            .recs
+            .iter()
+            .filter(|r| r.item.is_edit() && r.item.state == St::Err && r.item.to.src == server)
+            .filter(|r| r.item.err.as_ref().and_then(|e| e.get("code")).and_then(|c| c.as_str()).is_some_and(|c| LINK.contains(&c)))
+            .map(|r| r.item.id)
+            .collect();
+        for id in edits {
+            self.retry(id, false);
         }
     }
 
@@ -793,6 +903,9 @@ impl Transfers {
         }
         // The publisher may have gone to sleep with nothing running: the end must reach the UI and the disk.
         self.changed();
+        if let Some(st) = self.with(id, |r| r.item.state).filter(|s| matches!(s, St::Done | St::Err)) {
+            let _ = self.ended.send((id, st));
+        }
         if sweep {
             self.sweep(id).await;
         }
@@ -931,6 +1044,28 @@ impl Transfers {
             out
         };
         for b in out {
+            // A finished edit upload has its own toast ("uploaded to") while its copy is open, and one
+            // the server changed under has the copy's question; another failure, or an upload that went
+            // after a restart, keeps the batch toast.
+            let edit = {
+                let mut g = self.inner();
+                let ids: Vec<u64> = g.recs.iter().filter(|r| r.item.batch == b.batch).map(|r| r.item.id).collect();
+                let quiet = ids.iter().any(|id| g.quiet.contains(id));
+                // A failed one may be sent again, and stays quiet for that.
+                if b.bad == 0 {
+                    g.quiet.retain(|id| !ids.contains(id));
+                }
+                // A file changed on the server: the copy asks whose version wins, which says it all.
+                let changed = g
+                    .recs
+                    .iter()
+                    .filter(|r| r.item.batch == b.batch && r.item.state == St::Err)
+                    .all(|r| r.item.err.as_ref().and_then(|e| e["code"].as_str()) == Some("SERVER_CHANGED"));
+                quiet && changed
+            };
+            if edit {
+                continue;
+            }
             let _ = self.app.emit("transfer://batch", b);
         }
     }
@@ -1059,6 +1194,8 @@ mod tests {
             state: St::Wait,
             err: None,
             denied: false,
+            keep: None,
+            expect: None,
         };
         assert_eq!(item.writes(&end("local", "c:\\x"), "README.md"), cfg!(windows));
         assert!(!item.writes(&end("s1", "C:\\X"), "Readme.md"));
@@ -1082,6 +1219,8 @@ mod tests {
             state: St::Run,
             err: None,
             denied: false,
+            keep: Some(Keep { mode: 0o600, uid: 0, gid: 0 }),
+            expect: Some((12, 1_700_000_000)),
         };
         let mut resume = Resume { files: 3, ..Default::default() };
         resume.parts.insert("b/c".into(), (100, 1_700_000_000));
@@ -1090,5 +1229,6 @@ mod tests {
         let back: Disk = serde_json::from_str(&text).unwrap();
         assert_eq!(back.items[0].resume, resume);
         assert_eq!(back.items[0].item.state, St::Run);
+        assert_eq!(back.items[0].item.expect, Some((12, 1_700_000_000)));
     }
 }

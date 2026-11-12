@@ -1,9 +1,8 @@
 <script setup lang="ts">
 import { tr, trn } from '../../i18n';
 import { closeDlg } from '../../state/overlay';
-import { sideGroups } from '../../state/servers';
 import {
-  applyImport, copyAgent, copyExport, exportCount, exportJson, impDiff, impFile, impPaste, parseImport, SAMPLE, saveExport, statusColor,
+  allGroups, applyImport, copyAgent, copyExport, exportCount, exportJson, impDiff, impFile, impPaste, parseImport, SAMPLE, saveExport, statusColor,
 } from '../../state/importExport';
 import Icon from '../Icon.vue';
 
@@ -82,7 +81,7 @@ const desc = (s: Record<string, any>) => s.desc ?? s.description;
       <div class="dlg-b" style="display:grid;grid-template-columns:260px minmax(0,1fr);gap:24px;height:470px">
         <div style="display:flex;flex-direction:column;gap:10px">
           <h3 class="h3" style="margin:0">{{ tr('Группы') }}</h3>
-          <label v-for="g in sideGroups" :key="g.name" class="chk"><input v-model="d.exportGroups[g.name]" type="checkbox" class="cb"><span class="grow ell">{{ g.name }}</span><span class="faint">{{ g.total }}</span></label>
+          <label v-for="g in allGroups" :key="g.name" class="chk"><input v-model="d.exportGroups[g.name]" type="checkbox" class="cb"><span class="grow ell">{{ g.name }}</span><span class="faint">{{ g.total }}</span></label>
           <div class="sep" style="margin:6px 0"></div>
           <label class="chk"><input v-model="d.exportUsers" type="checkbox" class="cb">{{ tr('Пользователи и имена ключей') }}</label>
           <div class="faint" style="font-size:12px">{{ tr('Без паролей и ключей.') }}</div>

@@ -12,7 +12,7 @@ use crate::error::Error;
 /// Files bigger than this are not shown in the viewer: open them in an editor.
 pub const MAX_TEXT: u64 = 10 * 1024 * 1024;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Entry {
     pub name: String,
     /// Follows a link's target; a broken link is a file.
@@ -43,13 +43,33 @@ impl TextFile {
         Self { text: String::new(), binary: false, too_big: true }
     }
 
-    /// A NUL byte near the start means binary, like git decides it.
+    /// A NUL byte near the start means binary, like git decides it. UTF-8 (a BOM is dropped),
+    /// anything else is read as cp1251: the old Windows files of a Russian admin.
     pub fn from_bytes(data: &[u8]) -> Self {
         if data[..data.len().min(8000)].contains(&0) {
             return Self { text: String::new(), binary: true, too_big: false };
         }
-        Self { text: String::from_utf8_lossy(data).into_owned(), binary: false, too_big: false }
+        let data = data.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(data);
+        let text = match std::str::from_utf8(data) {
+            Ok(s) => s.to_owned(),
+            Err(_) => cp1251(data),
+        };
+        Self { text, binary: false, too_big: false }
     }
+}
+
+/// Windows-1251 bytes 0x80..0xBF; 0xC0..0xFF are А..я in a row. 0x98 is unassigned and kept as is.
+const CP1251_HIGH: &str = "ЂЃ‚ѓ„…†‡€‰Љ‹ЊЌЋЏђ‘’“”•–—\u{98}™љ›њќћџ\u{a0}ЎўЈ¤Ґ¦§Ё©Є«¬\u{ad}®Ї°±Ііґµ¶·ё№є»јЅѕї";
+
+fn cp1251(data: &[u8]) -> String {
+    let high: Vec<char> = CP1251_HIGH.chars().collect();
+    data.iter()
+        .map(|&b| match b {
+            0..=0x7F => b as char,
+            0x80..=0xBF => high[(b - 0x80) as usize],
+            _ => char::from_u32(0x410 + (b - 0xC0) as u32).unwrap_or('\u{fffd}'),
+        })
+        .collect()
 }
 
 /// POSIX path from what the user typed: `~` is the home folder, a relative path hangs off `base`
@@ -166,5 +186,15 @@ mod tests {
         assert!(TextFile::from_bytes(b"\x7fELF\0\0").binary);
         let t = TextFile::from_bytes("строка\n".as_bytes());
         assert!(!t.binary && t.text == "строка\n");
+        assert_eq!(TextFile::from_bytes(b"\xEF\xBB\xBFok").text, "ok");
+    }
+
+    #[test]
+    fn cp1251_fallback() {
+        assert_eq!(super::CP1251_HIGH.chars().count(), 64);
+        // "Ёжик №1 — ok" in cp1251
+        let t = TextFile::from_bytes(b"\xA8\xE6\xE8\xEA \xB91 \x97 ok");
+        assert_eq!(t.text, "Ёжик №1 — ok");
+        assert_eq!(TextFile::from_bytes(b"\xC0\xFF").text, "Ая");
     }
 }

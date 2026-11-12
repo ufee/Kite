@@ -5,7 +5,7 @@ import { tr } from '../i18n';
 import { collator, copyText, fmtSize, objs } from '../util/format';
 import { baseName, childOf, homeOf, isLocal, parentOf, rootOf, within } from '../util/paths';
 import { settings, ui, type ColKey } from './prefs';
-import { ask, closeDlg, confirmBox, dlg, openMenu, toast } from './overlay';
+import { ask, choiceBox, closeDlg, confirmBox, dlg, openMenu, toast } from './overlay';
 import { label, srvBy, touchDir, touchRecent } from './servers';
 import { transfer } from './queue';
 
@@ -314,7 +314,10 @@ export async function openFile(i: number, e: Entry | undefined, mode: 'view' | '
   try {
     const f = await backend.fsReadText(src, user, childOf(src, path, e.name));
     if (f.binary) { toast(tr('Для {n} нет просмотра', { n: e.name }), 'info'); return; }
-    if (f.tooBig) { toast(tr('{n} больше 10 МБ: откройте в редакторе', { n: e.name }), 'info'); return; }
+    if (f.tooBig) {
+      toast(tr('{n} больше 10 МБ: откройте в редакторе', { n: e.name }), 'info', { label: 'Открыть', run: () => editExternal(src, user, path, e.name) }, 6000);
+      return;
+    }
     ask('file', { name: e.name, src, user, path, where: `${label(src)} · ${path}`, text: f.text });
     nextTick(() => document.querySelector<HTMLElement>('.file-text')?.focus());
   } catch (err) { errToast(err); }
@@ -334,14 +337,38 @@ async function editExternal(src: Src, user: string, path: string, name: string) 
   const where = label(src);
   toast(`${tr('{n} открыт в {app}', { n: name, app })}. ${tr(settings.autosave ? 'Правки загрузятся на {src}' : 'Загрузка на {src} после подтверждения', { src: where })}`, 'info', null, 4000);
 }
+/** Files with an upload question open: a second save asks nothing, the answer sends the copy as it is then. */
+const asking = new Set<string>();
 async function editChanged(src: Src, user: string, path: string, uploaded: boolean) {
   const name = baseName(src, path), where = label(src);
   if (!uploaded) {
-    // Queued in the dialog stack: a second save waits for its turn instead of being dropped.
-    if (!(await confirmBox(tr('Загрузить {n}?', { n: name }), tr('Файл изменён в редакторе. Загрузить на {src}?', { src: where }), 'Загрузить'))) return;
+    const key = `${src}\n${user}\n${path}`;
+    if (asking.has(key)) return;
+    asking.add(key);
+    try {
+      if (!(await confirmBox(tr('Загрузить {n}?', { n: name }), tr('Файл изменён в редакторе. Загрузить на {src}?', { src: where }), 'Загрузить'))) return;
+    } finally { asking.delete(key); }
     try { await backend.editUpload(src, user, path); } catch (e) { errToast(e); return; }
+    // The core reports the upload's end itself; the mock uploads within the call.
+    if (backend.kind === 'tauri') return;
   }
   toast(tr('{n} загружен на {src}', { n: name, src: where }));
+}
+/** Someone changed the server file while it was open in the editor. One question per file: a save meanwhile is in the copy the answer is about. */
+const conflicts = new Set<string>();
+async function editConflict(src: Src, user: string, path: string) {
+  const name = baseName(src, path), where = label(src), key = `${src}\n${user}\n${path}`;
+  if (conflicts.has(key)) return;
+  conflicts.add(key);
+  let pick;
+  try {
+    pick = await choiceBox(tr('{n} изменён на сервере', { n: name }),
+      tr('Файл на {src} поменяли, пока он был открыт в редакторе. Чья версия важнее?', { src: where }), 'Загрузить мою', 'Взять с сервера');
+  } finally { conflicts.delete(key); }
+  try {
+    if (pick === 'ok') await backend.editUpload(src, user, path, true);
+    else if (pick === 'alt') { await backend.editReload(src, user, path); toast(tr('В редакторе версия с {src}', { src: where }), 'info'); }
+  } catch (e) { errToast(e); }
 }
 
 /* ---------- "Copy to…" / "Move to…" destination picker ---------- */
@@ -554,11 +581,12 @@ export function drop(i: number, ev: DragEvent) {
     ui.dnd = null;
     return;
   }
+  // A drop from Explorer is a copy, with the usual name-clash questions.
   const files = [...(ev.dataTransfer?.files || [])];
-  if (files.length) {
-    const list: Entry[] = files.map(f => ({ name: f.name, dir: false, size: f.size || 1, mtime: f.lastModified || Date.now(), perm: '', owner: '', group: '' }));
-    transfer({ src: 'ext', user: '', path: tr('Проводник') }, list, to, false);
-  }
+  if (!files.length) return;
+  backend.dropFiles(files).then(async groups => {
+    for (const g of groups) await transfer(g.from, g.entries, to, false);
+  }, errToast);
 }
 export function dropHint(i: number) {
   const p = panes[i], to = p.dropRow === '..' ? tr('родительскую папку') : p.dropRow || tr('эту папку');
@@ -569,6 +597,8 @@ export function dropHint(i: number) {
 export function initPanes() {
   backend.onFsChanged((src, path) => panes.forEach((p, i) => { if (p.state === 'ok' && p.src === src && p.path === path) reload(i); }));
   backend.onEditChanged(editChanged);
+  backend.onEditConflict(editConflict);
+  backend.onEditFailed((_src, _user, _path, err) => errToast(err));
   backend.onSshStatus((server, user, state) => {
     // The core gave up reconnecting a working session: the pane shows the error with "Retry".
     if (state === 'bad') {

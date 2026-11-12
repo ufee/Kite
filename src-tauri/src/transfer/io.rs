@@ -339,6 +339,28 @@ impl Side {
         l.conn.session.sftp.setstat(path, a).await.map(|_| ()).map_err(|e| fs_error(e, path))
     }
 
+    /// The file an edit replaced comes back as it was: its owner first (chown drops setuid), then its
+    /// mode. The owner is sent only when it differs: a user may set his own file's mode, not its owner.
+    pub async fn restore(&self, path: &str, k: &super::Keep) -> Result<()> {
+        let Side::Remote(l) = self else { return Ok(()) };
+        let sftp = &l.conn.session.sftp;
+        let now = sftp.lstat(path).await.map_err(|e| fs_error(e, path))?.attrs;
+        let chown = now.uid != Some(k.uid) || now.gid != Some(k.gid);
+        let mut owner = Ok(());
+        if chown {
+            let mut a = FileAttributes::empty();
+            a.uid = Some(k.uid);
+            a.gid = Some(k.gid);
+            owner = sftp.setstat(path, a).await.map(|_| ()).map_err(|e| fs_error(e, path));
+        }
+        let mode = if chown || now.permissions.map(|p| p & 0o7777) != Some(k.mode & 0o7777) {
+            self.chmod(path, k.mode & 0o7777).await
+        } else {
+            Ok(())
+        };
+        owner.and(mode)
+    }
+
     /// Renames over an existing file: `posix-rename@openssh.com` when the server has it, otherwise
     /// remove and rename (not atomic, but the only way in plain SFTP v3).
     pub async fn rename_over(&self, from: &str, to: &str) -> Result<()> {

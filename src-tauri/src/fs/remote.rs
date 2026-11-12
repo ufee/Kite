@@ -548,6 +548,42 @@ pub async fn read_text(s: &Session, path: &str) -> Result<TextFile> {
     })
 }
 
+/// Chunks asked for in one round of a download: 4 MB in memory at most.
+const WINDOW: u64 = 64;
+
+/// A whole server file to a local one, for the external editor. Chunks go out `IN_FLIGHT` at a
+/// time and land in order; the file ends at the first empty read, so a file that grew comes whole.
+pub async fn download(s: &Session, path: &str, dest: &std::path::Path) -> Result<u64> {
+    use tokio::io::AsyncWriteExt;
+    let sftp = &s.sftp;
+    let handle = sftp.open(path, OpenFlags::READ, FileAttributes::empty()).await.map_err(|e| fs_error(e, path))?.handle;
+    let shown = dest.display().to_string();
+    let local = |e: std::io::Error| super::io_error(&e, &shown);
+    let work = async {
+        let mut out = tokio::fs::File::create(dest).await.map_err(local)?;
+        let mut at = 0u64;
+        'all: loop {
+            let reads: Vec<_> = (0..WINDOW).map(|k| read_at(sftp, &handle, path, at + k * READ_CHUNK, READ_CHUNK)).collect();
+            for c in ordered(reads, IN_FLIGHT).await? {
+                out.write_all(&c).await.map_err(local)?;
+                at += c.len() as u64;
+                // Short: the end, or the server cut the chunk; the rest of the round is at wrong offsets.
+                if (c.len() as u64) < READ_CHUNK {
+                    if c.is_empty() {
+                        break 'all;
+                    }
+                    continue 'all;
+                }
+            }
+        }
+        out.flush().await.map_err(local)?;
+        Ok(at)
+    };
+    let res = work.await;
+    let _ = sftp.close(handle).await;
+    res
+}
+
 async fn read_at(sftp: &RawSftpSession, handle: &str, path: &str, offset: u64, len: u64) -> Result<Vec<u8>> {
     match sftp.read(handle, offset, len as u32).await {
         Ok(d) => Ok(d.data),
