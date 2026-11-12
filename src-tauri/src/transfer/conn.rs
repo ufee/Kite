@@ -14,7 +14,7 @@ use futures::{
     FutureExt,
     future::{BoxFuture, Shared},
 };
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, watch};
 
 use crate::{
     error::{Error, Result},
@@ -25,13 +25,19 @@ use crate::{
 /// several SSH packets and stalls the session task (spike: 140 against 195 MB/s on 1 GB).
 pub const CHUNK: u32 = 64 * 1024;
 const IDLE: Duration = Duration::from_secs(30);
+/// Data requests in flight on one connection, all files and items together. russh-sftp starts a
+/// request's timeout when it is queued, not sent: with no cap, 32 files × 64 requests on a slow link
+/// would time out before their turn on the wire. 128 × 64 KiB = 8 MiB, so the floor is ~70 KB/s.
+pub const BUDGET: usize = 128;
 
 pub struct Conn {
     pub session: Arc<Session>,
     /// Read and write size, the server's limit if it is lower than ours.
     pub chunk: u32,
-    /// `posix-rename@openssh.com` works here; turns false on the first refusal.
+    /// `posix-rename@openssh.com` works here: announced at init, turns false on a refusal.
     pub posix_rename: AtomicBool,
+    /// One permit per data request in flight.
+    pub budget: Arc<Semaphore>,
     /// Turns true when the connection is gone.
     dropped: watch::Receiver<bool>,
 }
@@ -47,7 +53,8 @@ impl Conn {
                 }
             }
         }
-        Ok(Arc::new(Conn { session, chunk, posix_rename: AtomicBool::new(true), dropped }))
+        let posix_rename = AtomicBool::new(session.posix_rename);
+        Ok(Arc::new(Conn { session, chunk, posix_rename, budget: Arc::new(Semaphore::new(BUDGET)), dropped }))
     }
 
     /// Resolves once the connection is gone. A writer waiting for the channel window never hears
@@ -99,6 +106,28 @@ impl Drop for Lease {
     }
 }
 
+/// A use counted for a pair while `get` waits: given back if `get` is dropped (a pause meanwhile)
+/// or fails, handed to the lease when it succeeds.
+struct Claim<'a> {
+    pool: &'a Pool,
+    pair: Option<Pair>,
+}
+
+impl Claim<'_> {
+    fn lease(mut self, conn: Arc<Conn>) -> Lease {
+        let pair = self.pair.take().unwrap_or_default();
+        Lease { pool: self.pool.me.clone(), pair, conn }
+    }
+}
+
+impl Drop for Claim<'_> {
+    fn drop(&mut self) {
+        if let Some(pair) = self.pair.take() {
+            self.pool.release(&pair);
+        }
+    }
+}
+
 impl Pool {
     pub fn new(ssh: Arc<Ssh>) -> Arc<Self> {
         Arc::new_cyclic(|me| Pool { ssh, me: me.clone(), pairs: Mutex::new(Pairs::default()), epoch: AtomicU64::new(0) })
@@ -109,6 +138,7 @@ impl Pool {
     }
 
     /// The transfer connection of the pair; callers that come while it connects share the result.
+    /// Safe to drop while it waits: the connect goes on for the others, the use is given back.
     pub async fn get(&self, server: &str, user: &str) -> Result<Lease> {
         let pair: Pair = (server.to_owned(), user.to_owned());
         let (epoch, fut) = {
@@ -127,6 +157,7 @@ impl Pool {
                 }
             }
         };
+        let claim = Claim { pool: self, pair: Some(pair.clone()) };
         let res = fut.await;
         let mut stale = None;
         {
@@ -149,16 +180,14 @@ impl Pool {
             }
         }
         match (res, stale) {
+            // Closed for the server while connecting (a disconnect): the job's retry decides.
             (Ok(_), Some(c)) => {
-                self.release(&pair);
+                drop(claim);
                 c.session.close().await;
-                Err(Error::Stopped)
+                Err(Error::Disconnected)
             }
-            (Ok(conn), None) => Ok(Lease { pool: self.me.clone(), pair, conn }),
-            (Err(e), _) => {
-                self.release(&pair);
-                Err(e)
-            }
+            (Ok(conn), None) => Ok(claim.lease(conn)),
+            (Err(e), _) => Err(e),
         }
     }
 

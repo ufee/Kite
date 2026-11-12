@@ -64,6 +64,10 @@ function words(e: CoreError): [string, string] {
     case 'NO_EXEC': return [tr('Владелец не изменён'), tr('Сервер не выполняет команды: только SFTP.')];
     case 'EINVAL': return [tr('Операция не выполнена'), e.reason];
     case 'SERVER_GONE': return [tr('Сервер удалён из списка'), ''];
+    case 'BAD_NAME': return [tr('Имя не подходит для Windows: {p}', { p: e.path }), tr('Файл пропущен.')];
+    case 'NAME_CLASH': return [tr('Имя отличается от соседнего только регистром: {p}', { p: e.path }), tr('В Windows это один файл, второй пропущен.')];
+    case 'SOURCE_CHANGED': return [tr('Файл изменился во время передачи: {p}', { p: e.path }), tr('Источник оставлен на месте.')];
+    case 'NOT_REGULAR': return [tr('Не обычный файл: {p}', { p: e.path }), tr('Каналы, сокеты и устройства не передаются.')];
     default: return [tr('Ошибка SSH'), e.reason ?? ''];
   }
 }
@@ -95,6 +99,8 @@ const item = (i: CoreItem): TransferItem => {
 
 export class TauriBackend extends MockBackend {
   override readonly kind = 'tauri';
+  /** The queue as the core last sent it, in its order. */
+  private mirror = new Map<number, TransferItem>();
 
   constructor(store: Store) {
     super(store);
@@ -106,7 +112,12 @@ export class TauriBackend extends MockBackend {
     void invoke('prompts_reset').catch(() => undefined);
     void listen<CoreRow>('log://row', e => this.emit('log', row(e.payload)));
     void listen<CoreRow>('log://update', e => this.emit('logUpdate', row(e.payload)));
-    void listen<CoreItem[]>('transfer://state', e => this.emit('transfer', e.payload.map(item)));
+    // The core sends the items that changed; the mirror keeps the order of the queue.
+    void listen<{ up: CoreItem[]; del: number[] }>('transfer://state', e => {
+      for (const id of e.payload.del) this.mirror.delete(id);
+      for (const i of e.payload.up) this.mirror.set(i.id, item(i));
+      this.emit('transfer', [...this.mirror.values()]);
+    });
     void listen<BatchReport>('transfer://batch', e => this.emit('batch', e.payload));
     void listen<{ src: Src; path: string }>('fs://changed', e => this.emit('fs', e.payload.src, e.payload.path));
   }
@@ -188,7 +199,11 @@ export class TauriBackend extends MockBackend {
     const picks = entries.map(e => ({ name: e.name, dir: e.dir, size: e.size }));
     return call<number>('transfer_enqueue', { from, picks, to, mv: move, policy });
   }
-  override async transferList() { return (await call<CoreItem[]>('transfer_list')).map(item); }
+  override async transferList() {
+    const list = (await call<CoreItem[]>('transfer_list')).map(item);
+    this.mirror = new Map(list.map(i => [i.id, i]));
+    return list;
+  }
   override transferPause(id: number) { void invoke('transfer_pause', { id }); }
   override transferResume(id: number) { void invoke('transfer_resume', { id }); }
   override transferCancel(id: number) { void invoke('transfer_cancel', { id }); }

@@ -49,6 +49,7 @@ export type ErrCode =
   | 'ENOENT' | 'ENOTDIR' | 'EACCES' | 'EEXIST' | 'EINVAL' | 'BAD_PATH' | 'NO_EXEC'
   | 'TIMEOUT' | 'NET' | 'DROPPED' |'AUTH_KEY' | 'AUTH_PASS' | 'NO_SECRET' | 'AUTH_MULTI' | 'AUTH_METHODS' | 'HOSTKEY_REJECTED' | 'HOSTKEY_CHANGED'
   | 'KEY_FILE' | 'NO_PUBKEY' | 'KEY_CHECK' | 'PASSPHRASE' | 'KEYCHAIN' | 'SSH' | 'CANCELLED' | 'DISCONNECTED'
+  | 'SERVER_GONE' | 'BAD_NAME' | 'NAME_CLASH' | 'SOURCE_CHANGED' | 'NOT_REGULAR'
   /** The operation arrives in a later stage. */
   | 'NOT_YET';
 

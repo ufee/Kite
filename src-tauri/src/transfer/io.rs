@@ -18,7 +18,7 @@ use russh_sftp::{
     client::error::Error as SftpError,
     protocol::{FileAttributes, OpenFlags, StatusCode},
 };
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{OwnedSemaphorePermit, mpsc, watch};
 
 use super::conn::{Conn, Lease};
 use crate::{
@@ -110,6 +110,29 @@ fn no_file(e: &SftpError) -> bool {
 
 async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
     tauri::async_runtime::spawn_blocking(f).await.map_err(|e| Error::Einval { reason: e.to_string() })?
+}
+
+/// A name this PC can hold as one path component. A server name is any bytes but `/`: on Windows
+/// `\` and `:` would make it a path of its own (`..\x`, `C:\x`, an NTFS stream), so such a file is
+/// skipped rather than joined.
+pub fn local_name_ok(name: &str) -> bool {
+    if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\0']) {
+        return false;
+    }
+    if !cfg!(windows) {
+        return true;
+    }
+    const DEVICES: [&str; 22] = [
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5",
+        "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    let stem = name.split('.').next().unwrap_or_default().trim_end_matches(' ').to_ascii_uppercase();
+    !(name.ends_with(['.', ' ']) || name.chars().any(|c| c < ' ' || r#"\:<>"|?*"#.contains(c)) || DEVICES.contains(&stem.as_str()))
+}
+
+/// Every component of a `/`-separated relative path is a name this PC can hold.
+pub fn local_rel_ok(rel: &str) -> bool {
+    rel.split('/').all(local_name_ok)
 }
 
 /// A local path from a folder and a `/`-separated relative path.
@@ -276,6 +299,17 @@ impl Side {
         }
     }
 
+    /// A link itself, never what it points to; on Windows a link to a folder is a folder entry.
+    pub async fn remove_link(&self, path: &str) -> Result<()> {
+        match self {
+            Side::Local => {
+                let p = path.to_owned();
+                blocking(move || std::fs::remove_file(&p).or_else(|_| std::fs::remove_dir(&p)).map_err(|e| io_error(&e, &p))).await
+            }
+            Side::Remote(_) => self.remove(path).await,
+        }
+    }
+
     /// An empty folder; one with something left in it stays.
     pub async fn rmdir(&self, path: &str) -> Result<()> {
         match self {
@@ -285,6 +319,14 @@ impl Side {
             }
             Side::Remote(l) => l.conn.session.sftp.rmdir(path).await.map(|_| ()).map_err(|e| fs_error(e, path)),
         }
+    }
+
+    /// Permission bits of a server path; set exactly, past the server's umask.
+    pub async fn chmod(&self, path: &str, mode: u32) -> Result<()> {
+        let Side::Remote(l) = self else { return Ok(()) };
+        let mut a = FileAttributes::empty();
+        a.permissions = Some(mode);
+        l.conn.session.sftp.setstat(path, a).await.map(|_| ()).map_err(|e| fs_error(e, path))
     }
 
     /// Renames over an existing file: `posix-rename@openssh.com` when the server has it, otherwise
@@ -313,17 +355,26 @@ impl Side {
                         Err(e) => return Err(fs_error(e, to)),
                     }
                 }
+                let Err(first) = sftp.rename(from, to).await else { return Ok(()) };
+                // Plain SFTP refuses to rename over a file. Only that case goes on: the part is there
+                // and a file is in the way. The old file steps aside, the part takes its place, then
+                // the old one goes; if the part cannot move, the old one comes back.
+                let in_way = matches!(sftp.lstat(to).await, Ok(a) if !a.attrs.is_dir());
+                if !in_way || sftp.lstat(from).await.is_err() {
+                    return Err(fs_error(first, to));
+                }
+                let (dir, name) = self.split(to);
+                let old = self.join(&dir, &format!(".{name}.kite-old"));
+                let _ = sftp.remove(&old).await;
+                sftp.rename(to, &old).await.map_err(|e| fs_error(e, to))?;
                 match sftp.rename(from, to).await {
-                    Ok(_) => Ok(()),
-                    Err(first) => {
-                        // Plain SFTP refuses to rename over a file: take the old one away first.
-                        match sftp.lstat(to).await {
-                            Ok(a) if !a.attrs.is_dir() => {
-                                sftp.remove(to).await.map_err(|e| fs_error(e, to))?;
-                                sftp.rename(from, to).await.map(|_| ()).map_err(|e| fs_error(e, to))
-                            }
-                            _ => Err(fs_error(first, to)),
-                        }
+                    Ok(_) => {
+                        let _ = sftp.remove(&old).await;
+                        Ok(())
+                    }
+                    Err(e) => {
+                        let _ = sftp.rename(&old, to).await;
+                        Err(fs_error(e, to))
                     }
                 }
             }
@@ -463,7 +514,7 @@ pub async fn copy(
         (Err(Error::Stopped), _) | (_, Err(Error::Stopped)) => Err(Error::Stopped),
         (_, Err(e)) => Err(e),
         (Err(e), _) => Err(e),
-        (Ok(got), Ok(())) if got < size - offset => Err(Error::Einval { reason: format!("{src}: file shrank while copying") }),
+        (Ok(got), Ok(())) if got < size - offset => Err(Error::SourceChanged { path: src.into() }),
         _ => Ok(()),
     }
 }
@@ -480,10 +531,13 @@ pub async fn fetch_small(from: &Side, src: &str, to: &Side, part: &str, dst: &st
     }
     let sftp = &l.conn.session.sftp;
     let handle = sftp.open(src, OpenFlags::READ, FileAttributes::empty()).await.map_err(|e| fs_error(e, src))?.handle;
+    let permit = l.conn.budget.acquire().await.map_err(|_| Error::Disconnected)?;
     let read = async {
         if size == 0 { Ok(Vec::new()) } else { sftp.read(handle.as_str(), 0, size as u32).await.map(|d| d.data) }
     };
-    let (read, _) = tokio::join!(read, sftp.close(handle.as_str()));
+    // `biased`: the read is queued before the close, and the server answers in order.
+    let (read, _) = tokio::join!(biased; read, sftp.close(handle.as_str()));
+    drop(permit);
     let Some(data) = read.ok().filter(|d| d.len() as u64 == size) else { return Ok(false) };
     let (p, d) = (part.to_owned(), dst.to_owned());
     blocking(move || {
@@ -553,6 +607,17 @@ async fn read(side: &Side, path: &str, offset: u64, size: u64, chunk: usize, tx:
     }
 }
 
+/// A slot of the connection's request budget. A pipeline with requests of its own in flight only
+/// takes a free one: waiting here would stop it collecting its replies, and those free slots. With
+/// none in flight it waits.
+async fn permit(conn: &Conn, idle: bool) -> Result<Option<OwnedSemaphorePermit>> {
+    match conn.budget.clone().try_acquire_owned() {
+        Ok(p) => Ok(Some(p)),
+        Err(_) if idle => conn.budget.clone().acquire_owned().await.map(Some).map_err(|_| Error::Disconnected),
+        Err(_) => Ok(None),
+    }
+}
+
 /// Keeps `IN_FLIGHT` reads outstanding and passes them on in file order.
 async fn read_pipeline(conn: &Conn, handle: &str, path: &str, start: u64, size: u64, chunk: u64, tx: &mpsc::Sender<Vec<u8>>) -> Result<u64> {
     let sftp = &conn.session.sftp;
@@ -560,9 +625,14 @@ async fn read_pipeline(conn: &Conn, handle: &str, path: &str, start: u64, size: 
     let (mut offset, mut got) = (start, 0u64);
     loop {
         while offset < size && in_flight.len() < IN_FLIGHT {
+            let Some(permit) = permit(conn, in_flight.is_empty()).await? else { break };
             let len = chunk.min(size - offset);
             let at = offset;
-            in_flight.push_back(async move { (at, len, sftp.read(handle, at, len as u32).await) });
+            in_flight.push_back(async move {
+                let r = sftp.read(handle, at, len as u32).await;
+                drop(permit);
+                (at, len, r)
+            });
             offset += len;
         }
         let Some((at, len, res)) = in_flight.next().await else { return Ok(got) };
@@ -649,9 +719,8 @@ async fn write(side: &Side, path: &str, offset: u64, size: u64, mut rx: mpsc::Re
         Side::Remote(l) => {
             let sftp = &l.conn.session.sftp;
             let flags = if offset > 0 { OpenFlags::WRITE } else { OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE };
-            let mut attrs = FileAttributes::empty();
-            attrs.permissions = finish.mode;
-            let handle = sftp.open(path, flags, attrs).await.map_err(|e| fs_error(e, path))?.handle;
+            // The part stays writable for a resume: its mode comes at the end, with the date.
+            let handle = sftp.open(path, flags, FileAttributes::empty()).await.map_err(|e| fs_error(e, path))?.handle;
             let res = tokio::select! {
                 r = write_pipeline(&l.conn, &handle, path, offset, &mut rx, done) => r,
                 _ = stopped(&mut stop) => Err(Error::Stopped),
@@ -666,19 +735,21 @@ async fn write(side: &Side, path: &str, offset: u64, size: u64, mut rx: mpsc::Re
                 }
                 r => r.map(|_| ()),
             };
-            // Date and close go together: the server applies them in order, nothing is written after.
+            // Date, mode and close go together: the server applies them in order, nothing is written
+            // after. A mode set here is exact, past the server's umask.
             let set = async {
-                match (res.is_ok(), finish.mtime) {
-                    (true, Some(t)) => {
-                        let mut a = FileAttributes::empty();
-                        a.atime = Some(t as u32);
-                        a.mtime = Some(t as u32);
-                        sftp.fsetstat(handle.as_str(), a).await.map(|_| ()).map_err(|e| fs_error(e, path))
-                    }
-                    _ => Ok(()),
+                if res.is_err() || (finish.mtime.is_none() && finish.mode.is_none()) {
+                    return Ok(());
                 }
+                let mut a = FileAttributes::empty();
+                a.permissions = finish.mode;
+                if let Some(t) = finish.mtime {
+                    a.atime = Some(t as u32);
+                    a.mtime = Some(t as u32);
+                }
+                sftp.fsetstat(handle.as_str(), a).await.map(|_| ()).map_err(|e| fs_error(e, path))
             };
-            let (set, closed) = tokio::join!(set, sftp.close(handle.as_str()));
+            let (set, closed) = tokio::join!(biased; set, sftp.close(handle.as_str()));
             res?;
             set?;
             closed.map(|_| ()).map_err(|e| fs_error(e, path))
@@ -700,12 +771,22 @@ async fn write_pipeline(conn: &Conn, handle: &str, path: &str, start: u64, rx: &
     loop {
         let floor = open.keys().next().copied().unwrap_or(offset);
         let room = in_flight.len() < IN_FLIGHT && offset - floor < window;
-        if let Some(data) = held.take_if(|_| room) {
-            let (at, len) = (offset, data.len() as u64);
-            offset += len;
-            open.insert(at, len);
-            in_flight.push(async move { (at, len, sftp.write(handle, at, data).await) });
-            continue;
+        if room && let Some(data) = held.take() {
+            match permit(conn, in_flight.is_empty()).await? {
+                Some(permit) => {
+                    let (at, len) = (offset, data.len() as u64);
+                    offset += len;
+                    open.insert(at, len);
+                    in_flight.push(async move {
+                        let r = sftp.write(handle, at, data).await;
+                        drop(permit);
+                        (at, len, r)
+                    });
+                    continue;
+                }
+                // The budget is spent: a reply of ours below frees a slot.
+                None => held = Some(data),
+            }
         }
         tokio::select! {
             biased;
@@ -739,6 +820,24 @@ mod tests {
         let rels: Vec<String> = local_walk(&dir.to_string_lossy()).unwrap().into_iter().map(|n| n.rel).collect();
         assert_eq!(rels, ["a", "a/z", "b", "b/c", "b/c/f.txt", "b.txt"]);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn server_names_that_escape_are_refused() {
+        for bad in ["", ".", "..", "a/b"] {
+            assert!(!local_name_ok(bad), "{bad:?}");
+        }
+        assert!(local_name_ok("report.final.txt"));
+        assert!(local_name_ok(".bashrc"));
+        assert!(local_rel_ok("a/b/c.txt"));
+        assert!(!local_rel_ok("a/../b"));
+        if cfg!(windows) {
+            for bad in [r"..\..\x.bat", r"C:\Users\Public\x.bat", "a.txt:stream", "CON", "nul.txt", "com1", "dot.", "space ", "q?", "tab\t"] {
+                assert!(!local_name_ok(bad), "{bad:?}");
+            }
+            assert!(local_name_ok("CONSOLE.txt"));
+            assert!(!local_rel_ok(r"ok/..\..\evil"));
+        }
     }
 
     #[test]

@@ -233,6 +233,8 @@ pub struct Session {
     pub home: String,
     /// The server's code at connect time: the log's source column.
     pub code: String,
+    /// The server announced `posix-rename@openssh.com` at init.
+    pub posix_rename: bool,
     closing: AtomicBool,
 }
 
@@ -520,7 +522,7 @@ impl Ssh {
 
     async fn open_session(self: &Arc<Self>, t: &Target, method: &Method, mode: HostMode) -> Result<(Arc<Session>, watch::Receiver<bool>)> {
         let Shaken { handle, dropped, .. } = self.handshake(t, method, mode).await?;
-        let (sftp, version, home) = match sftp::open(&handle).await {
+        let (sftp, version, home, posix_rename) = match sftp::open(&handle).await {
             Ok(v) => v,
             Err(e) => {
                 self.log.err(&t.code, "SFTP", "Подсистема SFTP не запустилась", e.to_string());
@@ -529,7 +531,7 @@ impl Ssh {
             }
         };
         self.log.ok(&t.code, "SFTP", msg!("Подсистема запущена, протокол v{v}", v = version));
-        Ok((Arc::new(Session { handle, sftp, home, code: t.code.clone(), closing: AtomicBool::new(false) }), dropped))
+        Ok((Arc::new(Session { handle, sftp, home, code: t.code.clone(), posix_rename, closing: AtomicBool::new(false) }), dropped))
     }
 
     /* ----- saved servers ----- */
@@ -569,6 +571,11 @@ impl Ssh {
             Some(Slot::Live { session, .. }) if !session.is_closed() => Ok(session.clone()),
             _ => Err(Error::Disconnected),
         }
+    }
+
+    /// The server is connected, under any user.
+    pub fn has_session(&self, server: &str) -> bool {
+        self.slots().iter().any(|((s, _), slot)| s == server && matches!(slot, Slot::Live { session, .. } if !session.is_closed()))
     }
 
     /// The session of the pair, connecting if needed. Callers that come while it connects share the result.

@@ -49,27 +49,37 @@ impl Run<'_> {
     pub async fn go(&self, from: &Side, to: &Side) -> Result<()> {
         let it = self.item;
         let src = from.join(&it.from.path, &it.name);
+        if to.is_local() && !io::local_name_ok(&it.tname) {
+            return Err(Error::BadName { path: it.tname.clone() });
+        }
         let dst = to.join(&it.to.path, &it.tname);
         // The picked item may be a link: its target is what the user sees in the panel.
         let meta = from.stat(&src).await?.ok_or_else(|| Error::Enoent { path: src.clone() })?;
         if meta.kind == Kind::Other {
-            return Err(Error::Einval { reason: format!("{src}: not a regular file") });
+            return Err(Error::NotRegular { path: src });
         }
         if it.mv && same_place(it) && self.rename(from, &src, to, &dst, &meta).await? {
             self.done().store(meta.size, Ordering::Relaxed);
             return Ok(());
         }
+        // Moving a link sends what it points to and then deletes the link, never its target's files.
+        let link = it.mv && from.lstat(&src).await?.is_some_and(|m| m.kind == Kind::Link);
         if meta.kind == Kind::Dir {
-            self.folder(from, &src, to, &dst, &meta).await
+            self.folder(from, &src, to, &dst, &meta, it.mv && !link).await?;
         } else {
             self.q.set_size(self.id, meta.size);
             self.done().store(0, Ordering::Relaxed);
             self.file(from, &src, &meta, to, &dst, "").await?;
-            if it.mv {
-                from.delete_tree(&src).await?;
+            if it.mv && !link {
+                unchanged(from, &src, &meta, false).await?;
             }
-            Ok(())
         }
+        if link {
+            from.remove_link(&src).await?;
+        } else if it.mv && meta.kind != Kind::Dir {
+            from.delete_tree(&src).await?;
+        }
+        Ok(())
     }
 
     /// A move inside one place: true when the rename did it all.
@@ -100,8 +110,9 @@ impl Run<'_> {
             && len <= meta.size
         {
             offset = match to.conn() {
-                // Writes may have landed out of order within the window: redo that much.
-                Some(c) => len.saturating_sub(IN_FLIGHT as u64 * c.chunk as u64),
+                // Writes may have landed out of order within the window: redo that much, plus one
+                // chunk for the last write let in at the window's edge with uneven chunks.
+                Some(c) => len.saturating_sub((IN_FLIGHT as u64 + 1) * c.chunk as u64),
                 None => len,
             };
         }
@@ -128,13 +139,14 @@ impl Run<'_> {
         (i, same)
     }
 
-    /// One file of a folder; a move deletes its source right after.
+    /// One file of a folder; a move deletes its source right after, if it is still what was sent.
     #[allow(clippy::too_many_arguments)]
-    async fn one(&self, from: &Side, src: String, to: &Side, dst: String, n: &io::Node, big: &Semaphore, i: usize) -> (usize, String, Result<()>) {
+    async fn one(&self, from: &Side, src: String, to: &Side, dst: String, n: &io::Node, big: &Semaphore, i: usize, mv: bool) -> (usize, String, Result<()>) {
         let res = async {
             let _slot = if n.meta.size > BIG { big.acquire().await.ok() } else { None };
             self.file(from, &src, &n.meta, to, &dst, &n.rel).await?;
-            if self.item.mv {
+            if mv {
+                unchanged(from, &src, &n.meta, true).await?;
                 from.remove(&src).await?;
             }
             Ok(())
@@ -143,19 +155,65 @@ impl Run<'_> {
         (i, src, res)
     }
 
-    async fn folder(&self, from: &Side, src: &str, to: &Side, dst: &str, meta: &Meta) -> Result<()> {
-        let it = self.item;
+    /// Entries this PC cannot take as they are: names Windows reads as paths or devices, and names
+    /// that differ only in case (one file there). Each one is logged and left out with what is under it.
+    fn unfit(&self, from: &Side, src: &str, nodes: Vec<io::Node>) -> (Vec<io::Node>, Option<Error>) {
+        let fold = cfg!(windows);
+        let mut seen: std::collections::HashMap<String, Kind> = std::collections::HashMap::new();
+        let mut cut: Vec<String> = Vec::new();
+        let mut first = None;
+        let mut keep = Vec::with_capacity(nodes.len());
+        for n in nodes {
+            if cut.iter().any(|c| n.rel.starts_with(c.as_str())) {
+                continue;
+            }
+            let key = if fold { n.rel.to_lowercase() } else { n.rel.clone() };
+            let err = if !io::local_rel_ok(&n.rel) {
+                Some(Error::BadName { path: n.rel.clone() })
+            } else {
+                match seen.get(&key) {
+                    // Two folders that fold to one simply merge.
+                    Some(Kind::Dir) if n.meta.kind == Kind::Dir => None,
+                    Some(_) => Some(Error::NameClash { path: n.rel.clone() }),
+                    None => None,
+                }
+            };
+            match err {
+                Some(e) => {
+                    self.q.log_path(from, &from.join(src, &n.rel), e.to_string(), Row::Err);
+                    if n.meta.kind == Kind::Dir {
+                        cut.push(format!("{}/", n.rel));
+                    }
+                    first.get_or_insert(e);
+                }
+                None => {
+                    seen.entry(key).or_insert(n.meta.kind);
+                    keep.push(n);
+                }
+            }
+        }
+        (keep, first)
+    }
+
+    async fn folder(&self, from: &Side, src: &str, to: &Side, dst: &str, meta: &Meta, mv: bool) -> Result<()> {
         self.q.set_state(self.id, St::Count);
         let mut nodes = from.walk(src).await?;
         nodes.sort_by(|a, b| a.rel.split('/').cmp(b.rel.split('/')));
+        let mut first: Option<Error> = None;
+        if to.is_local() {
+            let (keep, bad) = self.unfit(from, src, nodes);
+            nodes = keep;
+            first = bad;
+        }
         let total = nodes.iter().filter(|n| n.meta.kind == Kind::File).map(|n| n.meta.size).sum();
         self.q.set_size(self.id, total);
         self.done().store(0, Ordering::Relaxed);
         self.q.set_state(self.id, St::Run);
 
         let relay = !from.is_local() && !to.is_local();
-        let mode = |m: &Meta| relay.then_some(m.mode & 0o7777);
-        to.mkdir(dst, mode(meta)).await?;
+        // Folders are made writable and get their own modes after their files (a 0555 folder
+        // would refuse them).
+        to.mkdir(dst, None).await?;
         // Parents before children: one depth at a time, the folders of a depth together.
         let dirs: Vec<&io::Node> = nodes.iter().filter(|n| n.meta.kind == Kind::Dir).collect();
         let deepest = dirs.iter().map(|n| n.rel.matches('/').count()).max().unwrap_or(0);
@@ -165,7 +223,7 @@ impl Run<'_> {
             loop {
                 while fl.len() < DIRS_IN_FLIGHT && next < level.len() {
                     let n = level[next];
-                    fl.push(mkdir(to, to.join(dst, &n.rel), mode(&n.meta)));
+                    fl.push(mkdir(to, to.join(dst, &n.rel), None));
                     next += 1;
                 }
                 match fl.next().await {
@@ -178,13 +236,12 @@ impl Run<'_> {
             return Err(Error::Stopped);
         }
 
-        let mut first: Option<Error> = None;
         for n in nodes.iter().filter(|n| n.meta.kind == Kind::Link || n.meta.kind == Kind::Other) {
             let s = from.join(src, &n.rel);
             if n.meta.kind == Kind::Link && relay {
                 let made = async { to.symlink(&from.readlink(&s).await?, &to.join(dst, &n.rel)).await }.await;
                 match made {
-                    Ok(()) if it.mv => {
+                    Ok(()) if mv => {
                         let _ = from.remove(&s).await;
                     }
                     Ok(()) => {}
@@ -203,7 +260,7 @@ impl Run<'_> {
 
         let files: Vec<&io::Node> = nodes.iter().filter(|n| n.meta.kind == Kind::File).collect();
         // A move deletes what it has sent, so the source list shrinks and the mark means nothing.
-        let mark = if it.mv { 0 } else { self.resume.files.min(files.len()) };
+        let mark = if mv { 0 } else { self.resume.files.min(files.len()) };
         let mut flags = vec![false; files.len()];
         // Files under the mark are checked, not trusted: the folder may have changed since.
         let (mut next, mut fl) = (0, FuturesUnordered::new());
@@ -231,7 +288,7 @@ impl Run<'_> {
         loop {
             while sent.len() < FILES_IN_FLIGHT && next < todo.len() {
                 let i = todo[next];
-                sent.push(self.one(from, from.join(src, &files[i].rel), to, to.join(dst, &files[i].rel), files[i], big, i));
+                sent.push(self.one(from, from.join(src, &files[i].rel), to, to.join(dst, &files[i].rel), files[i], big, i, mv));
                 next += 1;
             }
             let Some((i, s, res)) = sent.next().await else { break };
@@ -255,7 +312,18 @@ impl Run<'_> {
         }
         drop(sent);
 
-        if it.mv {
+        if relay {
+            // Modes of the folders, deepest first, so none closes before its children are done.
+            for n in dirs.iter().rev() {
+                if let Err(e) = to.chmod(&to.join(dst, &n.rel), n.meta.mode & 0o7777).await {
+                    first.get_or_insert(e);
+                }
+            }
+            if let Err(e) = to.chmod(dst, meta.mode & 0o7777).await {
+                first.get_or_insert(e);
+            }
+        }
+        if mv {
             // Emptied folders go, deepest first; one with something left (a failed file) stays.
             for n in dirs.iter().rev() {
                 let _ = from.rmdir(&from.join(src, &n.rel)).await;
@@ -268,6 +336,16 @@ impl Run<'_> {
 
 async fn mkdir(to: &Side, path: String, mode: Option<u32>) -> Result<()> {
     to.mkdir(&path, mode).await
+}
+
+/// A move deletes its source only while it is still what was sent: a file written to meanwhile
+/// stays, and the item ends with an error.
+async fn unchanged(from: &Side, src: &str, meta: &Meta, own: bool) -> Result<()> {
+    let now = if own { from.lstat(src).await? } else { from.stat(src).await? };
+    match now {
+        Some(m) if m.size == meta.size && m.mtime == meta.mtime => Ok(()),
+        _ => Err(Error::SourceChanged { path: src.into() }),
+    }
 }
 
 #[cfg(test)]

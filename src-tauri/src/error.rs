@@ -56,6 +56,14 @@ pub enum Error {
     Einval { reason: String },
     /// The server of a transfer is no longer in the list.
     ServerGone,
+    /// A server name this PC cannot hold (`\`, `:`, `CON`, a trailing dot): skipped, never joined.
+    BadName { path: String },
+    /// Two server names that differ only in case land on one file here: the second is skipped.
+    NameClash { path: String },
+    /// The source changed while it was being sent; a move keeps it.
+    SourceChanged { path: String },
+    /// A FIFO, socket or device: never transferred.
+    NotRegular { path: String },
     /// A transfer was paused or cancelled; never reaches the UI.
     Stopped,
 }
@@ -109,6 +117,10 @@ impl std::fmt::Display for Error {
             Self::AuthPass => f.write_str("пароль не принят"),
             Self::Disconnected => f.write_str("соединение закрыто"),
             Self::Dropped { .. } => f.write_str("сервер закрыл соединение до входа"),
+            Self::BadName { .. } => f.write_str("имя не подходит для Windows, пропущен"),
+            Self::NameClash { .. } => f.write_str("имя отличается от соседнего только регистром, пропущен"),
+            Self::SourceChanged { .. } => f.write_str("источник изменился во время передачи"),
+            Self::NotRegular { .. } => f.write_str("не обычный файл, пропущен"),
             Self::Net { reason, .. } | Self::Ssh { reason } | Self::Keychain { reason } | Self::Einval { reason } => {
                 f.write_str(reason)
             }

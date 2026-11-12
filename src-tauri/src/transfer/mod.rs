@@ -1,11 +1,13 @@
 //! The transfer queue. FIFO, 1–5 items at a time; a file or a folder is one item.
 //!
-//! The core owns the queue: the UI mirrors it from `transfer://state` (at most ten times a second)
-//! and gets `transfer://batch` when every item of a batch has ended. The queue is saved to
-//! `transfers.json`; after a restart unfinished items come back paused with their progress.
+//! The core owns the queue: the UI mirrors it from `transfer://state` (the items that changed, at
+//! most ten times a second) and gets `transfer://batch` when every item of a batch has ended. The
+//! queue is saved to `transfers.json`; after a restart unfinished items come back paused with their
+//! progress.
 //!
 //! Servers are reached over a transfer connection of their own (see `conn`). A dropped connection
-//! is retried with pauses of 1, 3, 10 and 30 s while the item keeps its place; then it fails.
+//! is retried with pauses of 1, 3, 10 and 30 s while the item keeps its place; then it fails. So
+//! does an item that keeps losing the connection right after getting it back.
 
 pub mod conn;
 mod io;
@@ -15,7 +17,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     sync::{
         Arc, Mutex, Weak,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -39,10 +41,16 @@ use crate::{
 
 const LOCAL: &str = "local";
 const RECONNECT: [u64; 4] = [1, 3, 10, 30];
+/// Drops in a row with no byte moved in between, then the item fails.
+const DROPS: usize = 4;
 /// Progress events: at most ten a second for the whole queue.
 const TICK: Duration = Duration::from_millis(100);
-/// The queue on disk while something runs.
+/// The queue on disk at most this often.
 const SAVE_EVERY: Duration = Duration::from_secs(2);
+/// Deleting the parts of a cancelled item, connecting included.
+const CLEAN_WAIT: Duration = Duration::from_secs(15);
+/// A disconnect that cancels waits this long for the parts to go before closing the connections.
+const DETACH_WAIT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct End {
@@ -55,6 +63,11 @@ pub struct End {
 impl End {
     fn is_local(&self) -> bool {
         self.src == LOCAL
+    }
+
+    /// Names here as the file system compares them: Windows folders ignore case.
+    fn key(&self, name: &str) -> String {
+        if cfg!(windows) && self.is_local() { name.to_lowercase() } else { name.to_owned() }
     }
 }
 
@@ -93,7 +106,7 @@ pub struct Pick {
 }
 
 /// What the UI shows of an item.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Item {
     pub id: u64,
@@ -117,6 +130,13 @@ pub struct Item {
     pub denied: bool,
 }
 
+impl Item {
+    /// Writes this target: the same server, folder and name as the file system compares them.
+    fn writes(&self, to: &End, tname: &str) -> bool {
+        self.to.src == to.src && to.key(&self.to.path) == to.key(&to.path) && to.key(&self.tname) == to.key(tname)
+    }
+}
+
 /// What a resume needs: parts being written with their source's size and date, and for a folder
 /// how many of its files in sorted order are done.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -135,8 +155,6 @@ pub struct Prog {
 struct Live {
     stop: watch::Sender<bool>,
     prog: Arc<Prog>,
-    /// Set before the stop when the item is cancelled: its parts are deleted.
-    cancel: AtomicBool,
 }
 
 struct Rec {
@@ -145,9 +163,15 @@ struct Rec {
     live: Option<Arc<Live>>,
     /// Log row of the item while it runs.
     row: Option<u64>,
+    /// Paused by a disconnect of its server: goes on when the server is connected again.
+    held: bool,
 }
 
 impl Rec {
+    fn new(item: Item, resume: Resume) -> Self {
+        Rec { item, resume, live: None, row: None, held: false }
+    }
+
     /// The item with the progress of its running job.
     fn now(&self) -> Item {
         let mut item = self.item.clone();
@@ -183,7 +207,8 @@ struct Inner {
     parallel: usize,
     keep_time: bool,
     reported: HashSet<u64>,
-    /// Cancelled items whose job has not stopped yet: their parts are deleted when it has.
+    /// Cancelled and cleared items until their parts are deleted, after their job if it still runs.
+    /// Their target does not start again meanwhile.
     gone: Vec<Rec>,
     /// Something changed that the disk does not have yet.
     dirty: bool,
@@ -194,6 +219,13 @@ struct View<'a> {
     #[serde(flatten)]
     item: &'a Item,
     speed: f64,
+}
+
+/// One `transfer://state`: items new or changed since the last one, and ids no longer listed.
+#[derive(Serialize, Clone)]
+struct Diff {
+    up: Vec<Value>,
+    del: Vec<u64>,
 }
 
 #[derive(Serialize, Clone)]
@@ -222,6 +254,8 @@ pub struct Transfers {
     me: Weak<Transfers>,
     inner: Mutex<Inner>,
     kick: Notify,
+    /// An item left `gone`.
+    settled: Notify,
 }
 
 impl Transfers {
@@ -236,7 +270,7 @@ impl Transfers {
                 if item.state != St::Err {
                     item.state = St::Pause;
                 }
-                Rec { item, resume, live: None, row: None }
+                Rec::new(item, resume)
             })
             .collect::<Vec<_>>();
         let next_id = recs.iter().map(|r| r.item.id).max().unwrap_or(0).max(disk.next_id);
@@ -252,6 +286,7 @@ impl Transfers {
             me: me.clone(),
             inner: Mutex::new(Inner { recs, next_id, next_batch, parallel: 3, keep_time: true, reported, gone: Vec::new(), dirty: false }),
             kick: Notify::new(),
+            settled: Notify::new(),
         });
         let t = me.clone();
         tauri::async_runtime::spawn(async move { t.publisher().await });
@@ -302,18 +337,18 @@ impl Transfers {
         let mut added = 0;
         for p in picks {
             let mut tname = p.name.clone();
-            if names.contains(&p.name) {
+            if names.contains(&to.key(&p.name)) {
                 match policy {
                     Policy::Skip => continue,
-                    Policy::Both => tname = free_name(&taken, &p.name, p.dir),
+                    Policy::Both => tname = free_name(&taken, &p.name, p.dir, |n| to.key(n)),
                     Policy::Replace => {}
                 }
             }
             // The same target twice at once would write one part from two sides.
-            if g.recs.iter().any(|r| r.item.state.active() && r.item.to.src == to.src && r.item.to.path == to.path && r.item.tname == tname) {
+            if g.recs.iter().any(|r| r.item.state.active() && r.item.writes(&to, &tname)) {
                 continue;
             }
-            taken.insert(tname.clone());
+            taken.insert(to.key(&tname));
             g.next_id += 1;
             let item = Item {
                 id: g.next_id,
@@ -330,7 +365,7 @@ impl Transfers {
                 denied: false,
                 name: p.name,
             };
-            g.recs.push(Rec { item, resume: Resume::default(), live: None, row: None });
+            g.recs.push(Rec::new(item, Resume::default()));
             added += 1;
         }
         if added == 0 {
@@ -343,7 +378,7 @@ impl Transfers {
         Ok(batch)
     }
 
-    /// Names in the target folder, for "skip" and "keep both".
+    /// Names in the target folder as its file system compares them, for "skip" and "keep both".
     async fn names(&self, to: &End) -> Result<HashSet<String>> {
         let list = if to.is_local() {
             let p = to.path.clone();
@@ -352,15 +387,23 @@ impl Transfers {
             let s = self.ssh.session_live(&to.src, &to.user)?;
             crate::fs::remote::list(&s, &to.path).await?
         };
-        Ok(list.into_iter().map(|e| e.name).collect())
+        Ok(list.into_iter().map(|e| to.key(&e.name)).collect())
     }
 
     pub fn pause(&self, id: u64) {
+        self.hold(id, false);
+    }
+
+    /// Pauses an item; `held` marks a pause by a disconnect, which a new connect undoes.
+    fn hold(&self, id: u64, held: bool) {
         let live = self.with(id, |r| {
             if matches!(r.item.state, St::Wait | St::Count | St::Run) {
                 r.item.state = St::Pause;
+                r.held = held;
                 r.live.clone()
             } else {
+                // A pause by hand outlasts a reconnect.
+                r.held &= held;
                 None
             }
         });
@@ -373,6 +416,7 @@ impl Transfers {
 
     pub fn resume(&self, id: u64) {
         self.with(id, |r| {
+            r.held = false;
             if r.item.state == St::Pause {
                 r.item.state = St::Wait;
             }
@@ -391,33 +435,26 @@ impl Transfers {
 
     /// Cancels an item, or takes a finished one off the list. Parts it leaves are deleted.
     pub fn cancel(&self, id: u64) {
-        let (gone, live) = {
+        let (row, live, sweep) = {
             let mut g = self.inner();
             let Some(k) = g.recs.iter().position(|r| r.item.id == id) else { return };
-            let mut gone = g.recs.remove(k);
-            let live = gone.live.clone();
-            if let Some(l) = &live {
-                l.cancel.store(true, Ordering::Relaxed);
-                // The job still runs: it keeps reporting its parts here until it stops.
-                g.gone.push(Rec { item: gone.item.clone(), resume: gone.resume.clone(), live: gone.live.take(), row: None });
+            let mut rec = g.recs.remove(k);
+            let row = rec.row.take().filter(|_| rec.item.state.active());
+            let live = rec.live.clone();
+            // A running job keeps reporting its parts here until it stops; `finish` sweeps them then.
+            let sweep = live.is_none() && rec.item.state != St::Done && !rec.resume.parts.is_empty();
+            if live.is_some() || sweep {
+                g.gone.push(rec);
             }
-            (gone, live)
+            (row, live, sweep)
         };
-        match &live {
-            Some(l) => {
-                let _ = l.stop.send(true);
-            }
-            None if gone.item.state != St::Done && !gone.resume.parts.is_empty() => {
-                if let Some(t) = self.me.upgrade() {
-                    let (to, tname, parts) = (gone.item.to.clone(), gone.item.tname.clone(), gone.resume.parts.keys().cloned().collect());
-                    tauri::async_runtime::spawn(async move { t.clean(&to, &tname, parts).await });
-                }
-            }
-            None => {}
+        if let Some(l) = &live {
+            let _ = l.stop.send(true);
         }
-        if let Some(row) = gone.row
-            && gone.item.state.active()
-        {
+        if sweep {
+            self.spawn_sweep(id);
+        }
+        if let Some(row) = row {
             self.log.done(row, "отменено", Row::Ok);
         }
         self.changed();
@@ -441,8 +478,20 @@ impl Transfers {
         self.schedule();
     }
 
+    /// Takes the ended items off the list; the parts failed ones leave are deleted.
     pub fn clear_done(&self) {
-        self.inner().recs.retain(|r| r.item.state.active());
+        let swept: Vec<u64> = {
+            let mut g = self.inner();
+            let (keep, out): (Vec<Rec>, Vec<Rec>) = std::mem::take(&mut g.recs).into_iter().partition(|r| r.item.state.active());
+            g.recs = keep;
+            let dirty: Vec<Rec> = out.into_iter().filter(|r| r.item.state == St::Err && !r.resume.parts.is_empty()).collect();
+            let ids = dirty.iter().map(|r| r.item.id).collect();
+            g.gone.extend(dirty);
+            ids
+        };
+        for id in swept {
+            self.spawn_sweep(id);
+        }
         self.changed();
     }
 
@@ -456,13 +505,45 @@ impl Transfers {
     }
 
     /// Disconnecting or deleting a server: its transfers pause or go, then its connections close.
+    /// A cancel waits a while for the parts to be deleted over the connections it is about to close.
     pub async fn detach(&self, server: &str, user: Option<&str>, cancel: bool) {
         let touches = |e: &End| e.src == server && user.is_none_or(|u| u == e.user);
         let ids: Vec<u64> = self.inner().recs.iter().filter(|r| r.item.state.active() && (touches(&r.item.from) || touches(&r.item.to))).map(|r| r.item.id).collect();
-        for id in ids {
-            if cancel { self.cancel(id) } else { self.pause(id) }
+        for &id in &ids {
+            if cancel { self.cancel(id) } else { self.hold(id, true) }
+        }
+        if cancel {
+            let swept = async {
+                loop {
+                    let next = self.settled.notified();
+                    tokio::pin!(next);
+                    next.as_mut().enable();
+                    if !self.inner().gone.iter().any(|r| ids.contains(&r.item.id)) {
+                        break;
+                    }
+                    next.await;
+                }
+            };
+            let _ = tokio::time::timeout(DETACH_WAIT, swept).await;
         }
         self.pool.close(server, user).await;
+    }
+
+    /// A server is connected again: what its disconnect paused goes on, once every server the
+    /// item needs is connected.
+    pub fn attach(&self, server: &str) {
+        let held: Vec<(u64, Vec<String>)> = self
+            .inner()
+            .recs
+            .iter()
+            .filter(|r| r.held && r.item.state == St::Pause && (r.item.from.src == server || r.item.to.src == server))
+            .map(|r| (r.item.id, [&r.item.from, &r.item.to].into_iter().filter(|e| !e.is_local()).map(|e| e.src.clone()).collect()))
+            .collect();
+        for (id, ends) in held {
+            if ends.iter().all(|s| self.ssh.has_session(s)) {
+                self.resume(id);
+            }
+        }
     }
 
     /// A batch that ended can end again after a resume or a retry.
@@ -479,18 +560,22 @@ impl Transfers {
         let Some(me) = self.me.upgrade() else { return };
         let start: Vec<(u64, Arc<Live>, watch::Receiver<bool>)> = {
             let mut g = self.inner();
-            let mut running = g.recs.iter().filter(|r| r.live.is_some()).count();
-            let parallel = g.parallel;
+            let Inner { recs, gone, parallel, .. } = &mut *g;
+            let mut running = recs.iter().filter(|r| r.live.is_some()).count();
             let mut out = Vec::new();
-            for r in g.recs.iter_mut() {
-                if running >= parallel {
+            for r in recs.iter_mut() {
+                if running >= *parallel {
                     break;
                 }
                 if r.item.state != St::Wait || r.live.is_some() {
                     continue;
                 }
+                // A cancelled item still writes this target or its parts are being deleted.
+                if gone.iter().any(|x| x.item.writes(&r.item.to, &r.item.tname)) {
+                    continue;
+                }
                 let (tx, rx) = watch::channel(false);
-                let live = Arc::new(Live { stop: tx, prog: Arc::new(Prog::default()), cancel: AtomicBool::new(false) });
+                let live = Arc::new(Live { stop: tx, prog: Arc::new(Prog::default()) });
                 live.prog.done.store(r.item.done, Ordering::Relaxed);
                 r.live = Some(live.clone());
                 r.item.state = if r.item.dir { St::Count } else { St::Run };
@@ -508,6 +593,8 @@ impl Transfers {
 
     /// Runs one item to its end, waiting out dropped connections.
     async fn drive(self: Arc<Self>, id: u64, live: Arc<Live>, stop: Stop) {
+        let mut drops = 0;
+        let mut mark = live.prog.done.load(Ordering::Relaxed);
         let res = loop {
             let Some((item, resume, keep_time)) = self.with(id, |r| (r.item.clone(), r.resume.clone())).map(|(i, r)| (i, r, self.inner().keep_time)) else {
                 break Err(Error::Stopped);
@@ -516,15 +603,29 @@ impl Transfers {
             if !matches!(res, Err(Error::Disconnected)) {
                 break res;
             }
+            // A server that lets us in and drops us at the same step again would loop forever.
+            let done = live.prog.done.load(Ordering::Relaxed);
+            drops = if done > mark { 1 } else { drops + 1 };
+            mark = done;
+            if drops >= DROPS {
+                break res;
+            }
             self.log_note(id, "соединение потеряно · жду");
             let mut back = false;
             for pause in RECONNECT {
                 let mut s = stop.clone();
                 tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_secs(pause)) => {}
+                    biased;
                     _ = io::stopped(&mut s) => break,
+                    _ = tokio::time::sleep(Duration::from_secs(pause)) => {}
                 }
-                if self.reachable(&item).await {
+                let mut s = stop.clone();
+                let up = tokio::select! {
+                    biased;
+                    _ = io::stopped(&mut s) => break,
+                    up = self.reachable(&item) => up,
+                };
+                if up {
                     back = true;
                     break;
                 }
@@ -548,8 +649,13 @@ impl Transfers {
     }
 
     async fn attempt(self: &Arc<Self>, id: u64, item: &Item, resume: &Resume, prog: &Prog, stop: &Stop, keep_time: bool) -> Result<()> {
-        let from = self.side(&item.from).await?;
-        let to = self.side(&item.to).await?;
+        // Connecting to a silent host takes a while: a pause or a cancel must not wait for it.
+        let mut s = stop.clone();
+        let (from, to) = tokio::select! {
+            biased;
+            _ = io::stopped(&mut s) => return Err(Error::Stopped),
+            sides = async { Ok::<_, Error>((self.side(&item.from).await?, self.side(&item.to).await?)) } => sides?,
+        };
         self.open_row(id, item, &from, &to);
         let run = job::Run { q: self, id, item, resume, stop, prog, keep_time };
         // Copies stop by themselves and close their handles; a long walk or a hung request gets a
@@ -564,7 +670,9 @@ impl Transfers {
             }
             futures::future::select_all(conns.iter().map(|c| Box::pin(c.lost()))).await;
         };
+        // Work that ended counts even if the connection went at the same moment.
         let res = tokio::select! {
+            biased;
             r = &mut go => r,
             _ = io::stopped(&mut s) => tokio::time::timeout(Duration::from_secs(2), &mut go).await.unwrap_or(Err(Error::Stopped)),
             // Requests in flight on a dead connection may never return.
@@ -582,10 +690,9 @@ impl Transfers {
     }
 
     async fn finish(&self, id: u64, live: &Live, res: Result<()>) {
-        let cancelled = live.cancel.load(Ordering::Relaxed);
         let done = live.prog.done.load(Ordering::Relaxed);
         let mut changed: Vec<End> = Vec::new();
-        let mut clean = None;
+        let mut sweep = false;
         {
             let mut g = self.inner();
             let rec = g.recs.iter_mut().find(|r| r.item.id == id && r.live.as_ref().is_some_and(|l| std::ptr::eq(Arc::as_ptr(l), live)));
@@ -607,8 +714,9 @@ impl Transfers {
                             }
                         }
                         Err(Error::Stopped) => {
-                            // Paused: the part stays for the resume.
-                            if r.item.state.active() && r.item.state != St::Pause {
+                            // Paused: the part stays for the resume. Resumed while stopping: `Wait`
+                            // stays and the item starts again below.
+                            if matches!(r.item.state, St::Count | St::Run) {
                                 r.item.state = St::Pause;
                             }
                         }
@@ -623,19 +731,19 @@ impl Transfers {
                         }
                     }
                 }
-                None if cancelled => {
-                    if let Some(k) = g.gone.iter().position(|r| r.item.id == id) {
-                        let r = g.gone.remove(k);
-                        clean = Some((r.item.to, r.item.tname, r.resume.parts.into_keys().collect::<Vec<_>>()));
+                // Cancelled while running: its parts go now.
+                None => {
+                    if let Some(r) = g.gone.iter_mut().find(|r| r.item.id == id) {
+                        r.live = None;
+                        sweep = true;
                     }
                 }
-                None => {}
             }
         }
         // The publisher may have gone to sleep with nothing running: the end must reach the UI and the disk.
         self.changed();
-        if let Some((to, tname, parts)) = clean {
-            self.clean(&to, &tname, parts).await;
+        if sweep {
+            self.sweep(id).await;
         }
         for e in changed {
             let _ = self.app.emit("fs://changed", Changed { src: &e.src, path: &e.path });
@@ -706,7 +814,26 @@ impl Transfers {
         self.with(id, |r| r.resume.files = n);
     }
 
-    /// Deletes the parts of a cancelled item.
+    /// Deletes the parts of an item in `gone`, then lets go of it: its target may start again.
+    async fn sweep(&self, id: u64) {
+        let parts = self.inner().gone.iter().find(|r| r.item.id == id).map(|r| (r.item.to.clone(), r.item.tname.clone(), r.resume.parts.keys().cloned().collect::<Vec<_>>()));
+        if let Some((to, tname, parts)) = parts
+            && !parts.is_empty()
+        {
+            // A server that is gone keeps its parts; the queue must not wait on it forever.
+            let _ = tokio::time::timeout(CLEAN_WAIT, self.clean(&to, &tname, parts)).await;
+        }
+        self.inner().gone.retain(|r| r.item.id != id);
+        self.settled.notify_waiters();
+        self.schedule();
+    }
+
+    fn spawn_sweep(&self, id: u64) {
+        if let Some(t) = self.me.upgrade() {
+            tauri::async_runtime::spawn(async move { t.sweep(id).await });
+        }
+    }
+
     async fn clean(&self, to: &End, tname: &str, parts: Vec<String>) {
         let Ok(side) = self.side(to).await else { return };
         let root = side.join(&to.path, tname);
@@ -750,28 +877,43 @@ impl Transfers {
 
     /* ---------- events and the disk ---------- */
 
-    /// Sends the queue at most every `TICK` while anything changes or runs, and saves it.
+    /// Sends what changed in the queue at most every `TICK`, and saves it at most every `SAVE_EVERY`.
+    /// Running items go every tick for their speed; the rest only when they change.
     async fn publisher(self: Arc<Self>) {
         let mut speeds: HashMap<u64, (u64, Instant, f64)> = HashMap::new();
+        // What the UI has of each item.
+        let mut sent: HashMap<u64, Item> = HashMap::new();
         let mut saved_at = Instant::now();
         loop {
-            let running = self.inner().recs.iter().any(|r| r.live.is_some());
+            let (running, dirty) = {
+                let g = self.inner();
+                (g.recs.iter().any(|r| r.live.is_some()), g.dirty)
+            };
             if running {
                 tokio::select! {
                     _ = self.kick.notified() => {}
                     _ = tokio::time::sleep(TICK) => {}
                 }
+            } else if dirty {
+                tokio::select! {
+                    _ = self.kick.notified() => {}
+                    _ = tokio::time::sleep_until((saved_at + SAVE_EVERY).into()) => {}
+                }
             } else {
                 self.kick.notified().await;
             }
             let now = Instant::now();
-            let (views, save) = {
+            let (diff, save) = {
                 let mut g = self.inner();
-                let mut views = Vec::with_capacity(g.recs.len());
+                let mut up = Vec::new();
                 for r in &g.recs {
+                    let live = r.live.is_some();
+                    if !live && sent.get(&r.item.id) == Some(&r.item) {
+                        continue;
+                    }
                     let item = r.now();
                     let mut speed = 0.0;
-                    if r.live.is_some() {
+                    if live {
                         let e = speeds.entry(item.id).or_insert((item.done, now, 0.0));
                         let dt = now.duration_since(e.1).as_secs_f64();
                         if dt >= 0.09 {
@@ -781,10 +923,17 @@ impl Transfers {
                         }
                         speed = e.2;
                     }
-                    views.push(serde_json::to_value(View { item: &item, speed }).unwrap_or_default());
+                    up.push(serde_json::to_value(View { item: &item, speed }).unwrap_or_default());
+                    sent.insert(item.id, item);
+                }
+                let ids: HashSet<u64> = g.recs.iter().map(|r| r.item.id).collect();
+                let del: Vec<u64> = sent.keys().filter(|id| !ids.contains(id)).copied().collect();
+                for id in &del {
+                    sent.remove(id);
                 }
                 speeds.retain(|id, _| g.recs.iter().any(|r| r.item.id == *id && r.live.is_some()));
-                let due = g.dirty || (g.recs.iter().any(|r| r.live.is_some()) && now.duration_since(saved_at) >= SAVE_EVERY);
+                let running = g.recs.iter().any(|r| r.live.is_some());
+                let due = (g.dirty || running) && now.duration_since(saved_at) >= SAVE_EVERY;
                 let save = due.then(|| {
                     g.dirty = false;
                     Disk {
@@ -797,9 +946,11 @@ impl Transfers {
                         next_batch: g.next_batch,
                     }
                 });
-                (views, save)
+                ((!up.is_empty() || !del.is_empty()).then_some(Diff { up, del }), save)
             };
-            let _ = self.app.emit("transfer://state", views);
+            if let Some(diff) = diff {
+                let _ = self.app.emit("transfer://state", diff);
+            }
             if let Some(disk) = save {
                 saved_at = now;
                 let store = self.store.clone();
@@ -810,14 +961,15 @@ impl Transfers {
     }
 }
 
-/// `name (2).ext` for a file, `name (2)` for a folder; the first number that is free.
-fn free_name(taken: &HashSet<String>, name: &str, dir: bool) -> String {
+/// `name (2).ext` for a file, `name (2)` for a folder; the first number that is free. `taken`
+/// holds names as `key` makes them.
+fn free_name(taken: &HashSet<String>, name: &str, dir: bool, key: impl Fn(&str) -> String) -> String {
     let dot = if dir { None } else { name.rfind('.').filter(|&d| d > 0) };
     let (stem, ext) = match dot {
         Some(d) => (&name[..d], &name[d..]),
         None => (name, ""),
     };
-    (2..).map(|n| format!("{stem} ({n}){ext}")).find(|c| !taken.contains(c)).unwrap_or_default()
+    (2..).map(|n| format!("{stem} ({n}){ext}")).find(|c| !taken.contains(&key(c))).unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -826,10 +978,39 @@ mod tests {
 
     #[test]
     fn free_names() {
+        let same = |n: &str| n.to_owned();
         let taken: HashSet<String> = ["a.txt", "a (2).txt", "dir.v1"].iter().map(|s| s.to_string()).collect();
-        assert_eq!(free_name(&taken, "a.txt", false), "a (3).txt");
-        assert_eq!(free_name(&taken, "dir.v1", true), "dir.v1 (2)");
-        assert_eq!(free_name(&taken, ".bashrc", false), ".bashrc (2)");
+        assert_eq!(free_name(&taken, "a.txt", false, same), "a (3).txt");
+        assert_eq!(free_name(&taken, "dir.v1", true, same), "dir.v1 (2)");
+        assert_eq!(free_name(&taken, ".bashrc", false, same), ".bashrc (2)");
+        // A Windows folder: "A (3).TXT" is taken by "a (3).txt".
+        let fold = |n: &str| n.to_lowercase();
+        let taken: HashSet<String> = ["a.txt", "a (2).txt", "a (3).txt"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(free_name(&taken, "A.TXT", false, fold), "A (4).TXT");
+    }
+
+    #[test]
+    fn windows_targets_ignore_case() {
+        let end = |src: &str, path: &str| End { src: src.into(), user: String::new(), path: path.into() };
+        let item = Item {
+            id: 1,
+            batch: 1,
+            name: "Readme.md".into(),
+            tname: "Readme.md".into(),
+            dir: false,
+            size: 1,
+            done: 0,
+            from: end("s1", "/srv"),
+            to: end("local", "C:\\X"),
+            mv: false,
+            state: St::Wait,
+            err: None,
+            denied: false,
+        };
+        assert_eq!(item.writes(&end("local", "c:\\x"), "README.md"), cfg!(windows));
+        assert!(!item.writes(&end("s1", "C:\\X"), "Readme.md"));
+        let remote = Item { to: end("s1", "/srv"), ..item };
+        assert!(!remote.writes(&end("s1", "/srv"), "README.md"));
     }
 
     #[test]
