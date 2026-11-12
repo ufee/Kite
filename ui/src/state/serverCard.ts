@@ -6,6 +6,7 @@ import { ask, closeDlg, confirmBox, dlg, dlgOf, toast } from './overlay';
 import { groupOrder, newServerId, recent, saveServers, servers, sessions, srvBy } from './servers';
 import { panes, setSource } from './panes';
 import { terms } from './terms';
+import { transfersOn } from './queue';
 import { ui } from './prefs';
 
 type Card = Record<string, any>;
@@ -156,7 +157,11 @@ async function save(d: Card) {
 export async function deleteServer(id: ServerId) {
   const s = srvBy(id);
   if (!s) return;
-  if (!(await confirmBox(tr('Удалить {c} из списка?', { c: s.code }), 'На самом сервере ничего не изменится.', 'Удалить', true))) return;
+  const n = transfersOn(id);
+  const ok = n
+    ? await confirmBox(tr('У {c} идут передачи: {n}', { c: s.code, n }), 'Сервер удалится из списка, а передачи отменятся. На самом сервере ничего не изменится.', 'Отменить передачи', true)
+    : await confirmBox(tr('Удалить {c} из списка?', { c: s.code }), 'На самом сервере ничего не изменится.', 'Удалить', true);
+  if (!ok) return;
   await dropServer(id);
   await saveServers();
   toast(tr('{c} удалён из списка', { c: s.code }), 'ok');
@@ -165,6 +170,8 @@ export async function deleteServer(id: ServerId) {
 export async function dropServer(id: ServerId) {
   const k = servers.findIndex(s => s.id === id);
   if (k < 0) return;
+  // A server out of the list takes its transfers along: nothing could resume them.
+  await backend.transferDetach(id, undefined, true).catch(() => undefined);
   await backend.sshDisconnect(id).catch(() => undefined);
   const s = servers[k];
   if (s.authPass) await backend.secretDelete(id, s.defaultUser).catch(() => undefined);

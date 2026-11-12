@@ -49,6 +49,7 @@ export type ErrCode =
   | 'ENOENT' | 'ENOTDIR' | 'EACCES' | 'EEXIST' | 'EINVAL' | 'BAD_PATH' | 'NO_EXEC'
   | 'TIMEOUT' | 'NET' | 'DROPPED' |'AUTH_KEY' | 'AUTH_PASS' | 'NO_SECRET' | 'AUTH_MULTI' | 'AUTH_METHODS' | 'HOSTKEY_REJECTED' | 'HOSTKEY_CHANGED'
   | 'KEY_FILE' | 'NO_PUBKEY' | 'KEY_CHECK' | 'PASSPHRASE' | 'KEYCHAIN' | 'SSH' | 'CANCELLED' | 'DISCONNECTED'
+  | 'SERVER_GONE' | 'BAD_NAME' | 'NAME_CLASH' | 'SOURCE_CHANGED' | 'NOT_REGULAR'
   /** The operation arrives in a later stage. */
   | 'NOT_YET';
 
@@ -134,6 +135,8 @@ export interface TransferItem {
   err: string;
   /** Lack of rights on the target: the queue offers "as root" */
   denied?: boolean;
+  /** The second of two picks that are one name on the target: a retry would land on the first */
+  twin?: boolean;
 }
 
 export interface BatchReport {
@@ -223,6 +226,8 @@ export interface Backend {
   transferClearDone(): void;
   transferSetParallel(n: number): void;
   transferKeepTime(keep: boolean): void;
+  /** Before a server (or one of its users) is disconnected or deleted: its unfinished transfers pause or go. */
+  transferDetach(server: ServerId, user: string | undefined, cancel: boolean): Promise<void>;
 
   // Editing in an external program
   editOpen(src: Src, user: string, path: string, editor: string, autosave: boolean): Promise<void>;

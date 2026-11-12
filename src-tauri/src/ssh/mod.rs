@@ -53,6 +53,32 @@ use crate::{
     store::{KeyMode, Server},
 };
 
+/// A running log row that ends as cancelled when its connect is dropped midway (a paused transfer).
+struct RunRow<'a> {
+    log: &'a Log,
+    row: Option<u64>,
+}
+
+impl<'a> RunRow<'a> {
+    fn new(log: &'a Log, row: u64) -> Self {
+        RunRow { log, row: Some(row) }
+    }
+
+    fn done(mut self, note: impl Into<crate::log::Msg>, state: State) {
+        if let Some(row) = self.row.take() {
+            self.log.done(row, note, state);
+        }
+    }
+}
+
+impl Drop for RunRow<'_> {
+    fn drop(&mut self) {
+        if let Some(row) = self.row.take() {
+            self.log.done(row, "отменено", State::Ok);
+        }
+    }
+}
+
 /// Tokio workers. SSH traffic is a chain of tasks handing buffers to each other; on 16 cores they
 /// keep migrating and uploads lose 15-25% (measured in the spike).
 pub const ASYNC_WORKERS: usize = 4;
@@ -233,6 +259,8 @@ pub struct Session {
     pub home: String,
     /// The server's code at connect time: the log's source column.
     pub code: String,
+    /// The server announced `posix-rename@openssh.com` at init.
+    pub posix_rename: bool,
     closing: AtomicBool,
 }
 
@@ -249,7 +277,7 @@ impl Session {
         }
     }
 
-    async fn close(&self) {
+    pub(crate) async fn close(&self) {
         self.closing.store(true, Ordering::Relaxed);
         let _ = self.handle.disconnect(Disconnect::ByApplication, "", "en").await;
     }
@@ -258,6 +286,7 @@ impl Session {
 /* ---------- Manager ---------- */
 
 type Pair = (String, String);
+type OnLive = Box<dyn Fn(&str) + Send + Sync>;
 
 enum Slot {
     Pending { epoch: u64, fut: Shared<BoxFuture<'static, Result<Arc<Session>>>> },
@@ -274,6 +303,9 @@ pub struct Ssh {
     known_lock: tokio::sync::Mutex<()>,
     slots: Mutex<HashMap<Pair, Slot>>,
     reconnecting: Mutex<HashSet<Pair>>,
+    /// Told the server id whenever a session goes live, by hand or by a reconnect: the transfer
+    /// queue resumes what a disconnect paused.
+    on_live: std::sync::OnceLock<OnLive>,
     epoch: AtomicU64,
 }
 
@@ -289,6 +321,7 @@ impl Ssh {
             known_lock: tokio::sync::Mutex::new(()),
             slots: Mutex::new(HashMap::new()),
             reconnecting: Mutex::new(HashSet::new()),
+            on_live: std::sync::OnceLock::new(),
             epoch: AtomicU64::new(0),
         })
     }
@@ -366,7 +399,7 @@ impl Ssh {
             shake.set_seen(HostSeen::Unverified(fp));
             return true;
         }
-        let row = self.log.run(src, "KEY", format!("{algo} {fp}"));
+        let row = RunRow::new(&self.log, self.log.run(src, "KEY", format!("{algo} {fp}")));
         // The question does not hold a handshake slot: other servers keep connecting meanwhile.
         shake.permit.lock().await.take();
         shake.asked.store(true, Ordering::Relaxed);
@@ -387,7 +420,7 @@ impl Ssh {
             *shake.permit.lock().await = Some(p);
         }
         if !trust {
-            self.log.done(row, if mode == "changed" { "ключ хоста изменился" } else { "не подтверждён" }, State::Err);
+            row.done(if mode == "changed" { "ключ хоста изменился" } else { "не подтверждён" }, State::Err);
             shake.set_seen(HostSeen::Rejected);
             return false;
         }
@@ -396,9 +429,9 @@ impl Ssh {
         let changed = mode == "changed";
         let saved = tokio::task::spawn_blocking(move || if changed { kh.replace(&host, port, &k) } else { kh.add(&host, port, &k) }).await;
         match saved {
-            Ok(Ok(())) => self.log.done(row, "сохранён в known_hosts", State::Ok),
-            Ok(Err(e)) => self.log.done(row, msg!("не записан в known_hosts: {e}", e = e), State::Err),
-            Err(e) => self.log.done(row, e.to_string(), State::Err),
+            Ok(Ok(())) => row.done("сохранён в known_hosts", State::Ok),
+            Ok(Err(e)) => row.done(msg!("не записан в known_hosts: {e}", e = e), State::Err),
+            Err(e) => row.done(e.to_string(), State::Err),
         }
         shake.set_seen(HostSeen::Trusted);
         true
@@ -428,21 +461,21 @@ impl Ssh {
         let permit = self.handshakes.clone().acquire_owned().await.map_err(|e| (Error::ssh(e), false))?;
         let addr = t.addr();
         let src = t.code.as_str();
-        let row = self.log.run(src, "TCP", msg!("Подключение к {addr}", addr = addr));
+        let row = RunRow { log: &self.log, row: Some(self.log.run(src, "TCP", msg!("Подключение к {addr}", addr = addr))) };
         let started = Instant::now();
         let stream = match tokio::time::timeout(TCP_TIMEOUT, TcpStream::connect((t.host.as_str(), t.port))).await {
             Err(_) => {
-                self.log.done(row, "нет ответа за 10 с", State::Err);
+                row.done("нет ответа за 10 с", State::Err);
                 return Err((Error::Timeout { addr }, false));
             }
             Ok(Err(e)) => {
-                self.log.done(row, e.to_string(), State::Err);
+                row.done(e.to_string(), State::Err);
                 return Err((Error::Net { addr, reason: e.to_string() }, false));
             }
             Ok(Ok(s)) => s,
         };
         let _ = stream.set_nodelay(true);
-        self.log.done(row, msg!("соединение установлено · {ms} мс", ms = started.elapsed().as_millis()), State::Ok);
+        row.done(msg!("соединение установлено · {ms} мс", ms = started.elapsed().as_millis()), State::Ok);
 
         let known = known_hosts::host_keys(&self.known_text().await, &t.host, t.port);
         let config = Arc::new(client::Config {
@@ -520,7 +553,7 @@ impl Ssh {
 
     async fn open_session(self: &Arc<Self>, t: &Target, method: &Method, mode: HostMode) -> Result<(Arc<Session>, watch::Receiver<bool>)> {
         let Shaken { handle, dropped, .. } = self.handshake(t, method, mode).await?;
-        let (sftp, version, home) = match sftp::open(&handle).await {
+        let (sftp, version, home, posix_rename) = match sftp::open(&handle).await {
             Ok(v) => v,
             Err(e) => {
                 self.log.err(&t.code, "SFTP", "Подсистема SFTP не запустилась", e.to_string());
@@ -529,7 +562,7 @@ impl Ssh {
             }
         };
         self.log.ok(&t.code, "SFTP", msg!("Подсистема запущена, протокол v{v}", v = version));
-        Ok((Arc::new(Session { handle, sftp, home, code: t.code.clone(), closing: AtomicBool::new(false) }), dropped))
+        Ok((Arc::new(Session { handle, sftp, home, code: t.code.clone(), posix_rename, closing: AtomicBool::new(false) }), dropped))
     }
 
     /* ----- saved servers ----- */
@@ -555,11 +588,30 @@ impl Ssh {
         Ok(Method::Keys(key_source(server, user)))
     }
 
+    /// A second connection of the pair for transfers, so a big file does not slow the terminal echo.
+    /// Same login and host key check; no sidebar status and no reconnect of its own: the queue retries.
+    pub async fn open_xfer(self: &Arc<Self>, server: &str, user: &str) -> Result<(Arc<Session>, watch::Receiver<bool>)> {
+        let saved = self.saved(server).await.ok_or(Error::ServerGone)?;
+        let t = Self::target(&saved, user);
+        let method = Self::method_for(&saved, user).await?;
+        self.open_session(&t, &method, HostMode::Ask).await
+    }
+
     pub fn session_live(&self, server: &str, user: &str) -> Result<Arc<Session>> {
         match self.slots().get(&(server.to_owned(), user.to_owned())) {
             Some(Slot::Live { session, .. }) if !session.is_closed() => Ok(session.clone()),
             _ => Err(Error::Disconnected),
         }
+    }
+
+    /// Sets the one listener for sessions going live.
+    pub fn on_live(&self, f: impl Fn(&str) + Send + Sync + 'static) {
+        let _ = self.on_live.set(Box::new(f));
+    }
+
+    /// The server is connected, under any user.
+    pub fn has_session(&self, server: &str) -> bool {
+        self.slots().iter().any(|((s, _), slot)| s == server && matches!(slot, Slot::Live { session, .. } if !session.is_closed()))
     }
 
     /// The session of the pair, connecting if needed. Callers that come while it connects share the result.
@@ -615,6 +667,9 @@ impl Ssh {
             Ok((session, dropped)) if ours => {
                 self.status(&pair.0, &pair.1, Some(SessionState::Live));
                 self.watch_drop(server, user, epoch, session.clone(), dropped);
+                if let Some(f) = self.on_live.get() {
+                    f(&pair.0);
+                }
                 Ok(session)
             }
             Ok((session, _)) => {

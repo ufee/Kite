@@ -59,6 +59,15 @@ impl Store {
         self.write_json(&self.dir.join(doc.file()), data)
     }
 
+    /// The transfer queue: the core owns it, so it survives a UI reload and a crash of the window.
+    pub fn load_transfers<T: DeserializeOwned>(&self) -> Option<T> {
+        self.read_json(&self.dir.join("transfers.json"))
+    }
+
+    pub fn save_transfers<T: Serialize>(&self, data: &T) -> std::io::Result<()> {
+        self.write_json(&self.dir.join("transfers.json"), data)
+    }
+
     pub fn load_servers(&self) -> Option<ServerConfig> {
         self.read_json(&self.dir.join("servers.json"))
     }

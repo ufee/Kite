@@ -38,8 +38,9 @@ pub fn fs_error(e: SftpError, path: &str) -> Error {
     }
 }
 
-/// Opens the subsystem; returns the session, its protocol version and the home folder.
-pub async fn open(handle: &Handle<Client>) -> Result<(RawSftpSession, u32, String)> {
+/// Opens the subsystem; returns the session, its protocol version, the home folder and whether the
+/// server announced `posix-rename@openssh.com`.
+pub async fn open(handle: &Handle<Client>) -> Result<(RawSftpSession, u32, String, bool)> {
     let channel = handle.channel_open_session().await?;
     channel.request_subsystem(true, "sftp").await?;
     let raw = RawSftpSession::new_with_config(
@@ -57,7 +58,8 @@ pub async fn open(handle: &Handle<Client>) -> Result<(RawSftpSession, u32, Strin
         .next()
         .map(|f| f.filename)
         .unwrap_or_else(|| "/".into());
-    Ok((raw, version.version, home))
+    let posix_rename = version.extensions.contains_key("posix-rename@openssh.com");
+    Ok((raw, version.version, home, posix_rename))
 }
 
 fn join(dir: &str, name: &str) -> String {

@@ -87,7 +87,8 @@ function sessionFile(): SessionFile {
     open: { queue: ui.queueOpen, log: ui.logOpen, logOnlyErr: ui.logOnlyErr },
     terms: termsSnapshot(),
     term: ui.term,
-    queue: queue.value.filter(q => q.state !== 'done'),
+    // The core keeps its queue in transfers.json; only the mock's lives here.
+    queue: backend.kind === 'mock' ? queue.value.filter(q => q.state !== 'done') : [],
     log: log.slice(-LOG_KEEP).map(r => ({ ...r })),
   };
 }

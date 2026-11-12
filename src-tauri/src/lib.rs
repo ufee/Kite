@@ -12,6 +12,7 @@ mod secrets;
 mod ssh;
 mod store;
 mod term;
+mod transfer;
 mod webview;
 
 use std::sync::Arc;
@@ -51,8 +52,11 @@ pub fn run() {
             app.manage(Arc::new(store::Store::new(dir)?));
             let log = Arc::new(log::Log::new(Some(app.handle().clone())));
             app.manage(log.clone());
-            app.manage(ssh::Ssh::new(app.handle().clone(), log));
+            let ssh = ssh::Ssh::new(app.handle().clone(), log.clone());
+            app.manage(ssh.clone());
             app.manage(Arc::new(term::Terms::default()));
+            let store = app.state::<Arc<store::Store>>().inner().clone();
+            app.manage(transfer::Transfers::new(app.handle().clone(), ssh, log, store));
             if let Some(w) = app.get_webview_window("main") {
                 webview::harden(&w);
             }
@@ -99,7 +103,27 @@ pub fn run() {
             ipc::term::pty_resize,
             ipc::term::pty_pause,
             ipc::term::pty_close,
+            ipc::transfer::transfer_enqueue,
+            ipc::transfer::transfer_list,
+            ipc::transfer::transfer_resync,
+            ipc::transfer::transfer_pause,
+            ipc::transfer::transfer_resume,
+            ipc::transfer::transfer_cancel,
+            ipc::transfer::transfer_pause_all,
+            ipc::transfer::transfer_retry,
+            ipc::transfer::transfer_clear_done,
+            ipc::transfer::transfer_set_parallel,
+            ipc::transfer::transfer_keep_time,
+            ipc::transfer::transfer_detach,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Kite");
+        .build(tauri::generate_context!())
+        .expect("error while building Kite")
+        .run(|app, event| {
+            // The queue is saved at most every 2 s: what changed since must not be lost on closing.
+            if let tauri::RunEvent::Exit = event
+                && let Some(q) = app.try_state::<Arc<transfer::Transfers>>()
+            {
+                q.save_now();
+            }
+        });
 }

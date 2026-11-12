@@ -1,9 +1,9 @@
 /* Transfer queue: the core runs it, the UI mirrors its state and reports batches. */
 import { computed, shallowRef } from 'vue';
-import { backend, isBackendError, type ConflictPolicy, type Endpoint, type Entry, type TransferItem } from '../backend';
+import { backend, isBackendError, type ConflictPolicy, type Endpoint, type Entry, type ServerId, type TransferItem } from '../backend';
 import { tr } from '../i18n';
 import { objs } from '../util/format';
-import { childOf, isLocal, within } from '../util/paths';
+import { childOf, isLocal, LOCAL_WIN, within } from '../util/paths';
 import { settings, ui } from './prefs';
 import { ask, toast } from './overlay';
 import { label } from './servers';
@@ -14,6 +14,9 @@ export const queue = shallowRef<TransferItem[]>([]);
 const ACTIVE = ['run', 'count', 'wait', 'pause'];
 export const active = computed(() => queue.value.filter(q => ACTIVE.includes(q.state)));
 export const qErr = computed(() => queue.value.filter(q => q.state === 'err'));
+/** Unfinished transfers with a server on either end; `running` leaves out the paused ones. */
+export const transfersOn = (id: ServerId, running = false) =>
+  active.value.filter(q => (q.from.src === id || q.to.src === id) && !(running && q.state === 'pause')).length;
 export const qStat = computed(() => {
   const a = active.value;
   if (!a.length) return null;
@@ -35,16 +38,21 @@ export async function transfer(from: Endpoint, entries: Entry[], to: Endpoint, m
     if (within(from.src, childOf(from.src, from.path, e.name), to.path)) { toast(tr('Нельзя поместить {n} в саму себя', { n: e.name }), 'bad'); return; }
   }
   let policy: ConflictPolicy | 'ask' = settings.conflict;
+  // Windows folders ignore case: `Readme.md` lands on `README.md`.
+  const fold = LOCAL_WIN && isLocal(to.src);
+  const same = (a: string, b: string) => (fold ? a.toLowerCase() === b.toLowerCase() : a === b);
   try {
     const target = await backend.fsList(to.src as string, to.user, to.path);
-    const clash = entries.filter(e => target.some(t => t.name === e.name));
+    const clash = entries.filter(e => target.some(t => same(t.name, e.name)));
     if (clash.length && policy === 'ask') {
       const r = await ask<ConflictPolicy>('conflict', { names: clash.map(e => e.name), where: `${label(to.src as string)} · ${to.path}`, total: entries.length, remember: false });
       if (!r) return;
       policy = r;
     }
     const batch = await backend.transferEnqueue(from, entries, to, move, policy === 'ask' ? 'replace' : policy);
-    if (!batch) toast('Всё уже на месте', 'info');
+    // The core skips a target that an unfinished item already writes.
+    const queued = entries.some(e => active.value.some(q => q.to.src === to.src && same(q.to.path, to.path) && same(q.tname, e.name)));
+    if (!batch) toast(queued ? 'Уже в очереди' : 'Всё уже на месте', 'info');
   } catch (e) {
     toast(isBackendError(e) ? e.title : String(e), 'bad');
   }

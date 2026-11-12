@@ -6,12 +6,13 @@
 import { Channel, invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { tr, trn } from '../i18n';
+import { fmtSize } from '../util/format';
 import { isLocal, LOCAL_WIN } from '../util/paths';
 import { MockBackend } from './mock';
 import type { Store } from './store';
 import type {
-  AgentStatus, BackendError, Entry, ErrCode, HostKeyRequest, LogRow, PassphraseRequest,
-  PtyExit, Server, ServerConfig, ServerDraft, ServerId, SessionState, Src, TestResult, TextFile,
+  AgentStatus, BackendError, BatchReport, ConflictPolicy, Endpoint, Entry, ErrCode, HostKeyRequest, LogRow, PassphraseRequest,
+  PtyExit, Server, ServerConfig, ServerDraft, ServerId, SessionState, Src, TestResult, TextFile, TransferItem,
 } from './types';
 
 /** Error as the core sends it: the code and its facts, no words. */
@@ -25,6 +26,8 @@ interface TestReport { login: boolean; password: boolean; ms: number; unverified
 function msg(m: CoreMsg) {
   if (!m.text) return '';
   const vars = m.vars ? Object.fromEntries(m.vars) : undefined;
+  // Sizes cross as bytes: the words for them are the UI's.
+  if (vars?.size != null) vars.size = fmtSize(Number(vars.size));
   return vars?.n != null && m.text.includes('|') ? trn(Number(vars.n), m.text) : tr(m.text, vars);
 }
 const stamp = (ms: number) => {
@@ -60,6 +63,11 @@ function words(e: CoreError): [string, string] {
     case 'BAD_PATH': return [tr(LOCAL_WIN ? 'Нужен путь вида D:\\папка' : 'Путь начинается с / или ~'), ''];
     case 'NO_EXEC': return [tr('Владелец не изменён'), tr('Сервер не выполняет команды: только SFTP.')];
     case 'EINVAL': return [tr('Операция не выполнена'), e.reason];
+    case 'SERVER_GONE': return [tr('Сервер удалён из списка'), ''];
+    case 'BAD_NAME': return [tr('Имя не подходит для Windows: {p}', { p: e.path }), tr('Файл пропущен.')];
+    case 'NAME_CLASH': return [tr('Имя отличается от соседнего только регистром: {p}', { p: e.path }), tr('В Windows это один файл, второй пропущен.')];
+    case 'SOURCE_CHANGED': return [tr('Файл изменился во время передачи: {p}', { p: e.path }), tr('Источник оставлен на месте.')];
+    case 'NOT_REGULAR': return [tr('Не обычный файл: {p}', { p: e.path }), tr('Каналы, сокеты и устройства не передаются.')];
     default: return [tr('Ошибка SSH'), e.reason ?? ''];
   }
 }
@@ -82,8 +90,18 @@ const where = (src: Src, user: string) => (isLocal(src) ? 'local' : { server: sr
 
 const notYet = (stage: number): BackendError => ({ code: 'NOT_YET', title: tr('Будет на этапе {n}', { n: stage }), text: '' });
 
+/** A queue item as the core sends it: the error is a code with facts. */
+type CoreItem = Omit<TransferItem, 'err'> & { err: CoreError | null };
+const item = (i: CoreItem): TransferItem => {
+  const [title, text] = i.err ? words(i.err) : ['', ''];
+  const twin = i.err?.code === 'NAME_CLASH' && i.err.path === i.name;
+  return { ...i, err: text ? `${title}. ${text}` : title, twin };
+};
+
 export class TauriBackend extends MockBackend {
   override readonly kind = 'tauri';
+  /** The queue as the core last sent it, in its order. */
+  private mirror = new Map<number, TransferItem>();
 
   constructor(store: Store) {
     super(store);
@@ -95,6 +113,16 @@ export class TauriBackend extends MockBackend {
     void invoke('prompts_reset').catch(() => undefined);
     void listen<CoreRow>('log://row', e => this.emit('log', row(e.payload)));
     void listen<CoreRow>('log://update', e => this.emit('logUpdate', row(e.payload)));
+    // The core sends the items that changed; the mirror keeps the order of the queue.
+    void listen<{ up: CoreItem[]; del: number[]; reset: boolean }>('transfer://state', e => {
+      // A reset is the whole list: rows deleted while the snapshot was on its way go too.
+      if (e.payload.reset) this.mirror.clear();
+      for (const id of e.payload.del) this.mirror.delete(id);
+      for (const i of e.payload.up) this.mirror.set(i.id, item(i));
+      this.emit('transfer', [...this.mirror.values()]);
+    });
+    void listen<BatchReport>('transfer://batch', e => this.emit('batch', e.payload));
+    void listen<{ src: Src; path: string }>('fs://changed', e => this.emit('fs', e.payload.src, e.payload.path));
   }
 
   /** Real servers only: the demo list belongs to the mock. */
@@ -164,9 +192,36 @@ export class TauriBackend extends MockBackend {
   override fsReadText(src: Src, user: string, path: string) { return call<TextFile>('fs_read_text', { src: where(src, user), path }); }
   override fsDrives() { return call<string[]>('fs_drives'); }
 
-  // The mock's editor and queue work on its own files, not on the real ones the panes now show.
+  // The mock's editor works on its own files, not on the real ones the panes now show.
   override async editOpen() { throw notYet(7); }
-  override async transferEnqueue(): Promise<number> { throw notYet(6); }
+
+  /* ---------- Transfers: the core owns the queue and keeps it on disk ---------- */
+  override transferEnqueue(from: Endpoint, entries: Entry[], to: Endpoint, move: boolean, policy: ConflictPolicy) {
+    // Files dropped from Explorer arrive with stage 7.
+    if (from.src === 'ext') return Promise.reject(notYet(7));
+    const picks = entries.map(e => ({ name: e.name, dir: e.dir, size: e.size }));
+    return call<number>('transfer_enqueue', { from, picks, to, mv: move, policy });
+  }
+  override async transferList() {
+    const list = (await call<CoreItem[]>('transfer_list')).map(item);
+    this.mirror = new Map(list.map(i => [i.id, i]));
+    // An update that crossed the reply was just overwritten: the core sends the whole list again.
+    void invoke('transfer_resync');
+    return list;
+  }
+  override transferPause(id: number) { void invoke('transfer_pause', { id }); }
+  override transferResume(id: number) { void invoke('transfer_resume', { id }); }
+  override transferCancel(id: number) { void invoke('transfer_cancel', { id }); }
+  override transferPauseAll(pause: boolean) { void invoke('transfer_pause_all', { pause }); }
+  override transferRetry(id: number, asRoot = false) { void invoke('transfer_retry', { id, asRoot }); }
+  override transferClearDone() { void invoke('transfer_clear_done'); }
+  override transferSetParallel(n: number) { void invoke('transfer_set_parallel', { n }); }
+  override transferKeepTime(keep: boolean) { void invoke('transfer_keep_time', { keep }); }
+  override transferDetach(server: ServerId, user: string | undefined, cancel: boolean) {
+    return call<void>('transfer_detach', { server, user: user ?? null, cancel });
+  }
+  /** The core loads its own queue at start. */
+  override transferRestore() {}
 
   /* ---------- Terminal ---------- */
   override async ptyOpen(src: Src, user: string, cwd: string, shell: string, cols: number, rows: number,
