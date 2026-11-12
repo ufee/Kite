@@ -105,6 +105,7 @@ pub fn run() {
             ipc::term::pty_close,
             ipc::transfer::transfer_enqueue,
             ipc::transfer::transfer_list,
+            ipc::transfer::transfer_resync,
             ipc::transfer::transfer_pause,
             ipc::transfer::transfer_resume,
             ipc::transfer::transfer_cancel,
@@ -115,6 +116,14 @@ pub fn run() {
             ipc::transfer::transfer_keep_time,
             ipc::transfer::transfer_detach,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Kite");
+        .build(tauri::generate_context!())
+        .expect("error while building Kite")
+        .run(|app, event| {
+            // The queue is saved at most every 2 s: what changed since must not be lost on closing.
+            if let tauri::RunEvent::Exit = event
+                && let Some(q) = app.try_state::<Arc<transfer::Transfers>>()
+            {
+                q.save_now();
+            }
+        });
 }

@@ -14,10 +14,10 @@ mod io;
 mod job;
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::{
         Arc, Mutex, Weak,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -145,6 +145,9 @@ pub struct Resume {
     pub files: usize,
     #[serde(default)]
     pub parts: BTreeMap<String, (u64, u64)>,
+    /// Folders of the item this transfer made (`""` is its root): only they get the source's mode.
+    #[serde(default)]
+    pub made: BTreeSet<String>,
 }
 
 #[derive(Default)]
@@ -256,6 +259,8 @@ pub struct Transfers {
     kick: Notify,
     /// An item left `gone`.
     settled: Notify,
+    /// The UI took a fresh list: the next event carries every item.
+    resend: AtomicBool,
 }
 
 impl Transfers {
@@ -287,6 +292,13 @@ impl Transfers {
             inner: Mutex::new(Inner { recs, next_id, next_batch, parallel: 3, keep_time: true, reported, gone: Vec::new(), dirty: false }),
             kick: Notify::new(),
             settled: Notify::new(),
+            resend: AtomicBool::new(false),
+        });
+        let w = Arc::downgrade(&me);
+        me.ssh.on_live(move |server| {
+            if let Some(t) = w.upgrade() {
+                t.attach(server);
+            }
         });
         let t = me.clone();
         tauri::async_runtime::spawn(async move { t.publisher().await });
@@ -315,6 +327,24 @@ impl Transfers {
         g.recs.iter().map(|r| serde_json::to_value(View { item: &r.now(), speed: 0.0 }).unwrap_or_default()).collect()
     }
 
+    /// The UI has put its list in place: an event that crossed the reply may have been lost under
+    /// it, so everything goes again.
+    pub fn resync(&self) {
+        self.resend.store(true, Ordering::Relaxed);
+        self.kick.notify_one();
+    }
+
+    /// The queue to disk now: the app is closing and the publisher's next save would not come.
+    pub fn save_now(&self) {
+        let disk = self.disk(&mut self.inner());
+        let _ = self.store.save_transfers(&disk);
+    }
+
+    fn disk(&self, g: &mut Inner) -> Disk {
+        g.dirty = false;
+        Disk { items: g.recs.iter().map(|r| Saved { item: r.now(), resume: r.resume.clone() }).collect(), next_id: g.next_id, next_batch: g.next_batch }
+    }
+
     pub async fn enqueue(&self, from: End, picks: Vec<Pick>, to: End, mv: bool, policy: Policy) -> Result<u64> {
         if from.src == "ext" {
             return Err(Error::Einval { reason: "drag and drop from Explorer comes in stage 7".into() });
@@ -337,15 +367,24 @@ impl Transfers {
         let mut added = 0;
         for p in picks {
             let mut tname = p.name.clone();
-            if names.contains(&to.key(&p.name)) {
+            let key = to.key(&p.name);
+            let mut clash = None;
+            if names.contains(&key) {
                 match policy {
                     Policy::Skip => continue,
                     Policy::Both => tname = free_name(&taken, &p.name, p.dir, |n| to.key(n)),
                     Policy::Replace => {}
                 }
+            } else if taken.contains(&key) {
+                // Two picks that are one name here (Windows ignores case): "keep both" numbers the
+                // second, otherwise it fails rather than land on the first.
+                match policy {
+                    Policy::Both => tname = free_name(&taken, &p.name, p.dir, |n| to.key(n)),
+                    _ => clash = serde_json::to_value(Error::NameClash { path: p.name.clone() }).ok(),
+                }
             }
             // The same target twice at once would write one part from two sides.
-            if g.recs.iter().any(|r| r.item.state.active() && r.item.writes(&to, &tname)) {
+            if clash.is_none() && g.recs.iter().any(|r| r.item.state.active() && r.item.writes(&to, &tname)) {
                 continue;
             }
             taken.insert(to.key(&tname));
@@ -360,8 +399,8 @@ impl Transfers {
                 from: from.clone(),
                 to: to.clone(),
                 mv,
-                state: St::Wait,
-                err: None,
+                state: if clash.is_some() { St::Err } else { St::Wait },
+                err: clash,
                 denied: false,
                 name: p.name,
             };
@@ -375,6 +414,8 @@ impl Transfers {
         drop(g);
         self.changed();
         self.schedule();
+        // A batch of clashes only has ended already.
+        self.report();
         Ok(batch)
     }
 
@@ -562,6 +603,8 @@ impl Transfers {
             let mut g = self.inner();
             let Inner { recs, gone, parallel, .. } = &mut *g;
             let mut running = recs.iter().filter(|r| r.live.is_some()).count();
+            // Targets being written: a retried clash or a resumed twin waits for its turn.
+            let mut busy: Vec<(End, String)> = recs.iter().filter(|r| r.live.is_some()).map(|r| (r.item.to.clone(), r.item.tname.clone())).collect();
             let mut out = Vec::new();
             for r in recs.iter_mut() {
                 if running >= *parallel {
@@ -571,9 +614,10 @@ impl Transfers {
                     continue;
                 }
                 // A cancelled item still writes this target or its parts are being deleted.
-                if gone.iter().any(|x| x.item.writes(&r.item.to, &r.item.tname)) {
+                if gone.iter().any(|x| x.item.writes(&r.item.to, &r.item.tname)) || busy.iter().any(|(to, t)| r.item.writes(to, t)) {
                     continue;
                 }
+                busy.push((r.item.to.clone(), r.item.tname.clone()));
                 let (tx, rx) = watch::channel(false);
                 let live = Arc::new(Live { stop: tx, prog: Arc::new(Prog::default()) });
                 live.prog.done.store(r.item.done, Ordering::Relaxed);
@@ -789,9 +833,10 @@ impl Transfers {
         self.kick.notify_one();
     }
 
+    /// Count → Run from the job. A pause or a resume meanwhile (Pause, Wait) is the user's and stays.
     fn set_state(&self, id: u64, st: St) {
         self.with(id, |r| {
-            if r.item.state.active() && r.item.state != St::Pause {
+            if matches!(r.item.state, St::Count | St::Run) {
                 r.item.state = st;
             }
         });
@@ -807,6 +852,12 @@ impl Transfers {
     fn part_done(&self, id: u64, rel: &str) {
         self.with(id, |r| {
             r.resume.parts.remove(rel);
+        });
+    }
+
+    fn dir_made(&self, id: u64, rel: &str) {
+        self.with(id, |r| {
+            r.resume.made.insert(rel.to_owned());
         });
     }
 
@@ -838,7 +889,9 @@ impl Transfers {
         let Ok(side) = self.side(to).await else { return };
         let root = side.join(&to.path, tname);
         for rel in parts {
-            let _ = side.remove(&side.part_of(&side.join(&root, &rel))).await;
+            let target = side.join(&root, &rel);
+            let _ = side.remove(&side.part_of(&target)).await;
+            side.restore_old(&target).await;
         }
     }
 
@@ -903,6 +956,9 @@ impl Transfers {
                 self.kick.notified().await;
             }
             let now = Instant::now();
+            if self.resend.swap(false, Ordering::Relaxed) {
+                sent.clear();
+            }
             let (diff, save) = {
                 let mut g = self.inner();
                 let mut up = Vec::new();
@@ -934,18 +990,7 @@ impl Transfers {
                 speeds.retain(|id, _| g.recs.iter().any(|r| r.item.id == *id && r.live.is_some()));
                 let running = g.recs.iter().any(|r| r.live.is_some());
                 let due = (g.dirty || running) && now.duration_since(saved_at) >= SAVE_EVERY;
-                let save = due.then(|| {
-                    g.dirty = false;
-                    Disk {
-                        items: g
-                            .recs
-                            .iter()
-                            .map(|r| Saved { item: r.now(), resume: r.resume.clone() })
-                            .collect(),
-                        next_id: g.next_id,
-                        next_batch: g.next_batch,
-                    }
-                });
+                let save = due.then(|| self.disk(&mut g));
                 ((!up.is_empty() || !del.is_empty()).then_some(Diff { up, del }), save)
             };
             if let Some(diff) = diff {

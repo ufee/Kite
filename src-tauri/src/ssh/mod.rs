@@ -53,6 +53,28 @@ use crate::{
     store::{KeyMode, Server},
 };
 
+/// A running log row that ends as cancelled when its connect is dropped midway (a paused transfer).
+struct RunRow<'a> {
+    log: &'a Log,
+    row: Option<u64>,
+}
+
+impl RunRow<'_> {
+    fn done(mut self, note: impl Into<crate::log::Msg>, state: State) {
+        if let Some(row) = self.row.take() {
+            self.log.done(row, note, state);
+        }
+    }
+}
+
+impl Drop for RunRow<'_> {
+    fn drop(&mut self) {
+        if let Some(row) = self.row.take() {
+            self.log.done(row, "отменено", State::Ok);
+        }
+    }
+}
+
 /// Tokio workers. SSH traffic is a chain of tasks handing buffers to each other; on 16 cores they
 /// keep migrating and uploads lose 15-25% (measured in the spike).
 pub const ASYNC_WORKERS: usize = 4;
@@ -260,6 +282,7 @@ impl Session {
 /* ---------- Manager ---------- */
 
 type Pair = (String, String);
+type OnLive = Box<dyn Fn(&str) + Send + Sync>;
 
 enum Slot {
     Pending { epoch: u64, fut: Shared<BoxFuture<'static, Result<Arc<Session>>>> },
@@ -276,6 +299,9 @@ pub struct Ssh {
     known_lock: tokio::sync::Mutex<()>,
     slots: Mutex<HashMap<Pair, Slot>>,
     reconnecting: Mutex<HashSet<Pair>>,
+    /// Told the server id whenever a session goes live, by hand or by a reconnect: the transfer
+    /// queue resumes what a disconnect paused.
+    on_live: std::sync::OnceLock<OnLive>,
     epoch: AtomicU64,
 }
 
@@ -291,6 +317,7 @@ impl Ssh {
             known_lock: tokio::sync::Mutex::new(()),
             slots: Mutex::new(HashMap::new()),
             reconnecting: Mutex::new(HashSet::new()),
+            on_live: std::sync::OnceLock::new(),
             epoch: AtomicU64::new(0),
         })
     }
@@ -430,21 +457,21 @@ impl Ssh {
         let permit = self.handshakes.clone().acquire_owned().await.map_err(|e| (Error::ssh(e), false))?;
         let addr = t.addr();
         let src = t.code.as_str();
-        let row = self.log.run(src, "TCP", msg!("Подключение к {addr}", addr = addr));
+        let row = RunRow { log: &self.log, row: Some(self.log.run(src, "TCP", msg!("Подключение к {addr}", addr = addr))) };
         let started = Instant::now();
         let stream = match tokio::time::timeout(TCP_TIMEOUT, TcpStream::connect((t.host.as_str(), t.port))).await {
             Err(_) => {
-                self.log.done(row, "нет ответа за 10 с", State::Err);
+                row.done("нет ответа за 10 с", State::Err);
                 return Err((Error::Timeout { addr }, false));
             }
             Ok(Err(e)) => {
-                self.log.done(row, e.to_string(), State::Err);
+                row.done(e.to_string(), State::Err);
                 return Err((Error::Net { addr, reason: e.to_string() }, false));
             }
             Ok(Ok(s)) => s,
         };
         let _ = stream.set_nodelay(true);
-        self.log.done(row, msg!("соединение установлено · {ms} мс", ms = started.elapsed().as_millis()), State::Ok);
+        row.done(msg!("соединение установлено · {ms} мс", ms = started.elapsed().as_millis()), State::Ok);
 
         let known = known_hosts::host_keys(&self.known_text().await, &t.host, t.port);
         let config = Arc::new(client::Config {
@@ -573,6 +600,11 @@ impl Ssh {
         }
     }
 
+    /// Sets the one listener for sessions going live.
+    pub fn on_live(&self, f: impl Fn(&str) + Send + Sync + 'static) {
+        let _ = self.on_live.set(Box::new(f));
+    }
+
     /// The server is connected, under any user.
     pub fn has_session(&self, server: &str) -> bool {
         self.slots().iter().any(|((s, _), slot)| s == server && matches!(slot, Slot::Live { session, .. } if !session.is_closed()))
@@ -631,6 +663,9 @@ impl Ssh {
             Ok((session, dropped)) if ours => {
                 self.status(&pair.0, &pair.1, Some(SessionState::Live));
                 self.watch_drop(server, user, epoch, session.clone(), dropped);
+                if let Some(f) = self.on_live.get() {
+                    f(&pair.0);
+                }
                 Ok(session)
             }
             Ok((session, _)) => {

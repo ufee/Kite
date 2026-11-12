@@ -22,6 +22,12 @@ pub fn transfer_list(q: Queue<'_>) -> Vec<Value> {
     q.list()
 }
 
+/// The UI has put the list in place; the next `transfer://state` carries every item.
+#[tauri::command]
+pub fn transfer_resync(q: Queue<'_>) {
+    q.resync();
+}
+
 #[tauri::command]
 pub fn transfer_pause(q: Queue<'_>, id: u64) {
     q.pause(id);

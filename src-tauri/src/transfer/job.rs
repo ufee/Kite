@@ -118,8 +118,7 @@ impl Run<'_> {
         }
         self.q.part_started(self.id, rel, meta.size, meta.mtime);
         self.done().fetch_add(offset, Ordering::Relaxed);
-        let relay = !from.is_local() && !to.is_local();
-        let finish = Finish { mtime: self.keep_time.then_some(meta.mtime), mode: relay.then_some(meta.mode & 0o777) };
+        let finish = Finish { mtime: self.keep_time.then_some(meta.mtime) };
         if offset == 0 && io::fetch_small(from, src, to, &part, dst, meta.size, finish.mtime, self.done()).await? {
             self.q.part_done(self.id, rel);
             return Ok(());
@@ -127,6 +126,14 @@ impl Run<'_> {
         io::copy(from, src, to, &part, offset, meta.size, finish, self.done(), self.stop).await?;
         to.rename_over(&part, dst).await?;
         self.q.part_done(self.id, rel);
+        // Server to server the mode goes along, exact past the umask. A refusal costs only the mode.
+        if !from.is_local() && !to.is_local() {
+            match to.chmod(dst, meta.mode & 0o777).await {
+                Ok(()) => {}
+                Err(e @ Error::Disconnected) => return Err(e),
+                Err(e) => self.q.log_path(to, dst, e.to_string(), Row::Err),
+            }
+        }
         Ok(())
     }
 
@@ -212,8 +219,12 @@ impl Run<'_> {
 
         let relay = !from.is_local() && !to.is_local();
         // Folders are made writable and get their own modes after their files (a 0555 folder
-        // would refuse them).
-        to.mkdir(dst, None).await?;
+        // would refuse them). Only folders this item made get a mode: a merge leaves the target's.
+        let mut made: std::collections::HashSet<String> = self.resume.made.iter().cloned().collect();
+        if to.mkdir(dst).await? {
+            self.q.dir_made(self.id, "");
+            made.insert(String::new());
+        }
         // Parents before children: one depth at a time, the folders of a depth together.
         let dirs: Vec<&io::Node> = nodes.iter().filter(|n| n.meta.kind == Kind::Dir).collect();
         let deepest = dirs.iter().map(|n| n.rel.matches('/').count()).max().unwrap_or(0);
@@ -223,11 +234,16 @@ impl Run<'_> {
             loop {
                 while fl.len() < DIRS_IN_FLIGHT && next < level.len() {
                     let n = level[next];
-                    fl.push(mkdir(to, to.join(dst, &n.rel), None));
+                    fl.push(mkdir(to, to.join(dst, &n.rel), &n.rel));
                     next += 1;
                 }
                 match fl.next().await {
-                    Some(r) => r?,
+                    Some((rel, r)) => {
+                        if r? {
+                            self.q.dir_made(self.id, rel);
+                            made.insert(rel.to_owned());
+                        }
+                    }
                     None => break,
                 }
             }
@@ -314,13 +330,17 @@ impl Run<'_> {
 
         if relay {
             // Modes of the folders, deepest first, so none closes before its children are done.
-            for n in dirs.iter().rev() {
-                if let Err(e) = to.chmod(&to.join(dst, &n.rel), n.meta.mode & 0o7777).await {
-                    first.get_or_insert(e);
+            // A refusal costs only the mode: the files are there, it goes to the log.
+            let modes = dirs.iter().rev().map(|n| (to.join(dst, &n.rel), n.rel.as_str(), n.meta.mode)).chain([(dst.to_owned(), "", meta.mode)]);
+            for (path, rel, mode) in modes {
+                if !made.contains(rel) {
+                    continue;
                 }
-            }
-            if let Err(e) = to.chmod(dst, meta.mode & 0o7777).await {
-                first.get_or_insert(e);
+                match to.chmod(&path, mode & 0o7777).await {
+                    Ok(()) => {}
+                    Err(e @ Error::Disconnected) => return Err(e),
+                    Err(e) => self.q.log_path(to, &path, e.to_string(), Row::Err),
+                }
             }
         }
         if mv {
@@ -334,8 +354,8 @@ impl Run<'_> {
     }
 }
 
-async fn mkdir(to: &Side, path: String, mode: Option<u32>) -> Result<()> {
-    to.mkdir(&path, mode).await
+async fn mkdir<'a>(to: &Side, path: String, rel: &'a str) -> (&'a str, Result<bool>) {
+    (rel, to.mkdir(&path).await)
 }
 
 /// A move deletes its source only while it is still what was sent: a file written to meanwhile

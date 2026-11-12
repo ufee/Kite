@@ -13,7 +13,6 @@ use crate::{
     secrets,
     ssh::{Draft, SessionState, Ssh, TestReport, keys},
     store::Server,
-    transfer::Transfers,
 };
 
 type SshState<'a> = State<'a, Arc<Ssh>>;
@@ -22,12 +21,9 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'sta
     tauri::async_runtime::spawn_blocking(f).await.map_err(Error::ssh)?
 }
 
-/// Also resumes the transfers that the disconnect of this server paused.
 #[tauri::command]
-pub async fn ssh_connect(ssh: SshState<'_>, queue: State<'_, Arc<Transfers>>, server: Server, user: String) -> Result<()> {
-    ssh.connect(&server, &user).await?;
-    queue.attach(&server.id);
-    Ok(())
+pub async fn ssh_connect(ssh: SshState<'_>, server: Server, user: String) -> Result<()> {
+    ssh.connect(&server, &user).await.map(|_| ())
 }
 
 #[tauri::command]

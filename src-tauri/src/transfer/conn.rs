@@ -5,7 +5,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc, Mutex, Weak,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -38,6 +38,8 @@ pub struct Conn {
     pub posix_rename: AtomicBool,
     /// One permit per data request in flight.
     pub budget: Arc<Semaphore>,
+    /// Read and write pipelines running here: they split the budget evenly.
+    pipes: AtomicUsize,
     /// Turns true when the connection is gone.
     dropped: watch::Receiver<bool>,
 }
@@ -54,7 +56,19 @@ impl Conn {
             }
         }
         let posix_rename = AtomicBool::new(session.posix_rename);
-        Ok(Arc::new(Conn { session, chunk, posix_rename, budget: Arc::new(Semaphore::new(BUDGET)), dropped }))
+        Ok(Arc::new(Conn { session, chunk, posix_rename, budget: Arc::new(Semaphore::new(BUDGET)), pipes: AtomicUsize::new(0), dropped }))
+    }
+
+    /// Counts a pipeline in until the guard is dropped.
+    pub fn pipe(&self) -> Pipe<'_> {
+        self.pipes.fetch_add(1, Ordering::Relaxed);
+        Pipe(self)
+    }
+
+    /// Requests one pipeline may keep in flight: an even part of the budget. Without it the first
+    /// pipelines keep 64 each and a late one lives on the single slot it waited for.
+    pub fn share(&self, most: usize) -> usize {
+        (BUDGET / self.pipes.load(Ordering::Relaxed).max(1)).clamp(2, most)
     }
 
     /// Resolves once the connection is gone. A writer waiting for the channel window never hears
@@ -66,6 +80,14 @@ impl Conn {
 
     pub fn is_closed(&self) -> bool {
         self.session.is_closed()
+    }
+}
+
+pub struct Pipe<'a>(&'a Conn);
+
+impl Drop for Pipe<'_> {
+    fn drop(&mut self) {
+        self.0.pipes.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -203,6 +225,11 @@ impl Pool {
             }
             match p.slots.get(pair) {
                 Some(Slot::Live(e, _)) if n == Some(0) => Some(*e),
+                // Nobody waits for this connect any more (a pause): dropping it frees its handshake slot.
+                Some(Slot::Pending(..)) if n == Some(0) => {
+                    p.slots.remove(pair);
+                    None
+                }
                 _ => None,
             }
         };

@@ -202,6 +202,8 @@ export class TauriBackend extends MockBackend {
   override async transferList() {
     const list = (await call<CoreItem[]>('transfer_list')).map(item);
     this.mirror = new Map(list.map(i => [i.id, i]));
+    // An update that crossed the reply was just overwritten: the core sends everything again.
+    void invoke('transfer_resync');
     return list;
   }
   override transferPause(id: number) { void invoke('transfer_pause', { id }); }

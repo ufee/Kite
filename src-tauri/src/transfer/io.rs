@@ -122,12 +122,19 @@ pub fn local_name_ok(name: &str) -> bool {
     if !cfg!(windows) {
         return true;
     }
-    const DEVICES: [&str; 22] = [
-        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5",
-        "LPT6", "LPT7", "LPT8", "LPT9",
-    ];
     let stem = name.split('.').next().unwrap_or_default().trim_end_matches(' ').to_ascii_uppercase();
-    !(name.ends_with(['.', ' ']) || name.chars().any(|c| c < ' ' || r#"\:<>"|?*"#.contains(c)) || DEVICES.contains(&stem.as_str()))
+    !(name.ends_with(['.', ' ']) || name.chars().any(|c| c < ' ' || r#"\:<>"|?*"#.contains(c)) || is_device(&stem))
+}
+
+/// Names Windows keeps for devices, with any extension: CON, PRN, AUX, NUL, COM0–9 and LPT0–9,
+/// the superscript digits ¹²³ included.
+fn is_device(stem: &str) -> bool {
+    if ["CON", "PRN", "AUX", "NUL"].contains(&stem) {
+        return true;
+    }
+    let Some(rest) = stem.strip_prefix("COM").or_else(|| stem.strip_prefix("LPT")) else { return false };
+    let mut c = rest.chars();
+    matches!((c.next(), c.next()), (Some(d), None) if d.is_ascii_digit() || "¹²³".contains(d))
 }
 
 /// Every component of a `/`-separated relative path is a name this PC can hold.
@@ -262,25 +269,24 @@ impl Side {
     }
 
     /// A folder; one that is already there is fine.
-    pub async fn mkdir(&self, path: &str, mode: Option<u32>) -> Result<()> {
+    /// A folder, if there is none yet; true when this call made it.
+    pub async fn mkdir(&self, path: &str) -> Result<bool> {
         match self {
             Side::Local => {
                 let p = path.to_owned();
                 blocking(move || match std::fs::create_dir(&p) {
-                    Ok(()) => Ok(()),
-                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && Path::new(&p).is_dir() => Ok(()),
+                    Ok(()) => Ok(true),
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && Path::new(&p).is_dir() => Ok(false),
                     Err(e) => Err(io_error(&e, &p)),
                 })
                 .await
             }
             Side::Remote(l) => {
                 let sftp = &l.conn.session.sftp;
-                let mut attrs = FileAttributes::empty();
-                attrs.permissions = mode;
-                match sftp.mkdir(path, attrs).await {
-                    Ok(_) => Ok(()),
+                match sftp.mkdir(path, FileAttributes::empty()).await {
+                    Ok(_) => Ok(true),
                     Err(e) => match sftp.stat(path).await {
-                        Ok(a) if a.attrs.is_dir() => Ok(()),
+                        Ok(a) if a.attrs.is_dir() => Ok(false),
                         Ok(_) => Err(Error::Eexist { path: path.into() }),
                         Err(_) => Err(fs_error(e, path)),
                     },
@@ -355,7 +361,12 @@ impl Side {
                         Err(e) => return Err(fs_error(e, to)),
                     }
                 }
-                let Err(first) = sftp.rename(from, to).await else { return Ok(()) };
+                let old = self.old_of(to);
+                let Err(first) = sftp.rename(from, to).await else {
+                    // A break after the old file stepped aside last time left it there.
+                    let _ = sftp.remove(&old).await;
+                    return Ok(());
+                };
                 // Plain SFTP refuses to rename over a file. Only that case goes on: the part is there
                 // and a file is in the way. The old file steps aside, the part takes its place, then
                 // the old one goes; if the part cannot move, the old one comes back.
@@ -363,8 +374,6 @@ impl Side {
                 if !in_way || sftp.lstat(from).await.is_err() {
                     return Err(fs_error(first, to));
                 }
-                let (dir, name) = self.split(to);
-                let old = self.join(&dir, &format!(".{name}.kite-old"));
                 let _ = sftp.remove(&old).await;
                 sftp.rename(to, &old).await.map_err(|e| fs_error(e, to))?;
                 match sftp.rename(from, to).await {
@@ -378,6 +387,22 @@ impl Side {
                     }
                 }
             }
+        }
+    }
+
+    /// Where `rename_over` puts the old file aside on a server without `posix-rename`.
+    fn old_of(&self, path: &str) -> String {
+        let (dir, name) = self.split(path);
+        self.join(&dir, &format!(".{name}.kite-old"))
+    }
+
+    /// A cancel after a break between the two renames: the old file goes back to its name.
+    pub async fn restore_old(&self, path: &str) {
+        let Side::Remote(l) = self else { return };
+        let sftp = &l.conn.session.sftp;
+        let old = self.old_of(path);
+        if sftp.lstat(path).await.is_err() && sftp.lstat(&old).await.is_ok() {
+            let _ = sftp.rename(&old, path).await;
         }
     }
 
@@ -486,8 +511,6 @@ fn local_walk(root: &str) -> Result<Vec<Node>> {
 pub struct Finish {
     /// Date to set on the file.
     pub mtime: Option<u64>,
-    /// Permission bits for a new server file (server to server only).
-    pub mode: Option<u32>,
 }
 
 /// Copies `size` bytes of `src` from `offset` into `dst` at the same offset. `dst` is created or,
@@ -621,10 +644,11 @@ async fn permit(conn: &Conn, idle: bool) -> Result<Option<OwnedSemaphorePermit>>
 /// Keeps `IN_FLIGHT` reads outstanding and passes them on in file order.
 async fn read_pipeline(conn: &Conn, handle: &str, path: &str, start: u64, size: u64, chunk: u64, tx: &mpsc::Sender<Vec<u8>>) -> Result<u64> {
     let sftp = &conn.session.sftp;
+    let _pipe = conn.pipe();
     let mut in_flight = FuturesOrdered::new();
     let (mut offset, mut got) = (start, 0u64);
     loop {
-        while offset < size && in_flight.len() < IN_FLIGHT {
+        while offset < size && in_flight.len() < conn.share(IN_FLIGHT) {
             let Some(permit) = permit(conn, in_flight.is_empty()).await? else { break };
             let len = chunk.min(size - offset);
             let at = offset;
@@ -735,18 +759,13 @@ async fn write(side: &Side, path: &str, offset: u64, size: u64, mut rx: mpsc::Re
                 }
                 r => r.map(|_| ()),
             };
-            // Date, mode and close go together: the server applies them in order, nothing is written
-            // after. A mode set here is exact, past the server's umask.
+            // Date and close go together: the server applies them in order, nothing is written after.
+            // The mode comes after the rename, so a part always stays writable for a resume.
             let set = async {
-                if res.is_err() || (finish.mtime.is_none() && finish.mode.is_none()) {
-                    return Ok(());
-                }
+                let Some(t) = finish.mtime.filter(|_| res.is_ok()) else { return Ok(()) };
                 let mut a = FileAttributes::empty();
-                a.permissions = finish.mode;
-                if let Some(t) = finish.mtime {
-                    a.atime = Some(t as u32);
-                    a.mtime = Some(t as u32);
-                }
+                a.atime = Some(t as u32);
+                a.mtime = Some(t as u32);
                 sftp.fsetstat(handle.as_str(), a).await.map(|_| ()).map_err(|e| fs_error(e, path))
             };
             let (set, closed) = tokio::join!(biased; set, sftp.close(handle.as_str()));
@@ -762,6 +781,7 @@ async fn write(side: &Side, path: &str, offset: u64, size: u64, mut rx: mpsc::Re
 /// within that window of its end: resume steps back by it. Returns the end offset.
 async fn write_pipeline(conn: &Conn, handle: &str, path: &str, start: u64, rx: &mut mpsc::Receiver<Vec<u8>>, done: &AtomicU64) -> Result<u64> {
     let sftp = &conn.session.sftp;
+    let _pipe = conn.pipe();
     let window = IN_FLIGHT as u64 * conn.chunk as u64;
     let mut in_flight = FuturesUnordered::new();
     // Outstanding writes by offset: the first key is the lowest unconfirmed byte.
@@ -770,7 +790,7 @@ async fn write_pipeline(conn: &Conn, handle: &str, path: &str, start: u64, rx: &
     let mut held: Option<Vec<u8>> = None;
     loop {
         let floor = open.keys().next().copied().unwrap_or(offset);
-        let room = in_flight.len() < IN_FLIGHT && offset - floor < window;
+        let room = in_flight.len() < conn.share(IN_FLIGHT) && offset - floor < window;
         if room && let Some(data) = held.take() {
             match permit(conn, in_flight.is_empty()).await? {
                 Some(permit) => {
@@ -832,10 +852,12 @@ mod tests {
         assert!(local_rel_ok("a/b/c.txt"));
         assert!(!local_rel_ok("a/../b"));
         if cfg!(windows) {
-            for bad in [r"..\..\x.bat", r"C:\Users\Public\x.bat", "a.txt:stream", "CON", "nul.txt", "com1", "dot.", "space ", "q?", "tab\t"] {
+            for bad in [r"..\..\x.bat", r"C:\Users\Public\x.bat", "a.txt:stream", "CON", "nul.txt", "com1", "dot.", "space ", "q?", "tab\t", "COM0", "lpt0.log", "COM¹", "LPT³.txt"] {
                 assert!(!local_name_ok(bad), "{bad:?}");
             }
             assert!(local_name_ok("CONSOLE.txt"));
+            assert!(local_name_ok("COM10"));
+            assert!(local_name_ok("LPT"));
             assert!(!local_rel_ok(r"ok/..\..\evil"));
         }
     }
