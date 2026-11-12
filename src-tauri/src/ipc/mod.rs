@@ -3,6 +3,7 @@
 pub mod fs;
 pub mod ssh;
 pub mod term;
+pub mod transfer;
 
 use std::sync::Arc;
 

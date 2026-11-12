@@ -249,7 +249,7 @@ impl Session {
         }
     }
 
-    async fn close(&self) {
+    pub(crate) async fn close(&self) {
         self.closing.store(true, Ordering::Relaxed);
         let _ = self.handle.disconnect(Disconnect::ByApplication, "", "en").await;
     }
@@ -553,6 +553,15 @@ impl Ssh {
             return pass.map(Method::Password).ok_or(Error::NoSecret);
         }
         Ok(Method::Keys(key_source(server, user)))
+    }
+
+    /// A second connection of the pair for transfers, so a big file does not slow the terminal echo.
+    /// Same login and host key check; no sidebar status and no reconnect of its own: the queue retries.
+    pub async fn open_xfer(self: &Arc<Self>, server: &str, user: &str) -> Result<(Arc<Session>, watch::Receiver<bool>)> {
+        let saved = self.saved(server).await.ok_or(Error::ServerGone)?;
+        let t = Self::target(&saved, user);
+        let method = Self::method_for(&saved, user).await?;
+        self.open_session(&t, &method, HostMode::Ask).await
     }
 
     pub fn session_live(&self, server: &str, user: &str) -> Result<Arc<Session>> {

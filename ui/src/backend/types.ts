@@ -223,6 +223,8 @@ export interface Backend {
   transferClearDone(): void;
   transferSetParallel(n: number): void;
   transferKeepTime(keep: boolean): void;
+  /** Before a server (or one of its users) is disconnected or deleted: its unfinished transfers pause or go. */
+  transferDetach(server: ServerId, user: string | undefined, cancel: boolean): Promise<void>;
 
   // Editing in an external program
   editOpen(src: Src, user: string, path: string, editor: string, autosave: boolean): Promise<void>;

@@ -67,6 +67,9 @@ export function dropDialogs(kind: DlgKind, match: (data: Record<string, any>) =>
 
 export const confirmBox = (title: string, text: string, ok: string, danger = false) =>
   ask<boolean>('confirm', { title: tr(title), text: tr(text), ok: tr(ok), danger });
+/** Two answers besides "cancel": `ok` is the main one. */
+export const choiceBox = (title: string, text: string, ok: string, alt: string) =>
+  ask<'ok' | 'alt'>('confirm', { title: tr(title), text: tr(text), ok: tr(ok), alt: tr(alt) });
 
 /* ---------- Menus ---------- */
 export type MenuKey = 'src' | 'user' | 'cols' | 'row' | 'blank' | 'srv' | 'sort';

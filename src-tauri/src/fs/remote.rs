@@ -208,10 +208,10 @@ async fn gather<T, F: Future<Output = Result<T>>>(futs: Vec<F>, n: usize, skip: 
     Ok(out)
 }
 
-struct Node {
-    path: String,
-    attrs: FileAttributes,
-    depth: usize,
+pub(crate) struct Node {
+    pub path: String,
+    pub attrs: FileAttributes,
+    pub depth: usize,
 }
 
 /// A tree under a folder, one level at a time, parents before children. Links are entries, never
@@ -282,7 +282,7 @@ fn is_folder(a: &FileAttributes) -> bool {
 
 /// Everything under `root`, parents before children, and with `skip` the first folder that could
 /// not be read.
-async fn walk(sftp: &RawSftpSession, root: &str, every: bool, skip: bool) -> Result<(Vec<Node>, Option<Error>)> {
+pub(crate) async fn walk(sftp: &RawSftpSession, root: &str, every: bool, skip: bool) -> Result<(Vec<Node>, Option<Error>)> {
     let (mut w, mut out) = (Walker::new(root, every, skip), Vec::new());
     while let Some(level) = w.next(sftp).await? {
         out.extend(level);

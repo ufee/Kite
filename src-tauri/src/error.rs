@@ -54,6 +54,10 @@ pub enum Error {
     BadPath,
     #[serde(rename = "EINVAL")]
     Einval { reason: String },
+    /// The server of a transfer is no longer in the list.
+    ServerGone,
+    /// A transfer was paused or cancelled; never reaches the UI.
+    Stopped,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -5,7 +5,8 @@ import { tr } from '../i18n';
 import { collator } from '../util/format';
 import { isLocal } from '../util/paths';
 import { ui } from './prefs';
-import { toast } from './overlay';
+import { choiceBox, toast } from './overlay';
+import { transfersOn } from './queue';
 
 export const servers = reactive<Server[]>([]);
 export const groupOrder = reactive<string[]>([]);
@@ -97,6 +98,15 @@ export function srvTitle(s: Server | undefined) {
 
 export async function disconnect(id: ServerId) {
   const s = srvBy(id);
+  const n = transfersOn(id, true);
+  let cancel = false;
+  if (n) {
+    const r = await choiceBox(tr('У {c} идут передачи: {n}', { c: s?.code ?? id, n }), 'На паузе они продолжатся после нового подключения.', 'На паузу', 'Отменить передачи');
+    if (!r) return;
+    cancel = r === 'alt';
+  }
+  // Also closes the separate transfer connection.
+  await backend.transferDetach(id, undefined, cancel).catch(() => undefined);
   await backend.sshDisconnect(id);
   if (s) toast(tr('Отключено от {c}', { c: s.code }), 'info');
 }

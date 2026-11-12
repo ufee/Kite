@@ -1,6 +1,6 @@
 /* Transfer queue: the core runs it, the UI mirrors its state and reports batches. */
 import { computed, shallowRef } from 'vue';
-import { backend, isBackendError, type ConflictPolicy, type Endpoint, type Entry, type TransferItem } from '../backend';
+import { backend, isBackendError, type ConflictPolicy, type Endpoint, type Entry, type ServerId, type TransferItem } from '../backend';
 import { tr } from '../i18n';
 import { objs } from '../util/format';
 import { childOf, isLocal, within } from '../util/paths';
@@ -14,6 +14,9 @@ export const queue = shallowRef<TransferItem[]>([]);
 const ACTIVE = ['run', 'count', 'wait', 'pause'];
 export const active = computed(() => queue.value.filter(q => ACTIVE.includes(q.state)));
 export const qErr = computed(() => queue.value.filter(q => q.state === 'err'));
+/** Unfinished transfers with a server on either end; `running` leaves out the paused ones. */
+export const transfersOn = (id: ServerId, running = false) =>
+  active.value.filter(q => (q.from.src === id || q.to.src === id) && !(running && q.state === 'pause')).length;
 export const qStat = computed(() => {
   const a = active.value;
   if (!a.length) return null;
@@ -44,7 +47,9 @@ export async function transfer(from: Endpoint, entries: Entry[], to: Endpoint, m
       policy = r;
     }
     const batch = await backend.transferEnqueue(from, entries, to, move, policy === 'ask' ? 'replace' : policy);
-    if (!batch) toast('Всё уже на месте', 'info');
+    // The core skips a target that an unfinished item already writes.
+    const queued = entries.some(e => active.value.some(q => q.to.src === to.src && q.to.path === to.path && q.tname === e.name));
+    if (!batch) toast(queued ? 'Уже в очереди' : 'Всё уже на месте', 'info');
   } catch (e) {
     toast(isBackendError(e) ? e.title : String(e), 'bad');
   }

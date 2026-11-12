@@ -52,8 +52,9 @@ const COALESCE_MAX: usize = 256 * 1024;
 /// `COALESCE_WINDOW` (Windows rounds tokio timers up to its ~15.6 ms tick).
 const INTERACTIVE_BUDGET: usize = 4 * 1024;
 const LOCAL_READ_BUFFER: usize = 64 * 1024;
-/// Output a paused remote terminal keeps in the core. Only past this does its reader stop and the
-/// connection stall: a flood (`yes`) while the window is hidden and xterm parses nothing.
+/// Output a paused remote terminal keeps in the core: a flood (`yes`) while the window is hidden and
+/// xterm parses nothing. Past it the oldest half goes, so the reader never stops: a stalled channel
+/// would stall the whole connection, the panes' SFTP with it.
 const REMOTE_HOLD: usize = 8 * 1024 * 1024;
 /// How long a finished local shell waits for the rest of its output before it reports the exit.
 /// A background process that keeps the PTY open must not hold the exit forever.
@@ -72,9 +73,9 @@ pub type Handle = mpsc::UnboundedSender<Command>;
 /* ---------- Flow control ---------- */
 
 /// The UI pauses output while its terminal is behind. A local reader stops, and the ConPTY pipe
-/// holds the shell back. A remote reader keeps reading into its own buffer up to `REMOTE_HOLD`:
-/// russh hands channel data over from the session loop, so a reader that stops stalls the whole
-/// connection (file panels, other tabs, keepalive), not just this channel.
+/// holds the shell back. A remote reader never stops: russh hands channel data over from the session
+/// loop, so a reader that stops stalls the whole connection (file panels, other tabs, keepalive),
+/// not just this channel. It holds up to `REMOTE_HOLD` and drops the oldest output past it.
 #[derive(Default)]
 pub struct Flow {
     paused: Mutex<bool>,
@@ -320,15 +321,14 @@ async fn run_remote(
 
     loop {
         let paused = flow.is_paused();
-        // Resumed without the select branch seeing it (after the hold limit, or between two polls):
+        // Resumed without the select branch seeing it (between two polls):
         // outside a pause a non-empty buffer always has a deadline, so this is held output.
         if !paused && !buffer.is_empty() && deadline.is_none() {
             flush(&mut buffer);
             last_flush = Instant::now();
         }
         if paused && buffer.len() >= REMOTE_HOLD {
-            flow.wait().await;
-            continue;
+            drop_oldest(&mut buffer);
         }
         tokio::select! {
             msg = reader.wait() => match msg {
@@ -390,6 +390,14 @@ async fn run_remote(
         Exit::Exited
     };
     on_exit(reason);
+}
+
+/// Keeps the newer half of held output, from a line start: a cut there rarely splits a character or
+/// an escape sequence. Half, so the copy happens once per 4 MB, not on every packet.
+fn drop_oldest(buffer: &mut Vec<u8>) {
+    let cut = buffer.len() - REMOTE_HOLD / 2;
+    let from = buffer[cut..].iter().position(|&b| b == b'\n').map_or(cut, |i| cut + i + 1);
+    buffer.drain(..from);
 }
 
 /// A dropped connection may close its channels a moment before the handle reports it.
@@ -517,6 +525,17 @@ pub fn open_local(shell: &str, cwd: &str, cols: u16, rows: u16, flow: Arc<Flow>,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn held_output_keeps_the_newest_lines() {
+        let line = b"0123456789abcdef\n";
+        let mut buf: Vec<u8> = line.iter().copied().cycle().take(REMOTE_HOLD + 5).collect();
+        let last = *buf.last().unwrap();
+        drop_oldest(&mut buf);
+        assert!(buf.len() <= REMOTE_HOLD / 2 && buf.len() > REMOTE_HOLD / 2 - line.len());
+        assert_eq!(buf[0], b'0');
+        assert_eq!(*buf.last().unwrap(), last);
+    }
 
     #[test]
     fn start_command_quotes() {

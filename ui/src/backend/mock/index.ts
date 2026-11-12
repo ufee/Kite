@@ -625,6 +625,13 @@ export class MockBackend implements Backend {
   }
   transferSetParallel(n: number) { this.parallel = Math.max(1, Math.min(8, n)); }
   transferKeepTime(keep: boolean) { this.keepTime = keep; }
+  async transferDetach(server: ServerId, user: string | undefined, cancel: boolean) {
+    const touches = (e: Endpoint) => e.src === server && (user === undefined || e.user === user);
+    for (const j of [...this.jobs]) {
+      if (!['wait', 'count', 'run', 'pause'].includes(j.state) || !(touches(j.from) || touches(j.to))) continue;
+      if (cancel) this.transferCancel(j.id); else this.transferPause(j.id);
+    }
+  }
 
   /* ---------- Editing in an external program ---------- */
   async editOpen(src: Src, user: string, path: string, editor: string, autosave: boolean) {
