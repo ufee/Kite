@@ -135,6 +135,11 @@ impl Item {
     fn writes(&self, to: &End, tname: &str) -> bool {
         self.to.src == to.src && to.key(&self.to.path) == to.key(&to.path) && to.key(&self.tname) == to.key(tname)
     }
+
+    /// The second of two picks that are one name on the target: a retry would land on the first.
+    fn twin(&self) -> bool {
+        self.err.as_ref().is_some_and(|e| e["code"] == "NAME_CLASH" && e["path"] == self.name.as_str())
+    }
 }
 
 /// What a resume needs: parts being written with their source's size and date, and for a folder
@@ -225,10 +230,12 @@ struct View<'a> {
 }
 
 /// One `transfer://state`: items new or changed since the last one, and ids no longer listed.
+/// With `reset`, `up` is the whole list and replaces what the UI has.
 #[derive(Serialize, Clone)]
 struct Diff {
     up: Vec<Value>,
     del: Vec<u64>,
+    reset: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -504,7 +511,7 @@ impl Transfers {
 
     pub fn retry(&self, id: u64, as_root: bool) {
         self.with(id, |r| {
-            if r.item.state == St::Err {
+            if r.item.state == St::Err && !r.item.twin() {
                 if as_root {
                     r.item.to.user = "root".into();
                 }
@@ -956,7 +963,8 @@ impl Transfers {
                 self.kick.notified().await;
             }
             let now = Instant::now();
-            if self.resend.swap(false, Ordering::Relaxed) {
+            let reset = self.resend.swap(false, Ordering::Relaxed);
+            if reset {
                 sent.clear();
             }
             let (diff, save) = {
@@ -991,7 +999,7 @@ impl Transfers {
                 let running = g.recs.iter().any(|r| r.live.is_some());
                 let due = (g.dirty || running) && now.duration_since(saved_at) >= SAVE_EVERY;
                 let save = due.then(|| self.disk(&mut g));
-                ((!up.is_empty() || !del.is_empty()).then_some(Diff { up, del }), save)
+                ((reset || !up.is_empty() || !del.is_empty()).then_some(Diff { up, del, reset }), save)
             };
             if let Some(diff) = diff {
                 let _ = self.app.emit("transfer://state", diff);

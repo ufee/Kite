@@ -22,7 +22,7 @@ use russh::{
 use zeroize::Zeroizing;
 
 use super::{
-    Client, Ssh,
+    Client, RunRow, Ssh,
     keys::{self, Agent, KeyFile},
     prompt::PassphraseRequest,
 };
@@ -130,23 +130,26 @@ async fn password(ssh: &Ssh, h: &mut Handle<Client>, who: &Who<'_>, pass: &Zeroi
     // One attempt only: retrying the same password through the other method doubles the failures
     // the server counts (fail2ban).
     if offered.contains(&MethodKind::Password) {
-        let row = ssh.log.run(who.code, "AUTH", format!("password · {}", who.user));
+        let row = RunRow::new(&ssh.log, ssh.log.run(who.code, "AUTH", format!("password · {}", who.user)));
         let res = h.authenticate_password(who.user, pass.as_str()).await?;
-        let res = ended(h, Ok(res));
-        if res.is_err() {
-            ssh.log.done(row, "соединение закрыто", State::Err);
-        }
-        return match res? {
+        let res = match ended(h, Ok(res)) {
+            Ok(r) => r,
+            Err(e) => {
+                row.done("соединение закрыто", State::Err);
+                return Err(e);
+            }
+        };
+        return match res {
             AuthResult::Success => {
-                ssh.log.done(row, "", State::Ok);
+                row.done("", State::Ok);
                 Ok(())
             }
             AuthResult::Failure { partial_success: true, .. } => {
-                ssh.log.done(row, "нужен второй фактор", State::Err);
+                row.done("нужен второй фактор", State::Err);
                 Err(Error::AuthMulti)
             }
             AuthResult::Failure { .. } => {
-                ssh.log.done(row, "пароль не принят", State::Err);
+                row.done("пароль не принят", State::Err);
                 Err(Error::AuthPass)
             }
         };
@@ -159,22 +162,22 @@ async fn password(ssh: &Ssh, h: &mut Handle<Client>, who: &Who<'_>, pass: &Zeroi
 }
 
 async fn keyboard_interactive(ssh: &Ssh, h: &mut Handle<Client>, who: &Who<'_>, pass: &Zeroizing<String>) -> Result<()> {
-    let row = ssh.log.run(who.code, "AUTH", format!("keyboard-interactive · {}", who.user));
+    let row = RunRow::new(&ssh.log, ssh.log.run(who.code, "AUTH", format!("keyboard-interactive · {}", who.user)));
     let mut answered = false;
     let mut reply = h.authenticate_keyboard_interactive_start(who.user, None).await?;
     // Servers may send empty info requests around the real one; a bound keeps a broken one from looping.
     for _ in 0..6 {
         match reply {
             KeyboardInteractiveAuthResponse::Success => {
-                ssh.log.done(row, "", State::Ok);
+                row.done("", State::Ok);
                 return Ok(());
             }
             KeyboardInteractiveAuthResponse::Failure { partial_success: true, .. } => {
-                ssh.log.done(row, "нужен второй фактор", State::Err);
+                row.done("нужен второй фактор", State::Err);
                 return Err(Error::AuthMulti);
             }
             KeyboardInteractiveAuthResponse::Failure { .. } => {
-                ssh.log.done(row, "пароль не принят", State::Err);
+                row.done("пароль не принят", State::Err);
                 return Err(Error::AuthPass);
             }
             KeyboardInteractiveAuthResponse::InfoRequest { prompts, .. } => {
@@ -187,11 +190,11 @@ async fn keyboard_interactive(ssh: &Ssh, h: &mut Handle<Client>, who: &Who<'_>, 
                         vec![pass.to_string()]
                     }
                     1 => {
-                        ssh.log.done(row, "пароль не принят", State::Err);
+                        row.done("пароль не принят", State::Err);
                         return Err(Error::AuthPass);
                     }
                     _ => {
-                        ssh.log.done(row, "сервер задаёт несколько вопросов", State::Err);
+                        row.done("сервер задаёт несколько вопросов", State::Err);
                         return Err(Error::AuthMulti);
                     }
                 };
@@ -199,7 +202,7 @@ async fn keyboard_interactive(ssh: &Ssh, h: &mut Handle<Client>, who: &Who<'_>, 
             }
         }
     }
-    ssh.log.done(row, "сервер не завершил вход", State::Err);
+    row.done("сервер не завершил вход", State::Err);
     Err(Error::AuthPass)
 }
 
@@ -236,7 +239,7 @@ async fn listed(agent: &mut Option<Agent>) -> Vec<PublicKey> {
 }
 
 async fn with_agent(ssh: &Ssh, h: &mut Handle<Client>, who: &Who<'_>, a: &mut Attempt, agent: &mut Agent, key: PublicKey, how: &str) -> Result<bool> {
-    let row = ssh.log.run(who.code, "AUTH", format!("publickey · {} · {} · {how}", keys::algo_short(&key), keys::label(&key)));
+    let row = RunRow::new(&ssh.log, ssh.log.run(who.code, "AUTH", format!("publickey · {} · {} · {how}", keys::algo_short(&key), keys::label(&key))));
     let hash = key.algorithm().is_rsa().then_some(a.rsa).flatten();
     a.tried.push(key.clone());
     let res = h.authenticate_publickey_with(who.user, key, hash, agent).await.map_err(|e| match e {
@@ -244,12 +247,12 @@ async fn with_agent(ssh: &Ssh, h: &mut Handle<Client>, who: &Who<'_>, a: &mut At
         russh::AgentAuthError::Key(e) => Error::ssh(format!("agent: {e}")),
     });
     let res = ended(h, res).map_err(|e| if matches!(e, Error::Disconnected) { key_error(russh::Error::Disconnect, who, a) } else { e });
-    finish(ssh, row, res)
+    finish(row, res)
 }
 
 async fn with_key(ssh: &Ssh, h: &mut Handle<Client>, who: &Who<'_>, a: &mut Attempt, key: Arc<PrivateKey>, name: &str) -> Result<bool> {
     let public = key.public_key().clone();
-    let row = ssh.log.run(who.code, "AUTH", format!("publickey · {} · {name}", keys::algo_short(&public)));
+    let row = RunRow::new(&ssh.log, ssh.log.run(who.code, "AUTH", format!("publickey · {} · {name}", keys::algo_short(&public))));
     let hash = public.algorithm().is_rsa().then_some(a.rsa).flatten();
     a.tried.push(public);
     let res = h.authenticate_publickey(who.user, PrivateKeyWithHashAlg::new(key, hash)).await;
@@ -257,25 +260,25 @@ async fn with_key(ssh: &Ssh, h: &mut Handle<Client>, who: &Who<'_>, a: &mut Atte
         Ok(r) => ended(h, Ok(r)).map_err(|_| key_error(russh::Error::Disconnect, who, a)),
         Err(e) => Err(key_error(e, who, a)),
     };
-    finish(ssh, row, res)
+    finish(row, res)
 }
 
-fn finish(ssh: &Ssh, row: u64, res: Result<AuthResult>) -> Result<bool> {
+fn finish(row: RunRow<'_>, res: Result<AuthResult>) -> Result<bool> {
     match res {
         Ok(AuthResult::Success) => {
-            ssh.log.done(row, "", State::Ok);
+            row.done("", State::Ok);
             Ok(true)
         }
         Ok(AuthResult::Failure { partial_success: true, .. }) => {
-            ssh.log.done(row, "нужен второй фактор", State::Err);
+            row.done("нужен второй фактор", State::Err);
             Err(Error::AuthMulti)
         }
         Ok(AuthResult::Failure { .. }) => {
-            ssh.log.done(row, "ключ не принят", State::Err);
+            row.done("ключ не принят", State::Err);
             Ok(false)
         }
         Err(e) => {
-            ssh.log.done(row, e.to_string(), State::Err);
+            row.done(e.to_string(), State::Err);
             Err(e)
         }
     }
@@ -413,7 +416,7 @@ async fn unlock(ssh: &Ssh, who: &Who<'_>, kf: &KeyFile, agent: &mut Option<Agent
         agent: agent.is_some(),
     };
     ssh.log.ok(who.code, "KEY", msg!("Ключ {k} защищён паролем", k = name));
-    let Some((id, mut rx)) = ssh.prompts.passphrase(&ssh.app, req) else { return Err(Error::Cancelled) };
+    let Some((ask, mut rx)) = ssh.prompts.passphrase(&ssh.app, req) else { return Err(Error::Cancelled) };
     let result = loop {
         // A closed channel is this connection going away, not the user's answer: the waiters ask.
         let Some(answer) = rx.recv().await else { break Err(Error::Cancelled) };
@@ -451,7 +454,7 @@ async fn unlock(ssh: &Ssh, who: &Who<'_>, kf: &KeyFile, agent: &mut Option<Agent
         let _ = answer.reply.send(Ok(()));
         break Ok(key);
     };
-    ssh.prompts.passphrase_done(id);
+    ask.done();
     result
 }
 

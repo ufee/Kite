@@ -118,7 +118,8 @@ impl Run<'_> {
         }
         self.q.part_started(self.id, rel, meta.size, meta.mtime);
         self.done().fetch_add(offset, Ordering::Relaxed);
-        let finish = Finish { mtime: self.keep_time.then_some(meta.mtime) };
+        let relay = !from.is_local() && !to.is_local();
+        let finish = Finish { mtime: self.keep_time.then_some(meta.mtime), private: relay };
         if offset == 0 && io::fetch_small(from, src, to, &part, dst, meta.size, finish.mtime, self.done()).await? {
             self.q.part_done(self.id, rel);
             return Ok(());
@@ -126,8 +127,9 @@ impl Run<'_> {
         io::copy(from, src, to, &part, offset, meta.size, finish, self.done(), self.stop).await?;
         to.rename_over(&part, dst).await?;
         self.q.part_done(self.id, rel);
-        // Server to server the mode goes along, exact past the umask. A refusal costs only the mode.
-        if !from.is_local() && !to.is_local() {
+        // Server to server the mode goes along, exact past the umask. A refusal costs only the
+        // mode: the file stays 0600, narrower than its source.
+        if relay {
             match to.chmod(dst, meta.mode & 0o777).await {
                 Ok(()) => {}
                 Err(e @ Error::Disconnected) => return Err(e),
@@ -218,10 +220,11 @@ impl Run<'_> {
         self.q.set_state(self.id, St::Run);
 
         let relay = !from.is_local() && !to.is_local();
-        // Folders are made writable and get their own modes after their files (a 0555 folder
-        // would refuse them). Only folders this item made get a mode: a merge leaves the target's.
+        // Server to server, folders are made 0700 and get their own modes after their files (a
+        // 0555 folder would refuse them), so one cut short is never wider than its source. Only
+        // folders this item made get a mode: a merge leaves the target's. Only a relay keeps the list.
         let mut made: std::collections::HashSet<String> = self.resume.made.iter().cloned().collect();
-        if to.mkdir(dst).await? {
+        if to.mkdir(dst, relay).await? && relay {
             self.q.dir_made(self.id, "");
             made.insert(String::new());
         }
@@ -234,12 +237,12 @@ impl Run<'_> {
             loop {
                 while fl.len() < DIRS_IN_FLIGHT && next < level.len() {
                     let n = level[next];
-                    fl.push(mkdir(to, to.join(dst, &n.rel), &n.rel));
+                    fl.push(mkdir(to, to.join(dst, &n.rel), &n.rel, relay));
                     next += 1;
                 }
                 match fl.next().await {
                     Some((rel, r)) => {
-                        if r? {
+                        if r? && relay {
                             self.q.dir_made(self.id, rel);
                             made.insert(rel.to_owned());
                         }
@@ -354,8 +357,8 @@ impl Run<'_> {
     }
 }
 
-async fn mkdir<'a>(to: &Side, path: String, rel: &'a str) -> (&'a str, Result<bool>) {
-    (rel, to.mkdir(&path).await)
+async fn mkdir<'a>(to: &Side, path: String, rel: &'a str, private: bool) -> (&'a str, Result<bool>) {
+    (rel, to.mkdir(&path, private).await)
 }
 
 /// A move deletes its source only while it is still what was sent: a file written to meanwhile

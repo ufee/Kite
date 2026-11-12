@@ -135,6 +135,8 @@ export interface TransferItem {
   err: string;
   /** Lack of rights on the target: the queue offers "as root" */
   denied?: boolean;
+  /** The second of two picks that are one name on the target: a retry would land on the first */
+  twin?: boolean;
 }
 
 export interface BatchReport {

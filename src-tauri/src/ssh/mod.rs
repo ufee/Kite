@@ -59,7 +59,11 @@ struct RunRow<'a> {
     row: Option<u64>,
 }
 
-impl RunRow<'_> {
+impl<'a> RunRow<'a> {
+    fn new(log: &'a Log, row: u64) -> Self {
+        RunRow { log, row: Some(row) }
+    }
+
     fn done(mut self, note: impl Into<crate::log::Msg>, state: State) {
         if let Some(row) = self.row.take() {
             self.log.done(row, note, state);
@@ -395,7 +399,7 @@ impl Ssh {
             shake.set_seen(HostSeen::Unverified(fp));
             return true;
         }
-        let row = self.log.run(src, "KEY", format!("{algo} {fp}"));
+        let row = RunRow::new(&self.log, self.log.run(src, "KEY", format!("{algo} {fp}")));
         // The question does not hold a handshake slot: other servers keep connecting meanwhile.
         shake.permit.lock().await.take();
         shake.asked.store(true, Ordering::Relaxed);
@@ -416,7 +420,7 @@ impl Ssh {
             *shake.permit.lock().await = Some(p);
         }
         if !trust {
-            self.log.done(row, if mode == "changed" { "ключ хоста изменился" } else { "не подтверждён" }, State::Err);
+            row.done(if mode == "changed" { "ключ хоста изменился" } else { "не подтверждён" }, State::Err);
             shake.set_seen(HostSeen::Rejected);
             return false;
         }
@@ -425,9 +429,9 @@ impl Ssh {
         let changed = mode == "changed";
         let saved = tokio::task::spawn_blocking(move || if changed { kh.replace(&host, port, &k) } else { kh.add(&host, port, &k) }).await;
         match saved {
-            Ok(Ok(())) => self.log.done(row, "сохранён в known_hosts", State::Ok),
-            Ok(Err(e)) => self.log.done(row, msg!("не записан в known_hosts: {e}", e = e), State::Err),
-            Err(e) => self.log.done(row, e.to_string(), State::Err),
+            Ok(Ok(())) => row.done("сохранён в known_hosts", State::Ok),
+            Ok(Err(e)) => row.done(msg!("не записан в known_hosts: {e}", e = e), State::Err),
+            Err(e) => row.done(e.to_string(), State::Err),
         }
         shake.set_seen(HostSeen::Trusted);
         true

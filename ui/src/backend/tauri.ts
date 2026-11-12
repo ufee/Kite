@@ -94,7 +94,8 @@ const notYet = (stage: number): BackendError => ({ code: 'NOT_YET', title: tr('Ð
 type CoreItem = Omit<TransferItem, 'err'> & { err: CoreError | null };
 const item = (i: CoreItem): TransferItem => {
   const [title, text] = i.err ? words(i.err) : ['', ''];
-  return { ...i, err: text ? `${title}. ${text}` : title };
+  const twin = i.err?.code === 'NAME_CLASH' && i.err.path === i.name;
+  return { ...i, err: text ? `${title}. ${text}` : title, twin };
 };
 
 export class TauriBackend extends MockBackend {
@@ -113,7 +114,9 @@ export class TauriBackend extends MockBackend {
     void listen<CoreRow>('log://row', e => this.emit('log', row(e.payload)));
     void listen<CoreRow>('log://update', e => this.emit('logUpdate', row(e.payload)));
     // The core sends the items that changed; the mirror keeps the order of the queue.
-    void listen<{ up: CoreItem[]; del: number[] }>('transfer://state', e => {
+    void listen<{ up: CoreItem[]; del: number[]; reset: boolean }>('transfer://state', e => {
+      // A reset is the whole list: rows deleted while the snapshot was on its way go too.
+      if (e.payload.reset) this.mirror.clear();
       for (const id of e.payload.del) this.mirror.delete(id);
       for (const i of e.payload.up) this.mirror.set(i.id, item(i));
       this.emit('transfer', [...this.mirror.values()]);
@@ -202,7 +205,7 @@ export class TauriBackend extends MockBackend {
   override async transferList() {
     const list = (await call<CoreItem[]>('transfer_list')).map(item);
     this.mirror = new Map(list.map(i => [i.id, i]));
-    // An update that crossed the reply was just overwritten: the core sends everything again.
+    // An update that crossed the reply was just overwritten: the core sends the whole list again.
     void invoke('transfer_resync');
     return list;
   }

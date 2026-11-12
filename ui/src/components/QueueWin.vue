@@ -32,7 +32,7 @@ function progress(q: TransferItem) {
         <div class="ell"><span :style="{ color: q.state === 'done' ? 'var(--tx2)' : '' }">{{ q.tname }}</span>&ensp;<span class="faint" style="font-size:12px">{{ routeLabel(q) }}</span></div>
         <div class="q-acts">
           <button v-if="live(q) && q.state !== 'count'" class="ibtn" :title="tr(q.state === 'pause' ? 'Продолжить' : 'Пауза')" @click="togglePause(q)"><Icon :n="q.state === 'pause' ? 'play' : 'pause'" s="s" /></button>
-          <button v-if="q.state === 'err'" class="textbtn" @click="retryQ(q)">{{ tr('Повторить') }}</button>
+          <button v-if="q.state === 'err' && !q.twin" class="textbtn" @click="retryQ(q)">{{ tr('Повторить') }}</button>
           <button v-if="q.state === 'err' && q.denied" class="textbtn" @click="retryQ(q, true)">{{ tr('От root') }}</button>
           <button class="ibtn" :title="tr(q.state === 'done' ? 'Убрать из списка' : 'Отменить')" @click="cancelQ(q)"><Icon n="x" s="s" /></button>
         </div>

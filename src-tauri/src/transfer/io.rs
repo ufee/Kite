@@ -268,9 +268,9 @@ impl Side {
         }
     }
 
-    /// A folder; one that is already there is fine.
-    /// A folder, if there is none yet; true when this call made it.
-    pub async fn mkdir(&self, path: &str) -> Result<bool> {
+    /// A folder, if there is none yet; true when this call made it. A `private` one is made 0700
+    /// on a server: until its own mode comes, or if it never does, it is never wider than its source.
+    pub async fn mkdir(&self, path: &str, private: bool) -> Result<bool> {
         match self {
             Side::Local => {
                 let p = path.to_owned();
@@ -283,7 +283,11 @@ impl Side {
             }
             Side::Remote(l) => {
                 let sftp = &l.conn.session.sftp;
-                match sftp.mkdir(path, FileAttributes::empty()).await {
+                let mut a = FileAttributes::empty();
+                if private {
+                    a.permissions = Some(0o700);
+                }
+                match sftp.mkdir(path, a).await {
                     Ok(_) => Ok(true),
                     Err(e) => match sftp.stat(path).await {
                         Ok(a) if a.attrs.is_dir() => Ok(false),
@@ -511,6 +515,9 @@ fn local_walk(root: &str) -> Result<Vec<Node>> {
 pub struct Finish {
     /// Date to set on the file.
     pub mtime: Option<u64>,
+    /// Server to server: a new part is made 0600, so until the source's mode comes after the
+    /// rename (or if it never does) the file is never wider than its source.
+    pub private: bool,
 }
 
 /// Copies `size` bytes of `src` from `offset` into `dst` at the same offset. `dst` is created or,
@@ -743,8 +750,12 @@ async fn write(side: &Side, path: &str, offset: u64, size: u64, mut rx: mpsc::Re
         Side::Remote(l) => {
             let sftp = &l.conn.session.sftp;
             let flags = if offset > 0 { OpenFlags::WRITE } else { OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE };
-            // The part stays writable for a resume: its mode comes at the end, with the date.
-            let handle = sftp.open(path, flags, FileAttributes::empty()).await.map_err(|e| fs_error(e, path))?.handle;
+            // The part stays writable for a resume: its own mode comes after the rename.
+            let mut a = FileAttributes::empty();
+            if finish.private {
+                a.permissions = Some(0o600);
+            }
+            let handle = sftp.open(path, flags, a).await.map_err(|e| fs_error(e, path))?.handle;
             let res = tokio::select! {
                 r = write_pipeline(&l.conn, &handle, path, offset, &mut rx, done) => r,
                 _ = stopped(&mut stop) => Err(Error::Stopped),

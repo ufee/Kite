@@ -70,6 +70,29 @@ fn open<T>(m: &Open<T>) -> std::sync::MutexGuard<'_, HashMap<u64, (String, T)>> 
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// An open request that is withdrawn, its dialog closed, when its connect goes away unanswered
+/// (a transfer paused mid-login drops it).
+pub struct Ask<'a, T> {
+    m: &'a Open<T>,
+    app: &'a AppHandle,
+    id: u64,
+}
+
+impl<T> Ask<'_, T> {
+    /// Answered: the dialog has closed itself.
+    pub fn done(self) {
+        open(self.m).remove(&self.id);
+    }
+}
+
+impl<T> Drop for Ask<'_, T> {
+    fn drop(&mut self) {
+        if open(self.m).remove(&self.id).is_some() {
+            let _ = self.app.emit("ssh://prompt-gone", [self.id]);
+        }
+    }
+}
+
 impl Prompts {
     fn id(&self) -> u64 {
         self.next.fetch_add(1, Ordering::Relaxed) + 1
@@ -80,8 +103,8 @@ impl Prompts {
         req.req_id = self.id();
         let (tx, rx) = oneshot::channel();
         open(&self.host).insert(req.req_id, (req.server.clone(), tx));
+        let _ask = Ask { m: &self.host, app, id: req.req_id };
         if app.emit("ssh://hostkey", &req).is_err() {
-            open(&self.host).remove(&req.req_id);
             return false;
         }
         rx.await.unwrap_or(false)
@@ -94,19 +117,17 @@ impl Prompts {
     }
 
     /// Opens the dialog; answers arrive on the receiver until one is accepted or cancelled.
-    pub fn passphrase(&self, app: &AppHandle, mut req: PassphraseRequest) -> Option<(u64, mpsc::Receiver<PassphraseAnswer>)> {
+    #[allow(clippy::type_complexity)]
+    pub fn passphrase<'a>(&'a self, app: &'a AppHandle, mut req: PassphraseRequest) -> Option<(Ask<'a, mpsc::Sender<PassphraseAnswer>>, mpsc::Receiver<PassphraseAnswer>)> {
         req.req_id = self.id();
         let (tx, rx) = mpsc::channel(1);
         open(&self.pass).insert(req.req_id, (req.server.clone(), tx));
+        let ask = Ask { m: &self.pass, app, id: req.req_id };
         if app.emit("ssh://passphrase", &req).is_err() {
-            self.passphrase_done(req.req_id);
+            ask.done();
             return None;
         }
-        Some((req.req_id, rx))
-    }
-
-    pub fn passphrase_done(&self, req_id: u64) {
-        open(&self.pass).remove(&req_id);
+        Some((ask, rx))
     }
 
     /// Drops the open requests (of one server, or all when the window was reloaded and its dialogs
