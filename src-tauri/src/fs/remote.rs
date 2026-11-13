@@ -7,7 +7,7 @@ use std::{
 
 use futures::{
     future,
-    stream::{self, StreamExt},
+    stream::{self, FuturesUnordered, StreamExt},
 };
 use russh::ChannelMsg;
 use russh_sftp::{
@@ -39,30 +39,44 @@ fn owner_group(f: &File) -> (String, String) {
     }
 }
 
-/// All names of a folder, without `.` and `..`. Attributes are the entries' own (lstat).
-async fn read_dir(sftp: &RawSftpSession, path: &str) -> Result<Vec<File>> {
+/// READDIR requests kept in flight for a pane's folder on a server that answers in order: a reply
+/// holds ~100 names, so 10k names are 100 round trips one by one. Measured on 10k names: LAN
+/// 117 → 57 ms, 40 ms RTT 4.4 → 0.7 s.
+const READDIR_DEPTH: usize = 8;
+
+/// All names of a folder, without `.` and `..`. Attributes are the entries' own (lstat). `depth`
+/// READDIR go at once; batches may come in any order, which the pane's sort makes irrelevant.
+async fn read_dir(sftp: &RawSftpSession, path: &str, depth: usize) -> Result<Vec<File>> {
     let handle = sftp.opendir(path).await.map_err(|e| fs_error(e, path))?.handle;
+    let res = read_batches(sftp, handle.as_str(), depth.max(1)).await;
+    let _ = sftp.close(handle).await;
+    res.map_err(|e| fs_error(e, path))
+}
+
+async fn read_batches(sftp: &RawSftpSession, handle: &str, depth: usize) -> std::result::Result<Vec<File>, SftpError> {
     let mut files = Vec::new();
-    loop {
-        match sftp.readdir(handle.as_str()).await {
-            // An empty name or one with `/` would point back into the folder or out of it.
-            Ok(name) => files.extend(
-                name.files.into_iter().filter(|f| !matches!(f.filename.as_str(), "" | "." | "..") && !f.filename.contains('/')),
-            ),
-            Err(SftpError::Status(st)) if st.status_code == StatusCode::Eof => break,
-            Err(e) => {
-                let _ = sftp.close(handle).await;
-                return Err(fs_error(e, path));
+    let mut in_flight: FuturesUnordered<_> = (0..depth).map(|_| sftp.readdir(handle)).collect();
+    let mut end = false;
+    while let Some(reply) = in_flight.next().await {
+        match reply {
+            Ok(name) => {
+                // An empty name or one with `/` would point back into the folder or out of it.
+                files.extend(name.files.into_iter().filter(|f| !matches!(f.filename.as_str(), "" | "." | "..") && !f.filename.contains('/')));
+                if !end {
+                    in_flight.push(sftp.readdir(handle));
+                }
             }
+            // The requests still in flight end the same way.
+            Err(SftpError::Status(st)) if st.status_code == StatusCode::Eof => end = true,
+            Err(e) => return Err(e),
         }
     }
-    let _ = sftp.close(handle).await;
     Ok(files)
 }
 
 pub async fn list(s: &Session, path: &str) -> Result<Vec<Entry>> {
     let sftp = &s.sftp;
-    let files = read_dir(sftp, path).await?;
+    let files = read_dir(sftp, path, if s.in_order { READDIR_DEPTH } else { 1 }).await?;
     // Links: one stat each for the target type, pipelined on the channel.
     // Futures are collected first: a lazy `map` inside the stream trips the Send check of commands.
     let stats: Vec<_> = files
@@ -239,7 +253,8 @@ impl Walker {
         if self.level.is_empty() {
             return Ok(None);
         }
-        let reads: Vec<_> = self.level.iter().map(|d| async move { read_dir(sftp, d).await.map(|l| (d.clone(), l)) }).collect();
+        // Folders already go `DIRS_IN_FLIGHT` at once: one READDIR each.
+        let reads: Vec<_> = self.level.iter().map(|d| async move { read_dir(sftp, d, 1).await.map(|l| (d.clone(), l)) }).collect();
         let found: Vec<(String, FileAttributes)> = gather(reads, DIRS_IN_FLIGHT, self.skip, &mut self.err)
             .await?
             .into_iter()

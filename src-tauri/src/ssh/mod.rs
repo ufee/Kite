@@ -281,6 +281,8 @@ pub struct Session {
     pub code: String,
     /// The server announced `posix-rename@openssh.com` at init.
     pub posix_rename: bool,
+    /// Several READDIR on one handle are safe here: see `sftp::Opened::in_order`.
+    pub in_order: bool,
     closing: AtomicBool,
 }
 
@@ -579,7 +581,7 @@ impl Ssh {
 
     async fn open_session(self: &Arc<Self>, t: &Target, method: &Method, mode: HostMode) -> Result<(Arc<Session>, watch::Receiver<bool>)> {
         let Shaken { handle, dropped, fwd, .. } = self.handshake(t, method, mode).await?;
-        let (sftp, version, home, posix_rename) = match sftp::open(&handle).await {
+        let sftp::Opened { raw: sftp, version, home, posix_rename, in_order } = match sftp::open(&handle).await {
             Ok(v) => v,
             Err(e) => {
                 self.log.err(&t.code, "SFTP", "Подсистема SFTP не запустилась", e.to_string());
@@ -588,7 +590,7 @@ impl Ssh {
             }
         };
         self.log.ok(&t.code, "SFTP", msg!("Подсистема запущена, протокол v{v}", v = version));
-        let s = Session { handle, host: t.host.clone(), port: t.port, fwd, sftp, home, code: t.code.clone(), posix_rename, closing: AtomicBool::new(false) };
+        let s = Session { handle, host: t.host.clone(), port: t.port, fwd, sftp, home, code: t.code.clone(), posix_rename, in_order, closing: AtomicBool::new(false) };
         Ok((Arc::new(s), dropped))
     }
 
