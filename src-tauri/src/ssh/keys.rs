@@ -180,6 +180,7 @@ const AGENT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The OpenSSH agent: the Windows service pipe, `SSH_AUTH_SOCK` elsewhere. `None` when it is not running.
 pub async fn agent() -> Option<Agent> {
+    // russh waits out a busy pipe itself; the timeout bounds that wait.
     #[cfg(windows)]
     let client = tokio::time::timeout(AGENT_TIMEOUT, AgentClient::connect_named_pipe(r"\\.\pipe\openssh-ssh-agent")).await.ok()?.ok()?;
     #[cfg(unix)]

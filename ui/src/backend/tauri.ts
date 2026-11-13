@@ -38,6 +38,28 @@ const stamp = (ms: number) => {
 };
 const row = (r: CoreRow): LogRow => ({ id: r.id, time: stamp(r.ts), src: r.src === 'local' ? tr('Этот ПК') : r.src, tag: r.tag, text: msg(r.text), note: msg(r.note), state: r.state });
 
+/** Why a direct run failed, as the core words it; `{x}` parts carry names and addresses. */
+const DIRECT_REASONS = [
+  'агент OpenSSH не запущен', 'в агенте OpenSSH нет ключей', 'сервер-источник не разрешает проброс агента',
+  'на сервере-источнике нельзя запускать команды', 'на сервере-источнике не создаётся временный файл', 'rsync не запустился',
+  'имя пользователя {u} не подходит для ssh', 'адрес {h} не подходит для ssh', 'ключ хоста {c} не сохранён в known_hosts',
+  'второе подключение к серверу-источнику не открылось: {e}', 'на {c} нельзя запускать команды', 'нет rsync на {c}',
+  '{c} не ответил на проверку rsync', 'ключ хоста {t} не совпал с сохранённым', 'ключ из агента не принят на {t} для {u}',
+  'сервер-источник не видит {t}', 'на {t} кончилось место',
+].map(s => {
+  const names = [...s.matchAll(/\{(\w+)\}/g)].map(m => m[1]);
+  const re = new RegExp(`^${s.replace(/[.*+?^$()|[\]\\]/g, '\\$&').replace(/\{\w+\}/g, '(.+?)')}$`);
+  return { s, names, re };
+});
+/** Known reasons in the UI's language; tool output (rsync, ssh) stays as it is. */
+function directReason(r: string): string {
+  for (const { s, names, re } of DIRECT_REASONS) {
+    const m = re.exec(r);
+    if (m) return tr(s, Object.fromEntries(names.map((n, i) => [n, m[i + 1]])));
+  }
+  return r;
+}
+
 /** Words for the core's error codes; the table of spec section 5 where it has one. */
 function words(e: CoreError): [string, string] {
   switch (e.code) {
@@ -72,6 +94,8 @@ function words(e: CoreError): [string, string] {
     case 'SERVER_CHANGED': return [tr('Файл на сервере изменился: {p}', { p: e.path }), tr('Правка не загружена: решите, чья версия важнее.')];
     case 'EDIT_WAITS': return [tr('Правка ждёт: {p}', { p: e.path }), tr('Загрузка в этот файл стоит на паузе в очереди; правка уйдёт после неё.')];
     case 'NOT_REGULAR': return [tr('Не обычный файл: {p}', { p: e.path }), tr('Каналы, сокеты и устройства не передаются.')];
+    // The core's reason is a lowercase note, as in the log.
+    case 'DIRECT_FAILED': return [tr('Напрямую не получилось'), directReason(e.reason ?? '').replace(/^./, c => c.toUpperCase())];
     default:
       if (e.code.startsWith('IMPORT_')) return [importWords(e as ImportFail).title, ''];
       return [tr('Ошибка SSH'), e.reason ?? ''];
@@ -100,7 +124,7 @@ type CoreItem = Omit<TransferItem, 'err'> & { err: CoreError | null };
 const item = (i: CoreItem): TransferItem => {
   const [title, text] = i.err ? words(i.err) : ['', ''];
   const twin = i.err?.code === 'NAME_CLASH' && i.err.path === i.name;
-  return { ...i, err: text ? `${title}. ${text}` : title, twin };
+  return { ...i, err: text ? `${title}. ${text}` : title, twin, code: i.err?.code as ErrCode | undefined };
 };
 
 export class TauriBackend extends MockBackend {
@@ -253,6 +277,8 @@ export class TauriBackend extends MockBackend {
   override transferClearDone() { void invoke('transfer_clear_done'); }
   override transferSetParallel(n: number) { void invoke('transfer_set_parallel', { n }); }
   override transferKeepTime(keep: boolean) { void invoke('transfer_keep_time', { keep }); }
+  override transferDirect(on: boolean) { void invoke('transfer_direct', { on }); }
+  override transferRelay(ids: number[]) { void invoke('transfer_relay', { ids }); }
   override transferDetach(server: ServerId, user: string | undefined, cancel: boolean) {
     return call<void>('transfer_detach', { server, user: user ?? null, cancel });
   }

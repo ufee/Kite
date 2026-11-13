@@ -49,7 +49,7 @@ export type ErrCode =
   | 'ENOENT' | 'ENOTDIR' | 'EACCES' | 'EEXIST' | 'EINVAL' | 'BAD_PATH' | 'NO_EXEC'
   | 'TIMEOUT' | 'NET' | 'DROPPED' |'AUTH_KEY' | 'AUTH_PASS' | 'NO_SECRET' | 'AUTH_MULTI' | 'AUTH_METHODS' | 'HOSTKEY_REJECTED' | 'HOSTKEY_CHANGED'
   | 'KEY_FILE' | 'NO_PUBKEY' | 'KEY_CHECK' | 'PASSPHRASE' | 'KEYCHAIN' | 'SSH' | 'CANCELLED' | 'DISCONNECTED'
-  | 'SERVER_GONE' | 'BAD_NAME' | 'NAME_CLASH' | 'SOURCE_CHANGED' | 'SERVER_CHANGED' | 'EDIT_WAITS' | 'NOT_REGULAR'
+  | 'SERVER_GONE' | 'BAD_NAME' | 'NAME_CLASH' | 'SOURCE_CHANGED' | 'SERVER_CHANGED' | 'EDIT_WAITS' | 'NOT_REGULAR' | 'DIRECT_FAILED'
   | 'IMPORT_BIG' | 'IMPORT_JSON' | 'IMPORT_VERSION' | 'IMPORT_NO_GROUPS' | 'IMPORT_CODE' | 'IMPORT_HOST' | 'IMPORT_PORT'
   | 'IMPORT_USER' | 'IMPORT_KEY' | 'IMPORT_DUP'
   /** The operation arrives in a later stage. */
@@ -139,6 +139,12 @@ export interface TransferItem {
   denied?: boolean;
   /** The second of two picks that are one name on the target: a retry would land on the first */
   twin?: boolean;
+  /** The error's code, for the actions it offers */
+  code?: ErrCode;
+  /** Server to server, the last run went directly (copied between the servers, not through this PC) */
+  direct?: boolean;
+  /** The user chose to send it through Kite after a direct run failed */
+  relay?: boolean;
 }
 
 export interface BatchReport {
@@ -241,6 +247,10 @@ export interface Backend {
   transferClearDone(): void;
   transferSetParallel(n: number): void;
   transferKeepTime(keep: boolean): void;
+  /** "Copy directly between servers": items started from now on take the direct route. */
+  transferDirect(on: boolean): void;
+  /** After a failed direct run: these items go through Kite. */
+  transferRelay(ids: number[]): void;
   /** Before a server (or one of its users) is disconnected or deleted: its unfinished transfers pause or go. */
   transferDetach(server: ServerId, user: string | undefined, cancel: boolean): Promise<void>;
 

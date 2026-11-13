@@ -45,7 +45,12 @@ pub enum Error {
     #[serde(rename = "ENOTDIR")]
     Enotdir { path: String },
     #[serde(rename = "EACCES")]
-    Eacces { path: String },
+    Eacces {
+        path: String,
+        /// Known to be the source's: retrying as root on the target cannot help.
+        #[serde(skip)]
+        source: bool,
+    },
     #[serde(rename = "EEXIST")]
     Eexist { path: String },
     /// The server runs no commands (`ForceCommand internal-sftp`): no chown there.
@@ -68,6 +73,9 @@ pub enum Error {
     EditWaits { path: String },
     /// A FIFO, socket or device: never transferred.
     NotRegular { path: String },
+    /// A direct server-to-server copy could not run (no agent, no rsync, the target refused the
+    /// key or is out of the source's reach); the queue asks to send it through Kite instead.
+    DirectFailed { reason: String },
     /// A transfer was paused or cancelled; never reaches the UI.
     Stopped,
 }
@@ -127,7 +135,7 @@ impl std::fmt::Display for Error {
             Self::ServerChanged { .. } => f.write_str("файл на сервере изменился, правка не загружена"),
             Self::EditWaits { .. } => f.write_str("правка ждёт загрузку на паузе"),
             Self::NotRegular { .. } => f.write_str("не обычный файл, пропущен"),
-            Self::Net { reason, .. } | Self::Ssh { reason } | Self::Keychain { reason } | Self::Einval { reason } => {
+            Self::Net { reason, .. } | Self::Ssh { reason } | Self::Keychain { reason } | Self::Einval { reason } | Self::DirectFailed { reason } => {
                 f.write_str(reason)
             }
             Self::KeyFile { path, reason } => write!(f, "{path}: {reason}"),
@@ -135,7 +143,7 @@ impl std::fmt::Display for Error {
             Self::AuthMethods { methods } => write!(f, "methods: {methods}"),
             Self::Enoent { path } => write!(f, "ENOENT {path}"),
             Self::Enotdir { path } => write!(f, "ENOTDIR {path}"),
-            Self::Eacces { path } => write!(f, "EACCES {path}"),
+            Self::Eacces { path, .. } => write!(f, "EACCES {path}"),
             Self::Eexist { path } => write!(f, "EEXIST {path}"),
             e => write!(f, "{}", serde_json::to_value(e).ok().and_then(|v| v["code"].as_str().map(str::to_owned)).unwrap_or_default()),
         }

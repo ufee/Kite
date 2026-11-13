@@ -15,7 +15,7 @@ use russh_sftp::{
     protocol::{File, FileAttributes, OpenFlags, StatusCode},
 };
 
-use super::{Entry, MAX_TEXT, TextFile, join, normalize, perm_text, sh_quote, valid_account};
+use super::{Entry, MAX_TEXT, TextFile, join, login_len, login_line, normalize, perm_text, sh_quote, valid_account};
 use crate::{
     error::{Error, Result},
     ssh::{Session, sftp::fs_error},
@@ -322,7 +322,7 @@ pub async fn delete(s: &Session, path: &str) -> Result<usize> {
 async fn exec(s: &Session, cmd: &str) -> Result<std::result::Result<(), String>> {
     const MARK: &str = "kite-ok";
     let mut ch = s.handle.channel_open_session().await?;
-    ch.exec(true, format!("{cmd} && echo {MARK}")).await?;
+    ch.exec(true, login_line(&format!("{cmd} && echo {MARK}"))).await?;
     ch.eof().await?;
     let (mut out, mut err) = (Vec::new(), Vec::new());
     while let Some(m) = ch.wait().await {
@@ -348,7 +348,8 @@ async fn exec(s: &Session, cmd: &str) -> Result<std::result::Result<(), String>>
     }
 }
 
-/// Command lines stay well under the SSH packet limit (256 KB on OpenSSH).
+/// Command lines, as the login shell gets them (escaped), stay well under the SSH packet limit
+/// (256 KB on OpenSSH) and Linux's limit on one argument (128 KB).
 const CMD_MAX: usize = 64 * 1024;
 
 /// `chown` over the paths, in as many commands as the line length needs.
@@ -356,13 +357,13 @@ async fn chown(s: &Session, paths: &[String], spec: &str, recursive: bool) -> Re
     // `env` works from any login shell; `LC_ALL=C` keeps the error text we read in English.
     let head = format!("env LC_ALL=C chown {}-- {}", if recursive { "-R " } else { "" }, sh_quote(spec));
     let mut batch: Vec<&String> = Vec::new();
-    let mut len = head.len();
+    let mut len = login_len(&head);
     for (k, p) in paths.iter().enumerate() {
-        let q = sh_quote(p).len() + 1;
+        let q = login_len(&sh_quote(p)) + 1;
         if !batch.is_empty() && len + q > CMD_MAX {
             chown_run(s, &head, &batch).await?;
             batch.clear();
-            len = head.len();
+            len = login_len(&head);
         }
         batch.push(p);
         len += q;
@@ -396,7 +397,7 @@ async fn chown_run(s: &Session, head: &str, paths: &[&String]) -> Result<()> {
         Ok(()) => Ok(()),
         Err(text) if text.contains("Operation not permitted") || text.contains("Permission denied") => {
             let path = denied_path(&text).or_else(|| paths.first().map(|p| p.to_string())).unwrap_or_default();
-            Err(Error::Eacces { path })
+            Err(Error::Eacces { path, source: false })
         }
         Err(text) => Err(Error::Einval { reason: text.lines().next().unwrap_or_default().to_owned() }),
     }

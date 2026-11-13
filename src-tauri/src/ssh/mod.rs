@@ -5,6 +5,7 @@
 //! run at once, because the provider cuts bursts of connections and the app starts many servers.
 //! A dropped session reconnects with pauses of 1, 3, 10 and 30 s, then reports the error.
 
+pub mod agent_fwd;
 pub mod auth;
 pub mod keys;
 pub mod known_hosts;
@@ -183,6 +184,8 @@ struct Shake {
     waited: AtomicBool,
     first_kex: AtomicBool,
     dropped: watch::Sender<bool>,
+    /// Direct copies that want the agent on this connection.
+    fwd: agent_fwd::Forwards,
 }
 
 pub struct Client {
@@ -222,6 +225,17 @@ impl client::Handler for Client {
         Ok(())
     }
 
+    /// Refused unless a direct copy runs on this connection; then filtered (see `agent_fwd`).
+    async fn server_channel_open_agent_forward(
+        &mut self,
+        channel: russh::Channel<client::Msg>,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> std::result::Result<(), Self::Error> {
+        agent_fwd::on_open(&self.shake.fwd, channel, reply).await;
+        Ok(())
+    }
+
     async fn disconnected(&mut self, reason: client::DisconnectReason<Self::Error>) -> std::result::Result<(), Self::Error> {
         let _ = self.shake.dropped.send(true);
         match reason {
@@ -250,11 +264,17 @@ struct Shaken {
     seen: HostSeen,
     /// Turns true when the connection drops.
     dropped: watch::Receiver<bool>,
+    fwd: agent_fwd::Forwards,
 }
 
 /// A live connection after login with its SFTP channel.
 pub struct Session {
     pub handle: Handle<Client>,
+    /// Address as the saved server had it at connect time: a direct copy dials it from another server.
+    pub host: String,
+    pub port: u16,
+    /// Agent channels are let through while one of these is held.
+    pub fwd: agent_fwd::Forwards,
     pub sftp: RawSftpSession,
     pub home: String,
     /// The server's code at connect time: the log's source column.
@@ -347,6 +367,11 @@ impl Ssh {
 
     fn known_path(&self) -> PathBuf {
         keys::ssh_dir().join("known_hosts")
+    }
+
+    /// Keys on record for a host: a direct copy hands them to the other server to check this one.
+    pub async fn known_keys(&self, host: &str, port: u16) -> Vec<PublicKey> {
+        known_hosts::host_keys(&self.known_text().await, host, port)
     }
 
     pub async fn hostkey_known(&self, host: &str, port: u16) -> Option<String> {
@@ -506,6 +531,7 @@ impl Ssh {
             waited: AtomicBool::new(false),
             first_kex: AtomicBool::new(true),
             dropped,
+            fwd: agent_fwd::Forwards::default(),
         });
         let connected = client::connect_stream(config, stream, Client { shake: shake.clone() }).await;
         let seen = shake.seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -529,13 +555,13 @@ impl Ssh {
         let dropped = shake.dropped.subscribe();
         // Report mode never sends a password to a host it could not verify.
         if let (HostSeen::Unverified(_), Method::Password(_)) = (&seen, method) {
-            return Ok(Shaken { handle, seen, dropped });
+            return Ok(Shaken { handle, seen, dropped, fwd: shake.fwd.clone() });
         }
         let who = auth::Who { permit: Some(&shake.permit), waited: Some(&shake.waited), ..t.who() };
         let res = auth::login(self, &mut handle, &who, method).await;
         drop(shake.permit.lock().await.take());
         match res {
-            Ok(()) => Ok(Shaken { handle, seen, dropped }),
+            Ok(()) => Ok(Shaken { handle, seen, dropped, fwd: shake.fwd.clone() }),
             Err(e) => {
                 // A passphrase dialog took longer than LoginGraceTime: the key is open now,
                 // try once more. A password is never sent twice. `is_closed` covers the moment
@@ -552,7 +578,7 @@ impl Ssh {
     }
 
     async fn open_session(self: &Arc<Self>, t: &Target, method: &Method, mode: HostMode) -> Result<(Arc<Session>, watch::Receiver<bool>)> {
-        let Shaken { handle, dropped, .. } = self.handshake(t, method, mode).await?;
+        let Shaken { handle, dropped, fwd, .. } = self.handshake(t, method, mode).await?;
         let (sftp, version, home, posix_rename) = match sftp::open(&handle).await {
             Ok(v) => v,
             Err(e) => {
@@ -562,7 +588,8 @@ impl Ssh {
             }
         };
         self.log.ok(&t.code, "SFTP", msg!("Подсистема запущена, протокол v{v}", v = version));
-        Ok((Arc::new(Session { handle, sftp, home, code: t.code.clone(), posix_rename, closing: AtomicBool::new(false) }), dropped))
+        let s = Session { handle, host: t.host.clone(), port: t.port, fwd, sftp, home, code: t.code.clone(), posix_rename, closing: AtomicBool::new(false) };
+        Ok((Arc::new(s), dropped))
     }
 
     /* ----- saved servers ----- */

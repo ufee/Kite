@@ -10,6 +10,7 @@
 //! does an item that keeps losing the connection right after getting it back.
 
 pub mod conn;
+mod direct;
 mod io;
 mod job;
 
@@ -136,6 +137,12 @@ pub struct Item {
     /// else there right before the rename means someone changed it meanwhile (`SERVER_CHANGED`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expect: Option<Stamp>,
+    /// Server to server, the last run went directly (the route the queue shows).
+    #[serde(default)]
+    pub direct: bool,
+    /// The user chose to send it through Kite after a direct run failed.
+    #[serde(default)]
+    pub relay: bool,
 }
 
 /// Size in bytes and date in seconds of a file.
@@ -177,6 +184,16 @@ pub struct Resume {
     /// Folders of the item this transfer made (`""` is its root): only they get the source's mode.
     #[serde(default)]
     pub made: BTreeSet<String>,
+    /// A direct run started: rsync may have left its part folders on the target.
+    #[serde(default)]
+    pub direct: bool,
+}
+
+impl Resume {
+    /// Something on the target to delete when the item goes without finishing.
+    fn left(&self) -> bool {
+        !self.parts.is_empty() || self.direct
+    }
 }
 
 #[derive(Default)]
@@ -238,6 +255,8 @@ struct Inner {
     next_batch: u64,
     parallel: usize,
     keep_time: bool,
+    /// "Copy directly between servers".
+    direct: bool,
     reported: HashSet<u64>,
     /// Cancelled and cleared items until their parts are deleted, after their job if it still runs.
     /// Their target does not start again meanwhile.
@@ -324,7 +343,7 @@ impl Transfers {
             log,
             store,
             me: me.clone(),
-            inner: Mutex::new(Inner { recs, next_id, next_batch, parallel: 3, keep_time: true, reported, gone: Vec::new(), dirty: false, quiet: HashSet::new() }),
+            inner: Mutex::new(Inner { recs, next_id, next_batch, parallel: 3, keep_time: true, direct: false, reported, gone: Vec::new(), dirty: false, quiet: HashSet::new() }),
             kick: Notify::new(),
             settled: Notify::new(),
             resend: AtomicBool::new(false),
@@ -488,6 +507,8 @@ impl Transfers {
                 denied: false,
                 keep,
                 expect,
+                direct: false,
+                relay: false,
                 name: p.name,
             };
             g.recs.push(Rec::new(item, Resume::default()));
@@ -570,7 +591,7 @@ impl Transfers {
             let row = rec.row.take().filter(|_| rec.item.state.active());
             let live = rec.live.clone();
             // A running job keeps reporting its parts here until it stops; `finish` sweeps them then.
-            let sweep = live.is_none() && rec.item.state != St::Done && !rec.resume.parts.is_empty();
+            let sweep = live.is_none() && rec.item.state != St::Done && rec.resume.left();
             if live.is_some() || sweep {
                 g.gone.push(rec);
             }
@@ -629,7 +650,7 @@ impl Transfers {
             let mut g = self.inner();
             let (keep, out): (Vec<Rec>, Vec<Rec>) = std::mem::take(&mut g.recs).into_iter().partition(|r| r.item.state.active());
             g.recs = keep;
-            let dirty: Vec<Rec> = out.into_iter().filter(|r| r.item.state == St::Err && !r.resume.parts.is_empty()).collect();
+            let dirty: Vec<Rec> = out.into_iter().filter(|r| r.item.state == St::Err && r.resume.left()).collect();
             let ids = dirty.iter().map(|r| r.item.id).collect();
             g.gone.extend(dirty);
             ids
@@ -647,6 +668,34 @@ impl Transfers {
 
     pub fn set_keep_time(&self, on: bool) {
         self.inner().keep_time = on;
+    }
+
+    /// Server-to-server items started from now on go directly; running ones keep their route.
+    pub fn set_direct(&self, on: bool) {
+        self.inner().direct = on;
+    }
+
+    /// The user's answer to a failed direct run: these items go through Kite. Failed ones start again,
+    /// waiting ones simply take that route, running ones take it if their direct run fails too. The
+    /// parts a direct run left go when the item next starts (`attempt`).
+    pub fn relay(&self, ids: &[u64]) {
+        let mut again = Vec::new();
+        {
+            let mut g = self.inner();
+            for r in g.recs.iter_mut().filter(|r| ids.contains(&r.item.id) && r.item.state != St::Done) {
+                if r.item.from.is_local() || r.item.to.is_local() {
+                    continue;
+                }
+                r.item.relay = true;
+                if r.item.state == St::Err {
+                    again.push(r.item.id);
+                }
+            }
+            g.dirty = true;
+        }
+        for id in again {
+            self.retry(id, false);
+        }
     }
 
     /// Disconnecting or deleting a server: its transfers pause or go, then its connections close.
@@ -761,6 +810,17 @@ impl Transfers {
                 break Err(Error::Stopped);
             };
             let res = self.attempt(id, &item, &resume, &live.prog, &stop, keep_time).await;
+            // The user chose Kite while this direct run was going: no second question, the relay. The
+            // direct row ends with its reason; the relay opens its own.
+            if let Err(e @ Error::DirectFailed { .. }) = &res
+                && !item.relay
+                && self.with(id, |r| r.item.relay) == Some(true)
+            {
+                if let Some(Some(row)) = self.with(id, |r| r.row.take()) {
+                    self.log.done(row, e.to_string(), Row::Err);
+                }
+                continue;
+            }
             if !matches!(res, Err(Error::Disconnected)) {
                 break res;
             }
@@ -817,12 +877,40 @@ impl Transfers {
             _ = io::stopped(&mut s) => return Err(Error::Stopped),
             sides = async { Ok::<_, Error>((self.side(&item.from).await?, self.side(&item.to).await?)) } => sides?,
         };
-        self.open_row(id, item, &from, &to);
+        // Between two servers goes directly when the setting is on, unless the user chose Kite for it.
+        // Within one server the relay stays: a move there is a rename. A relay that began stays the
+        // relay: its folders are 0700 until it sets their modes at its end.
+        let relay_began = !resume.direct && (!resume.parts.is_empty() || resume.files > 0 || !resume.made.is_empty());
+        let direct = !from.is_local()
+            && !to.is_local()
+            && item.from.src != item.to.src
+            && !item.relay
+            && !item.is_edit()
+            && !relay_began
+            && self.inner().direct;
+        if self.with(id, |r| std::mem::replace(&mut r.item.direct, direct)) != Some(direct) {
+            self.changed();
+        }
+        // Kite takes over after a direct run: rsync's part folders on the target go first.
+        let fresh;
+        let resume = if direct || !resume.direct {
+            resume
+        } else {
+            let left = Resume { direct: true, ..Resume::default() };
+            let _ = tokio::time::timeout(CLEAN_WAIT, self.clean(item, &left)).await;
+            fresh = Resume { direct: false, ..resume.clone() };
+            self.with(id, |r| r.resume = fresh.clone());
+            self.inner().dirty = true;
+            &fresh
+        };
+        self.open_row(id, item, &from, &to, direct);
         let run = job::Run { q: self, id, item, resume, stop, prog, keep_time };
         // Copies stop by themselves and close their handles; a long walk or a hung request gets a
         // moment to do so, then is dropped.
         let mut s = stop.clone();
-        let go = run.go(&from, &to);
+        let go = async {
+            if direct { run.direct(&from, &to).await } else { run.go(&from, &to).await }
+        };
         tokio::pin!(go);
         let lost = async {
             let conns: Vec<_> = [&from, &to].into_iter().filter_map(|s| s.conn()).collect();
@@ -842,8 +930,10 @@ impl Transfers {
         if matches!(res, Err(Error::Disconnected)) {
             let conns: Vec<_> = [&from, &to].into_iter().filter_map(|s| s.conn().cloned()).collect();
             let closed: Vec<_> = conns.iter().filter(|c| c.is_closed()).collect();
-            // A dead channel under a live connection: take down what we cannot tell apart.
-            for c in if closed.is_empty() { conns.iter().collect() } else { closed } {
+            // A dead channel under a live connection: take down what we cannot tell apart. A direct
+            // run loses its own connection, not these.
+            let suspects = if !closed.is_empty() { closed } else if direct { Vec::new() } else { conns.iter().collect() };
+            for c in suspects {
                 self.pool.lost(c).await;
             }
         }
@@ -882,7 +972,7 @@ impl Transfers {
                             }
                         }
                         Err(e) => {
-                            r.item.denied = matches!(&e, Error::Eacces { path } if !r.item.to.is_local() && r.item.to.user != "root" && path.starts_with(r.item.to.path.trim_end_matches('/')));
+                            r.item.denied = matches!(&e, Error::Eacces { path, source: false } if !r.item.to.is_local() && r.item.to.user != "root" && path.starts_with(r.item.to.path.trim_end_matches('/')));
                             if let Some(row) = r.row.take() {
                                 self.log.done(row, e.to_string(), Row::Err);
                             }
@@ -918,12 +1008,14 @@ impl Transfers {
 
     /* ---------- bookkeeping from the job ---------- */
 
-    fn open_row(&self, id: u64, item: &Item, from: &Side, to: &Side) {
+    fn open_row(&self, id: u64, item: &Item, from: &Side, to: &Side, direct: bool) {
         let code = |s: &Side| s.conn().map(|c| c.session.code.clone());
         let (op, src) = match (from.is_local(), to.is_local()) {
             (true, true) => ("COPY", LOCAL.to_owned()),
             (true, false) => ("PUT", code(to).unwrap_or_default()),
             (false, true) => ("GET", code(from).unwrap_or_default()),
+            // The direct copy runs on the source: its row is the source's.
+            (false, false) if direct => ("DIRECT", code(from).unwrap_or_default()),
             (false, false) => ("RELAY", code(to).unwrap_or_default()),
         };
         let text = format!("{} · {} → {}", item.tname, item.from.path, item.to.path);
@@ -946,6 +1038,17 @@ impl Transfers {
         let src = side.conn().map(|c| c.session.code.clone()).unwrap_or_else(|| LOCAL.to_owned());
         let tag = if side.is_local() { "FS" } else { "SFTP" };
         self.log.add(&src, tag, path.to_owned(), note, state);
+    }
+
+    fn size_of(&self, id: u64) -> Option<u64> {
+        self.with(id, |r| r.item.size)
+    }
+
+    /// A direct run is about to start the copy on the source: its parts need a sweep from now on.
+    fn direct_started(&self, id: u64, tool: &'static str) {
+        self.with(id, |r| r.resume.direct = true);
+        self.inner().dirty = true;
+        self.log_note(id, tool);
     }
 
     fn set_size(&self, id: u64, size: u64) {
@@ -987,12 +1090,10 @@ impl Transfers {
 
     /// Deletes the parts of an item in `gone`, then lets go of it: its target may start again.
     async fn sweep(&self, id: u64) {
-        let parts = self.inner().gone.iter().find(|r| r.item.id == id).map(|r| (r.item.to.clone(), r.item.tname.clone(), r.resume.parts.keys().cloned().collect::<Vec<_>>()));
-        if let Some((to, tname, parts)) = parts
-            && !parts.is_empty()
-        {
+        let parts = self.inner().gone.iter().find(|r| r.item.id == id).filter(|r| r.resume.left()).map(|r| (r.item.clone(), r.resume.clone()));
+        if let Some((item, resume)) = parts {
             // A server that is gone keeps its parts; the queue must not wait on it forever.
-            let _ = tokio::time::timeout(CLEAN_WAIT, self.clean(&to, &tname, parts)).await;
+            let _ = tokio::time::timeout(CLEAN_WAIT, self.clean(&item, &resume)).await;
         }
         self.inner().gone.retain(|r| r.item.id != id);
         self.settled.notify_waiters();
@@ -1005,13 +1106,18 @@ impl Transfers {
         }
     }
 
-    async fn clean(&self, to: &End, tname: &str, parts: Vec<String>) {
-        let Ok(side) = self.side(to).await else { return };
-        let root = side.join(&to.path, tname);
-        for rel in parts {
-            let target = side.join(&root, &rel);
+    async fn clean(&self, item: &Item, resume: &Resume) {
+        let Ok(side) = self.side(&item.to).await else { return };
+        let root = side.join(&item.to.path, &item.tname);
+        for rel in resume.parts.keys() {
+            let target = side.join(&root, rel);
             let _ = side.remove(&side.part_of(&target)).await;
             side.restore_old(&target).await;
+        }
+        if resume.direct
+            && let Some(c) = side.conn()
+        {
+            direct::clean(&c.session, &root, &item.tname, item.dir).await;
         }
     }
 
@@ -1196,6 +1302,8 @@ mod tests {
             denied: false,
             keep: None,
             expect: None,
+            direct: false,
+            relay: false,
         };
         assert_eq!(item.writes(&end("local", "c:\\x"), "README.md"), cfg!(windows));
         assert!(!item.writes(&end("s1", "C:\\X"), "Readme.md"));
@@ -1221,6 +1329,8 @@ mod tests {
             denied: false,
             keep: Some(Keep { mode: 0o600, uid: 0, gid: 0 }),
             expect: Some((12, 1_700_000_000)),
+            direct: true,
+            relay: true,
         };
         let mut resume = Resume { files: 3, ..Default::default() };
         resume.parts.insert("b/c".into(), (100, 1_700_000_000));

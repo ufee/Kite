@@ -121,6 +121,8 @@ pub fn run() {
             ipc::transfer::transfer_clear_done,
             ipc::transfer::transfer_set_parallel,
             ipc::transfer::transfer_keep_time,
+            ipc::transfer::transfer_direct,
+            ipc::transfer::transfer_relay,
             ipc::transfer::transfer_detach,
             ipc::edit::edit_open,
             ipc::edit::edit_upload,

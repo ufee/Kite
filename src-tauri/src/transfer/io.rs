@@ -339,6 +339,15 @@ impl Side {
         l.conn.session.sftp.setstat(path, a).await.map(|_| ()).map_err(|e| fs_error(e, path))
     }
 
+    /// Sets a remote file's date (access and change alike).
+    pub async fn set_mtime(&self, path: &str, t: u64) -> Result<()> {
+        let Side::Remote(l) = self else { return Ok(()) };
+        let mut a = FileAttributes::empty();
+        a.atime = Some(t as u32);
+        a.mtime = Some(t as u32);
+        l.conn.session.sftp.setstat(path, a).await.map(|_| ()).map_err(|e| fs_error(e, path))
+    }
+
     /// The file an edit replaced comes back as it was: its owner first (chown drops setuid), then its
     /// mode. The owner is sent only when it differs: a user may set his own file's mode, not its owner.
     pub async fn restore(&self, path: &str, k: &super::Keep) -> Result<()> {

@@ -3,7 +3,7 @@ import type { TransferItem } from '../backend';
 import { tr } from '../i18n';
 import { fmtSize, fmtSpeed } from '../util/format';
 import { ui } from '../state/prefs';
-import { active, cancelQ, clearDone, qPct, queue, retryQ, routeLabel, togglePause } from '../state/queue';
+import { active, cancelQ, clearDone, qPct, queue, relayQ, retryQ, routeLabel, togglePause } from '../state/queue';
 import { WIN_EDGES, winDrag, winRaise, winResize, winStyle } from '../state/layout';
 import Icon from './Icon.vue';
 
@@ -34,6 +34,7 @@ function progress(q: TransferItem) {
           <button v-if="live(q) && q.state !== 'count'" class="ibtn" :title="tr(q.state === 'pause' ? 'Продолжить' : 'Пауза')" @click="togglePause(q)"><Icon :n="q.state === 'pause' ? 'play' : 'pause'" s="s" /></button>
           <button v-if="q.state === 'err' && !q.twin" class="textbtn" @click="retryQ(q)">{{ tr('Повторить') }}</button>
           <button v-if="q.state === 'err' && q.denied" class="textbtn" @click="retryQ(q, true)">{{ tr('От root') }}</button>
+          <button v-if="q.state === 'err' && q.code === 'DIRECT_FAILED'" class="textbtn" @click="relayQ(q)">{{ tr('Через Kite') }}</button>
           <button class="ibtn" :title="tr(q.state === 'done' ? 'Убрать из списка' : 'Отменить')" @click="cancelQ(q)"><Icon n="x" s="s" /></button>
         </div>
         <div v-if="q.state === 'err'" style="color:var(--bad);font-size:12px;line-height:16px">{{ q.err }}</div>

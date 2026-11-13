@@ -42,7 +42,7 @@ fn same_place(it: &Item) -> bool {
 }
 
 impl Run<'_> {
-    fn done(&self) -> &std::sync::atomic::AtomicU64 {
+    pub(super) fn done(&self) -> &std::sync::atomic::AtomicU64 {
         &self.prog.done
     }
 
@@ -400,7 +400,7 @@ async fn mkdir<'a>(to: &Side, path: String, rel: &'a str, private: bool) -> (&'a
 
 /// A move deletes its source only while it is still what was sent: a file written to meanwhile
 /// stays, and the item ends with an error.
-async fn unchanged(from: &Side, src: &str, meta: &Meta, own: bool) -> Result<()> {
+pub(super) async fn unchanged(from: &Side, src: &str, meta: &Meta, own: bool) -> Result<()> {
     let now = if own { from.lstat(src).await? } else { from.stat(src).await? };
     match now {
         Some(m) if m.size == meta.size && m.mtime == meta.mtime => Ok(()),
