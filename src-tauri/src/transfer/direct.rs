@@ -517,8 +517,12 @@ pub async fn clean(s: &Session, root: &str, name: &str, dir: bool) {
         format!("rm -f -- {} 2>/dev/null; rmdir -- {} 2>/dev/null", sh_quote(&format!("{pd}/{name}")), sh_quote(&pd))
     };
     // A receiver that is still dying moves its temporary file into the part folder only when it hears
-    // of the end: while an rsync of this user still runs there, a second pass takes what it put there.
-    let cmd = format!("{rm}; if pgrep -u \"$(id -u)\" -x rsync >/dev/null 2>&1; then sleep 2; {rm}; fi; echo kite-probe");
+    // of the end: if an rsync of this user ran there before the first pass (or there is no pgrep to
+    // tell), a second pass takes what it put there.
+    let cmd = format!(
+        "a=1; command -v pgrep >/dev/null 2>&1 && {{ pgrep -u \"$(id -u)\" -x rsync >/dev/null 2>&1 || a=; }}; \
+         {rm}; if [ -n \"$a\" ]; then sleep 2; {rm}; fi; echo kite-probe"
+    );
     let _ = tokio::time::timeout(PROBE_WAIT, capture(&s.handle, &login_line(&cmd))).await;
 }
 

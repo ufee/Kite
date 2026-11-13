@@ -29,6 +29,7 @@ export const routeLabel = (q: TransferItem) => {
   const ext = q.from.src === 'ext', relay = !ext && !isLocal(q.from.src) && !isLocal(q.to.src);
   // Running or done: the route it took. Otherwise the one its next start takes: one server copies
   // within itself through Kite, and a relay that began (bytes done, not directly) stays the relay.
+  // A relay paused before its first byte reads as direct here; the core keeps it on the relay.
   const live = q.state === 'run' || q.state === 'count' || q.state === 'done';
   const next = settings.agentFwd && !q.relay && q.from.src !== q.to.src && (q.done === 0 || !!q.direct);
   const direct = relay && (live ? !!q.direct : next);
