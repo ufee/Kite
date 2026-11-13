@@ -283,6 +283,8 @@ export interface Backend {
   /** The terminal is behind on output: the core stops reading until it catches up. */
   ptyPause(id: number, paused: boolean): void;
   ptyClose(id: number): void;
+  /** Starts a local shell ahead of the first local tab in `cwd`; that tab takes it with the prompt ready. */
+  ptyPrewarm(cwd: string, shell: string): void;
 
   // State the core already holds (after a UI reload), fetched once after subscribing
   sshSessions(): Promise<{ server: ServerId; user: string; state: SessionState }[]>;

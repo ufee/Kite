@@ -64,7 +64,12 @@ pub async fn pty_open(
             let row = log.run("local", "PTY", msg!("Запуск терминала · {u}", u = shell));
             let (shell, t) = (shell.clone(), terms.clone());
             let opened = tauri::async_runtime::spawn_blocking(move || {
-                term::open_local(&shell, &cwd, cols, rows, flow, sink(on_data), exit).map(|open| t.register(id, open))
+                let (dir, output) = (term::local_dir(&cwd), sink(on_data));
+                let open = match term::take_spare(&t, &shell, &dir, cols, rows, output.clone(), exit) {
+                    Ok(open) => Ok(open),
+                    Err(exit) => term::open_local(&shell, &dir, cols, rows, flow, output, exit),
+                };
+                open.map(|open| t.register(id, open))
             })
             .await
             .map_err(crate::error::Error::ssh)
@@ -92,6 +97,14 @@ pub async fn pty_open(
             Err(e)
         }
     }
+}
+
+/// Starts a local shell ahead of the first local tab (see `term::Spare`). No log row: nothing shows
+/// it until a tab takes it, and that tab logs its start as usual.
+#[tauri::command]
+pub async fn pty_prewarm(terms: TermsState<'_>, cwd: String, shell: String) -> Result<()> {
+    let terms = terms.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || term::open_spare(terms, &shell, &cwd)).await.map_err(crate::error::Error::ssh)?
 }
 
 fn state<T>(r: &Result<T>) -> crate::log::State {

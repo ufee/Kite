@@ -130,6 +130,7 @@ pub fn run() {
             ipc::term::pty_resize,
             ipc::term::pty_pause,
             ipc::term::pty_close,
+            ipc::term::pty_prewarm,
             ipc::transfer::transfer_enqueue,
             ipc::transfer::transfer_list,
             ipc::transfer::transfer_resync,
@@ -158,6 +159,9 @@ pub fn run() {
                 // The queue is saved at most every 2 s: what changed since must not be lost on closing.
                 if let Some(q) = app.try_state::<Arc<transfer::Transfers>>() {
                     q.save_now();
+                }
+                if let Some(t) = app.try_state::<Arc<term::Terms>>() {
+                    t.close_spare();
                 }
                 // Edit copies go, except those an unfinished upload still reads.
                 if let Some(e) = app.try_state::<Arc<edit::Edits>>() {

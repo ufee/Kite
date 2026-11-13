@@ -296,6 +296,15 @@ export function closeTerm(id: number) {
   if (ui.term) focusTerm();
   pruneHistory();
 }
+/**
+ * pwsh takes a few hundred ms to its first prompt: the core starts the shell the first local tab
+ * would get (the local pane's folder, as in `openTerm`), and that tab takes it ready.
+ */
+export function prewarmLocal() {
+  if (terms.some(t => isLocal(t.src))) return;
+  const p = panes.find(p => isLocal(p.src));
+  backend.ptyPrewarm(p && p.state === 'ok' ? p.path : '', settings.shell);
+}
 export function selectTerm(id: number) { ui.term = id; focusTerm(); }
 export function focusTerm() { nextTick(() => setTimeout(() => { const t = curTerm.value; if (t) views.get(t.id)?.xt.focus(); }, 30)); }
 export function newTermHere() { const p = panes[ui.focus]; openTerm(p.src, p.user, p.state === 'ok' ? p.path : undefined); }
