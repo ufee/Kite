@@ -1,11 +1,21 @@
 name: Release
 
 # A tag v<version> builds the Windows files and opens a draft GitHub Release with them.
-# A manual run builds the same files from any branch as an artifact, without a release.
+# A manual run, or a pull request touching the packaging, builds the same files as an artifact, without a release.
 on:
   push:
     tags: ['v*']
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - scripts/package.ps1
+      - scripts/third-party.mjs
+      - src-tauri/tauri.conf.json
   workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
