@@ -22,6 +22,10 @@ Both use the WebView2 runtime that ships with Windows 10 and 11. Passwords and k
 
 Until the builds are code-signed, SmartScreen may warn about an unknown publisher: choose **More info**, then **Run anyway**. `SHA256SUMS.txt` in each release lists the checksums of its files.
 
+## Documentation
+
+[User guide, shortcuts, settings, import format, architecture](docs/README.md).
+
 ## Stack
 
 - [Tauri 2](https://tauri.app) shell, Rust core (`src-tauri/`)
