@@ -220,11 +220,18 @@ impl Terms {
         }
     }
 
-    /// The spare shell, if it runs `shell` in `dir` and is still alive; any other spare is ended,
-    /// so a shell never waits for a folder the panes have left.
+    /// The spare shell, if it runs `shell`, can go to `dir` and is still alive; any other spare is
+    /// ended, so a shell never waits for a folder the panes have left.
     fn take_spare(&self, shell: &str, dir: &str) -> Option<(Open, Arc<Tap>)> {
         let spare = self.spare_slot().take()?;
-        if spare.shell == shell && spare.dir == dir && !spare.tap.exited() {
+        let fits = match &spare.dir {
+            Some(d) => d == dir,
+            None => true,
+        };
+        if spare.shell == shell && fits && !spare.tap.exited() {
+            if spare.dir.is_none() {
+                let _ = spare.open.handle.send(Command::Input(format!("{dir}\r").into_bytes()));
+            }
             Some((spare.open, spare.tap))
         } else {
             close(spare.open);
@@ -251,12 +258,13 @@ impl Terms {
 
 /* ---------- Spare local shell ---------- */
 
-/// pwsh needs a few hundred ms to print its first prompt. The UI asks for one local shell
-/// right after the window is shown, in the folder the first local tab would get; that tab takes
-/// it with the prompt already there. One spare at most, and only until a tab takes it.
+/// pwsh needs a few hundred ms to print its first prompt. The UI asks for one local shell once the
+/// start has settled; the first local tab takes it with the profile already loaded. One spare at
+/// most, and only until a tab takes it.
 struct Spare {
     shell: String,
-    dir: String,
+    /// The folder it started in; None when it waits for the tab's folder (`WAIT_DIR`).
+    dir: Option<String>,
     open: Open,
     tap: Arc<Tap>,
 }
@@ -348,7 +356,7 @@ impl Tap {
     }
 }
 
-/// A local tab takes the spare shell if it runs `shell` in `dir`: the open terminal to register,
+/// A local tab takes the spare shell if it runs `shell` and can go to `dir`: the open terminal to register,
 /// or `on_exit` back when there is none and the tab starts its own.
 pub fn take_spare(terms: &Terms, shell: &str, dir: &str, cols: u16, rows: u16, output: Output, on_exit: OnExit) -> std::result::Result<Open, OnExit> {
     let Some((open, tap)) = terms.take_spare(shell, dir) else { return Err(on_exit) };
@@ -375,10 +383,11 @@ pub fn open_spare(terms: Arc<Terms>, shell: &str, cwd: &str) -> Result<()> {
         None => t.spare_ended(&ended),
     });
     let dir = local_dir(cwd);
+    let wait = waits_for_dir(shell);
     // The tab resizes it on attach; until then the size only shapes the first prompt.
-    let open = open_local(shell, &dir, 120, 30, Arc::new(Flow::default()), output, on_exit)?;
+    let open = spawn_local(shell, &dir, wait, 120, 30, Arc::new(Flow::default()), output, on_exit)?;
     tap.set_input(open.handle.clone());
-    terms.set_spare(Spare { shell: shell.to_owned(), dir, open, tap });
+    terms.set_spare(Spare { shell: shell.to_owned(), dir: (!wait).then_some(dir), open, tap });
     Ok(())
 }
 
@@ -593,19 +602,29 @@ async fn wait_closed(session: &Session) -> bool {
 
 /* ---------- This PC ---------- */
 
+/// After its profile, a spare PowerShell reads the tab's folder from its input without echo and
+/// goes there; the first prompt comes after that. A script block keeps its variables out of the session.
+const WAIT_DIR: &str = "& { $d = ''; while (($k = [Console]::ReadKey($true)).Key -ne 'Enter') { $d += $k.KeyChar }; Set-Location -LiteralPath $d }";
+
+/// Shells that can start as a spare for any folder (`WAIT_DIR`); others start in the folder itself.
+fn waits_for_dir(shell: &str) -> bool {
+    cfg!(windows) && shell != "cmd"
+}
+
 /// Windows shells by the setting; elsewhere the setting is a path (from /etc/shells) or empty for `$SHELL`.
-fn shell_candidates(shell: &str) -> Vec<CommandBuilder> {
+fn shell_candidates(shell: &str, wait_dir: bool) -> Vec<CommandBuilder> {
     let with = |prog: &str, args: &[&str]| {
         let mut c = CommandBuilder::new(prog);
         c.args(args);
         c
     };
     if cfg!(windows) {
+        let ps: &[&str] = if wait_dir { &["-NoLogo", "-NoExit", "-Command", WAIT_DIR] } else { &["-NoLogo"] };
         match shell {
             "cmd" => vec![with("cmd.exe", &[])],
-            "powershell" => vec![with("powershell.exe", &["-NoLogo"])],
+            "powershell" => vec![with("powershell.exe", ps)],
             // pwsh is not installed everywhere: Windows PowerShell is always there.
-            _ => vec![with("pwsh.exe", &["-NoLogo"]), with("powershell.exe", &["-NoLogo"])],
+            _ => vec![with("pwsh.exe", ps), with("powershell.exe", ps)],
         }
     } else {
         let env = std::env::var("SHELL").ok().filter(|s| !s.is_empty());
@@ -620,6 +639,11 @@ fn shell_candidates(shell: &str) -> Vec<CommandBuilder> {
 }
 
 pub fn open_local(shell: &str, cwd: &str, cols: u16, rows: u16, flow: Arc<Flow>, output: Output, on_exit: OnExit) -> Result<Open> {
+    spawn_local(shell, cwd, false, cols, rows, flow, output, on_exit)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_local(shell: &str, cwd: &str, wait_dir: bool, cols: u16, rows: u16, flow: Arc<Flow>, output: Output, on_exit: OnExit) -> Result<Open> {
     let pty = native_pty_system()
         .openpty(PtySize { cols, rows, pixel_width: 0, pixel_height: 0 })
         .map_err(|e| Error::Einval { reason: e.to_string() })?;
@@ -627,7 +651,7 @@ pub fn open_local(shell: &str, cwd: &str, cols: u16, rows: u16, flow: Arc<Flow>,
     let dir = local_dir(cwd);
     let mut child = None;
     let mut last = String::new();
-    for mut command in shell_candidates(shell) {
+    for mut command in shell_candidates(shell, wait_dir) {
         command.cwd(&dir);
         command.env("TERM", "xterm-256color");
         command.env("COLORTERM", "truecolor");
@@ -739,6 +763,40 @@ mod tests {
         assert!(terms.spare_slot().is_none());
         let _ = open.handle.send(Command::Input(b"exit\r".to_vec()));
         assert_eq!(erx.recv_timeout(Duration::from_secs(5)).unwrap(), Exit::Exited);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn spare_powershell_goes_to_the_folder_of_the_tab() {
+        let terms = Arc::new(Terms::default());
+        let start = local_dir(&std::env::temp_dir().to_string_lossy());
+        let home = local_dir("");
+        assert_ne!(start, home);
+        open_spare(terms.clone(), "powershell", &start).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let (etx, erx) = std::sync::mpsc::channel();
+        let output: Output = Arc::new(move |b| {
+            let _ = tx.send(b);
+        });
+        let on_exit: OnExit = Box::new(move |r| {
+            let _ = etx.send(r);
+        });
+        let open = take_spare(&terms, "powershell", &home, 100, 30, output, on_exit).ok().expect("the spare is taken");
+        // The first prompt is in the tab's folder, and the folder was not echoed as typed text.
+        let mut seen = String::new();
+        let until = std::time::Instant::now() + Duration::from_secs(20);
+        while !seen.contains(&format!("PS {home}>")) {
+            let left = until.saturating_duration_since(std::time::Instant::now());
+            let chunk = rx.recv_timeout(left).unwrap_or_else(|_| panic!("no prompt in {home}: {seen:?}"));
+            // Taken this early, the cursor question reaches the tab: answer it as xterm does.
+            if chunk.windows(CURSOR_QUERY.len()).any(|w| w == CURSOR_QUERY) {
+                let _ = open.handle.send(Command::Input(CURSOR_HOME.to_vec()));
+            }
+            seen.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        assert_eq!(seen.matches(home.as_str()).count(), 1, "{seen:?}");
+        let _ = open.handle.send(Command::Input(b"exit\r".to_vec()));
+        assert_eq!(erx.recv_timeout(Duration::from_secs(10)).unwrap(), Exit::Exited);
     }
 
     #[test]

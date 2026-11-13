@@ -72,6 +72,7 @@ export async function initApp(session: SessionFile | null) {
     await initTerms(demo); // the demo terminals open next to the demo panes
   }
   startPersist();
-  // After the start settles: the shell must not compete with the first frames and the restored panes.
-  setTimeout(prewarmLocal, 1500);
+  // Well after the start and when the page is idle: a starting pwsh takes a core for about a second
+  // and must not compete with the first frames, the restored panes or the first clicks.
+  setTimeout(() => requestIdleCallback(prewarmLocal, { timeout: 2000 }), 4000);
 }
