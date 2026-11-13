@@ -123,13 +123,15 @@ pub async fn fs_list(ssh: SshState<'_>, log: LogState<'_>, src: Src, path: Strin
     let p = place(&ssh, src)?;
     let text = format!("{} {path}", if matches!(p, Place::Local) { "LIST" } else { "READDIR" });
     let work = async {
-        match &p {
+        let mut list = match &p {
             Place::Local => {
                 let path = path.clone();
                 blocking(move || local::list(&path)).await
             }
             Place::Server(s) => remote::list(s, &path).await,
-        }
+        }?;
+        crate::fs::presort(&mut list);
+        Ok(list)
     };
     logged(&log, &p, text, work, |l| objs(l.len())).await
 }
