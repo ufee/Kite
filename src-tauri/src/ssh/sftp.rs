@@ -22,7 +22,7 @@ pub fn fs_error(e: SftpError, path: &str) -> Error {
     match e {
         SftpError::Status(s) => match s.status_code {
             StatusCode::NoSuchFile => Error::Enoent { path: path.into() },
-            StatusCode::PermissionDenied => Error::Eacces { path: path.into() },
+            StatusCode::PermissionDenied => Error::Eacces { path: path.into(), source: false },
             StatusCode::Eof => Error::Einval { reason: "eof".into() },
             _ => Error::Einval { reason: format!("{path}: {}", s.error_message) },
         },

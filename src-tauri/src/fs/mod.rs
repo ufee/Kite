@@ -125,15 +125,24 @@ pub fn sh_quote(s: &str) -> String {
 /// octal escapes: the login shell sees no quote, backslash, `$`, `!` or newline of it.
 pub fn login_line(script: &str) -> String {
     use std::fmt::Write;
-    let mut enc = String::with_capacity(script.len() * 2);
+    let mut enc = String::with_capacity(login_len(script));
     for b in script.bytes() {
-        if b.is_ascii_alphanumeric() || b" _-./,:=@+".contains(&b) {
+        if login_safe(b) {
             enc.push(b as char);
         } else {
             let _ = write!(enc, "\\{b:03o}");
         }
     }
     format!("exec sh -c 'eval \"$(printf \"{enc}\")\"'")
+}
+
+fn login_safe(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b" _-./,:=@+".contains(&b)
+}
+
+/// Length of a piece of script once in [`login_line`]: an escaped byte takes four characters.
+pub fn login_len(s: &str) -> usize {
+    s.bytes().map(|b| if login_safe(b) { 1 } else { 4 }).sum()
 }
 
 /// A user or group name as chown takes it: no colon, space or shell character can get through.
@@ -148,7 +157,7 @@ pub fn io_error(e: &std::io::Error, path: &str) -> Error {
     use std::io::ErrorKind as K;
     match e.kind() {
         K::NotFound => Error::Enoent { path: path.into() },
-        K::PermissionDenied => Error::Eacces { path: path.into() },
+        K::PermissionDenied => Error::Eacces { path: path.into(), source: false },
         K::AlreadyExists => Error::Eexist { path: path.into() },
         K::NotADirectory => Error::Enotdir { path: path.into() },
         _ => Error::Einval { reason: format!("{path}: {e}") },
@@ -203,6 +212,9 @@ mod tests {
             }
         }
         assert_eq!(String::from_utf8(out).unwrap(), script);
+        // The length the batches are measured by is the escaped one.
+        assert_eq!(login_len(script), body.len());
+        assert_eq!(login_len("/путь"), 1 + 4 * 8);
     }
 
     #[test]

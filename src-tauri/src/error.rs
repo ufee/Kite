@@ -45,7 +45,12 @@ pub enum Error {
     #[serde(rename = "ENOTDIR")]
     Enotdir { path: String },
     #[serde(rename = "EACCES")]
-    Eacces { path: String },
+    Eacces {
+        path: String,
+        /// Known to be the source's: retrying as root on the target cannot help.
+        #[serde(skip)]
+        source: bool,
+    },
     #[serde(rename = "EEXIST")]
     Eexist { path: String },
     /// The server runs no commands (`ForceCommand internal-sftp`): no chown there.
@@ -138,7 +143,7 @@ impl std::fmt::Display for Error {
             Self::AuthMethods { methods } => write!(f, "methods: {methods}"),
             Self::Enoent { path } => write!(f, "ENOENT {path}"),
             Self::Enotdir { path } => write!(f, "ENOTDIR {path}"),
-            Self::Eacces { path } => write!(f, "EACCES {path}"),
+            Self::Eacces { path, .. } => write!(f, "EACCES {path}"),
             Self::Eexist { path } => write!(f, "EEXIST {path}"),
             e => write!(f, "{}", serde_json::to_value(e).ok().and_then(|v| v["code"].as_str().map(str::to_owned)).unwrap_or_default()),
         }

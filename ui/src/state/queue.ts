@@ -27,10 +27,11 @@ export const qStat = computed(() => {
 export const qPct = (q: TransferItem) => (q.size ? Math.floor((q.done / q.size) * 100) : 0);
 export const routeLabel = (q: TransferItem) => {
   const ext = q.from.src === 'ext', relay = !ext && !isLocal(q.from.src) && !isLocal(q.to.src);
-  // Running or done: the route it took. Otherwise the one its next start takes; one server
-  // copies within itself through Kite.
-  const live = q.state === 'run' || q.state === 'done';
-  const direct = relay && (live ? !!q.direct : settings.agentFwd && !q.relay && q.from.src !== q.to.src);
+  // Running or done: the route it took. Otherwise the one its next start takes: one server copies
+  // within itself through Kite, and a relay that began (bytes done, not directly) stays the relay.
+  const live = q.state === 'run' || q.state === 'count' || q.state === 'done';
+  const next = settings.agentFwd && !q.relay && q.from.src !== q.to.src && (q.done === 0 || !!q.direct);
+  const direct = relay && (live ? !!q.direct : next);
   return `${ext ? tr('Проводник') : label(q.from.src as string)} → ${label(q.to.src as string)}` + (direct ? tr(' · напрямую') : relay ? tr(' · через Kite') : '');
 };
 

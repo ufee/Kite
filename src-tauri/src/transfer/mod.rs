@@ -810,8 +810,15 @@ impl Transfers {
                 break Err(Error::Stopped);
             };
             let res = self.attempt(id, &item, &resume, &live.prog, &stop, keep_time).await;
-            // The user chose Kite while this direct run was going: no second question, the relay.
-            if matches!(res, Err(Error::DirectFailed { .. })) && !item.relay && self.with(id, |r| r.item.relay) == Some(true) {
+            // The user chose Kite while this direct run was going: no second question, the relay. The
+            // direct row ends with its reason; the relay opens its own.
+            if let Err(e @ Error::DirectFailed { .. }) = &res
+                && !item.relay
+                && self.with(id, |r| r.item.relay) == Some(true)
+            {
+                if let Some(Some(row)) = self.with(id, |r| r.row.take()) {
+                    self.log.done(row, e.to_string(), Row::Err);
+                }
                 continue;
             }
             if !matches!(res, Err(Error::Disconnected)) {
@@ -871,20 +878,27 @@ impl Transfers {
             sides = async { Ok::<_, Error>((self.side(&item.from).await?, self.side(&item.to).await?)) } => sides?,
         };
         // Between two servers goes directly when the setting is on, unless the user chose Kite for it.
-        // Within one server the relay stays: a move there is a rename.
-        let direct = !from.is_local() && !to.is_local() && item.from.src != item.to.src && !item.relay && !item.is_edit() && self.inner().direct;
+        // Within one server the relay stays: a move there is a rename. A relay that began stays the
+        // relay: its folders are 0700 until it sets their modes at its end.
+        let relay_began = !resume.direct && (!resume.parts.is_empty() || resume.files > 0 || !resume.made.is_empty());
+        let direct = !from.is_local()
+            && !to.is_local()
+            && item.from.src != item.to.src
+            && !item.relay
+            && !item.is_edit()
+            && !relay_began
+            && self.inner().direct;
         if self.with(id, |r| std::mem::replace(&mut r.item.direct, direct)) != Some(direct) {
             self.changed();
         }
-        // The route changed since the last run: what the other one left on the target goes first.
-        let stale = if direct { !resume.parts.is_empty() || resume.files > 0 || !resume.made.is_empty() } else { resume.direct };
+        // Kite takes over after a direct run: rsync's part folders on the target go first.
         let fresh;
-        let resume = if !stale {
+        let resume = if direct || !resume.direct {
             resume
         } else {
-            let left = if direct { Resume { direct: false, ..resume.clone() } } else { Resume { direct: true, ..Resume::default() } };
+            let left = Resume { direct: true, ..Resume::default() };
             let _ = tokio::time::timeout(CLEAN_WAIT, self.clean(item, &left)).await;
-            fresh = if direct { Resume { direct: resume.direct, ..Resume::default() } } else { Resume { direct: false, ..resume.clone() } };
+            fresh = Resume { direct: false, ..resume.clone() };
             self.with(id, |r| r.resume = fresh.clone());
             self.inner().dirty = true;
             &fresh
@@ -958,7 +972,7 @@ impl Transfers {
                             }
                         }
                         Err(e) => {
-                            r.item.denied = matches!(&e, Error::Eacces { path } if !r.item.to.is_local() && r.item.to.user != "root" && path.starts_with(r.item.to.path.trim_end_matches('/')));
+                            r.item.denied = matches!(&e, Error::Eacces { path, source: false } if !r.item.to.is_local() && r.item.to.user != "root" && path.starts_with(r.item.to.path.trim_end_matches('/')));
                             if let Some(row) = r.row.take() {
                                 self.log.done(row, e.to_string(), Row::Err);
                             }

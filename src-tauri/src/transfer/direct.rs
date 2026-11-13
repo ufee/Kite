@@ -307,7 +307,7 @@ async fn tools(s: &Session) -> Result<Option<String>> {
     // scp counts only with -s (OpenSSH 8.7+): without it the remote path goes through a shell there.
     let cmd = login_line(
         "command -v rsync >/dev/null 2>&1 && echo rsync; \
-         command -v scp >/dev/null 2>&1 && { LC_ALL=C scp -s 2>&1 | grep -q 'unknown option' || echo scp; }; echo kite-probe",
+         command -v scp >/dev/null 2>&1 && { LC_ALL=C scp -s 2>&1 | grep -Eq 'unknown option|illegal option|invalid option' || echo scp; }; echo kite-probe",
     );
     tokio::time::timeout(PROBE_WAIT, capture(&s.handle, &cmd)).await.map_err(|_| failed(format!("{} не ответил на проверку rsync", s.code)))?
 }
@@ -473,14 +473,18 @@ fn explain(code: u32, tail: &[String], r: &Reach, src: &str, dst: &str, started:
     if !denied.is_empty() {
         // rsync 3.2+ tags the side; older ones say `send_files failed to open` for a source file.
         let source = denied.iter().all(|l| l.contains("[sender]") || l.contains("send_files"));
-        return Error::Eacces { path: if source { src } else { dst }.into() };
+        return Error::Eacces { path: if source { src } else { dst }.into(), source };
     }
     let target = format!("{}:{}", r.host, r.port);
     let refused = has("Host key verification failed") || has("REMOTE HOST IDENTIFICATION HAS CHANGED") || has("Permission denied (publickey");
-    if started && !refused && LINK_CODES.contains(&code) {
+    // The receiver dies on a full disk and the sender reports a broken stream: not a drop.
+    let full = has("No space left on device") || has("Disk quota exceeded");
+    if started && !refused && !full && LINK_CODES.contains(&code) {
         return Error::Disconnected;
     }
-    let reason = if has("Host key verification failed") || has("REMOTE HOST IDENTIFICATION HAS CHANGED") {
+    let reason = if full {
+        format!("на {target} кончилось место")
+    } else if has("Host key verification failed") || has("REMOTE HOST IDENTIFICATION HAS CHANGED") {
         format!("ключ хоста {target} не совпал с сохранённым")
     } else if has("Permission denied (publickey") || has("Permission denied, please try again") {
         format!("ключ из агента не принят на {target} для {}", r.user)
@@ -494,7 +498,8 @@ fn explain(code: u32, tail: &[String], r: &Reach, src: &str, dst: &str, started:
         tail.iter()
             .rev()
             .find(|l| l.starts_with("rsync:") || l.starts_with("scp:") || l.starts_with("ssh:") || l.contains("error"))
-            .or(tail.last())
+            // A progress line says nothing of the end.
+            .or_else(|| tail.iter().rev().find(|l| parse_progress(l).is_none()))
             .cloned()
             .unwrap_or_else(|| format!("код выхода {code}"))
     };
@@ -512,8 +517,8 @@ pub async fn clean(s: &Session, root: &str, name: &str, dir: bool) {
         format!("rm -f -- {} 2>/dev/null; rmdir -- {} 2>/dev/null", sh_quote(&format!("{pd}/{name}")), sh_quote(&pd))
     };
     // A receiver that is still dying moves its temporary file into the part folder only when it hears
-    // of the end: a second pass takes what it put there after the first.
-    let cmd = format!("{rm}; sleep 2; {rm}; echo kite-probe");
+    // of the end: while an rsync of this user still runs there, a second pass takes what it put there.
+    let cmd = format!("{rm}; if pgrep -u \"$(id -u)\" -x rsync >/dev/null 2>&1; then sleep 2; {rm}; fi; echo kite-probe");
     let _ = tokio::time::timeout(PROBE_WAIT, capture(&s.handle, &login_line(&cmd))).await;
 }
 
@@ -554,20 +559,23 @@ mod tests {
         let r = reach();
         let e = |lines: &[&str], code, started| match explain(code, &lines.iter().map(|s| s.to_string()).collect::<Vec<_>>(), &r, "/s/x", "/d/x", started) {
             Error::DirectFailed { reason } => reason,
-            Error::Eacces { path } => format!("EACCES {path}"),
+            Error::Eacces { path, source } => format!("EACCES {path}{}", if source { " src" } else { "" }),
             other => format!("{other:?}"),
         };
         assert!(e(&["Host key verification failed."], 255, false).contains("не совпал"));
         assert!(e(&["key@10.0.0.2: Permission denied (publickey)."], 255, false).contains("не принят"));
         assert!(e(&["ssh: connect to host 10.0.0.2 port 2222: Connection refused"], 255, false).contains("не видит"));
         assert_eq!(e(&["rsync: [receiver] mkstemp \"/d/.x.Ab\" failed: Permission denied (13)"], 23, true), "EACCES /d/x");
-        assert_eq!(e(&["rsync: [sender] send_files failed to open \"/s/x\": Permission denied (13)"], 23, true), "EACCES /s/x");
-        assert_eq!(e(&["rsync: send_files failed to open \"/s/x\": Permission denied (13)"], 23, true), "EACCES /s/x");
+        assert_eq!(e(&["rsync: [sender] send_files failed to open \"/s/x\": Permission denied (13)"], 23, true), "EACCES /s/x src");
+        assert_eq!(e(&["rsync: send_files failed to open \"/s/x\": Permission denied (13)"], 23, true), "EACCES /s/x src");
+        // A full disk breaks the stream too, but is said as it is.
+        assert!(e(&["rsync: [receiver] write failed on \"/d/x\": No space left on device (28)", "rsync error: error in socket IO (code 10)"], 12, true).contains("кончилось место"));
         // A link that broke midway is a drop; before the copy began it is a reason.
         assert_eq!(e(&["rsync: connection unexpectedly closed"], 12, true), "Disconnected");
         assert!(!e(&["rsync: connection unexpectedly closed"], 12, false).contains("Disconnected"));
         assert!(e(&["Host key verification failed."], 255, true).contains("не совпал"));
         assert_eq!(e(&[], 5, false), "код выхода 5");
+        assert_eq!(e(&["big.bin    0%    0     0.0KB/s   --:-- ETA"], 143, true), "код выхода 143");
     }
 
     /// The script a login line carries, as sh gets it.

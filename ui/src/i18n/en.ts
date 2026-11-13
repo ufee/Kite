@@ -65,6 +65,7 @@ export const EN: Record<string, string> = {
   'на {c} нельзя запускать команды': 'commands cannot be run on {c}', 'нет rsync на {c}': 'no rsync on {c}',
   '{c} не ответил на проверку rsync': '{c} did not answer the rsync check', 'ключ хоста {t} не совпал с сохранённым': 'the host key of {t} does not match the saved one',
   'ключ из агента не принят на {t} для {u}': 'the agent key was not accepted on {t} for {u}', 'сервер-источник не видит {t}': 'the source server cannot reach {t}',
+  'на {t} кончилось место': '{t} ran out of space',
 
   // Menus
   'Недавние': 'Recent', 'Все серверы…': 'All servers…', 'Войти как': 'Log in as',
