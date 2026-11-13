@@ -9,6 +9,7 @@ mod error;
 mod fs;
 mod ipc;
 mod log;
+mod portable;
 mod secrets;
 mod ssh;
 mod store;
@@ -22,6 +23,18 @@ use tauri::Manager;
 use tauri_plugin_window_state::StateFlags;
 
 pub fn run() {
+    let portable = portable::dir();
+    if let Some(dir) = &portable
+        && let Err(e) = portable::writable(dir)
+    {
+        portable::fail(dir, &e);
+    }
+    // The plugin joins this name onto the config folder; an absolute path replaces that folder.
+    let window_state = match &portable {
+        Some(dir) => dir.join("window-state.json").to_string_lossy().into_owned(),
+        None => tauri_plugin_window_state::DEFAULT_FILENAME.to_owned(),
+    };
+
     // Kept alive for the whole `run`; Tauri commands and SSH tasks spawn on this handle.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(ssh::ASYNC_WORKERS)
@@ -44,12 +57,16 @@ pub fn run() {
         .plugin(
             tauri_plugin_window_state::Builder::default()
                 .with_state_flags(StateFlags::all() & !StateFlags::VISIBLE)
+                .with_filename(window_state)
                 .build(),
         )
         // Used from Rust only (the key file picker); the UI has no dialog permissions.
         .plugin(tauri_plugin_dialog::init())
-        .setup(|app| {
-            let dir = app.path().app_data_dir()?;
+        .setup(move |app| {
+            let dir = match &portable {
+                Some(dir) => dir.clone(),
+                None => app.path().app_data_dir()?,
+            };
             app.manage(Arc::new(store::Store::new(dir)?));
             let log = Arc::new(log::Log::new(Some(app.handle().clone())));
             app.manage(log.clone());
@@ -59,12 +76,20 @@ pub fn run() {
             let store = app.state::<Arc<store::Store>>().inner().clone();
             let q = transfer::Transfers::new(app.handle().clone(), ssh.clone(), log.clone(), store);
             app.manage(q.clone());
-            let copies = app.path().app_local_data_dir()?.join("edit");
+            let copies = match &portable {
+                Some(dir) => dir.join("edit"),
+                None => app.path().app_local_data_dir()?.join("edit"),
+            };
             app.manage(edit::Edits::new(app.handle().clone(), ssh, q, log, copies));
-            if let Some(w) = app.get_webview_window("main") {
-                webview::harden(&w);
-                webview::explorer_drop(&w);
+            // The window is built here, not from the config: a portable copy keeps the WebView data too.
+            let conf = app.config().app.windows.iter().find(|w| w.label == "main").cloned().ok_or("no main window in the config")?;
+            let mut builder = tauri::WebviewWindowBuilder::from_config(app, &conf)?;
+            if let Some(dir) = &portable {
+                builder = builder.data_directory(dir.join("webview"));
             }
+            let w = builder.build()?;
+            webview::harden(&w);
+            webview::explorer_drop(&w);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -110,6 +135,7 @@ pub fn run() {
             ipc::term::pty_resize,
             ipc::term::pty_pause,
             ipc::term::pty_close,
+            ipc::term::pty_prewarm,
             ipc::transfer::transfer_enqueue,
             ipc::transfer::transfer_list,
             ipc::transfer::transfer_resync,
@@ -138,6 +164,9 @@ pub fn run() {
                 // The queue is saved at most every 2 s: what changed since must not be lost on closing.
                 if let Some(q) = app.try_state::<Arc<transfer::Transfers>>() {
                     q.save_now();
+                }
+                if let Some(t) = app.try_state::<Arc<term::Terms>>() {
+                    t.close_spare();
                 }
                 // Edit copies go, except those an unfinished upload still reads.
                 if let Some(e) = app.try_state::<Arc<edit::Edits>>() {

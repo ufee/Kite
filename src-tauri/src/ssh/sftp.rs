@@ -38,9 +38,20 @@ pub fn fs_error(e: SftpError, path: &str) -> Error {
     }
 }
 
-/// Opens the subsystem; returns the session, its protocol version, the home folder and whether the
-/// server announced `posix-rename@openssh.com`.
-pub async fn open(handle: &Handle<Client>) -> Result<(RawSftpSession, u32, String, bool)> {
+/// A started SFTP subsystem and what its server announced.
+pub struct Opened {
+    pub raw: RawSftpSession,
+    pub version: u32,
+    pub home: String,
+    /// `posix-rename@openssh.com` was announced.
+    pub posix_rename: bool,
+    /// `limits@openssh.com` was announced: with OpenSSH in the server's version line, this is its
+    /// sftp-server, which handles requests one by one in the order they came, so several READDIR
+    /// on one handle return disjoint batches.
+    pub in_order: bool,
+}
+
+pub async fn open(handle: &Handle<Client>) -> Result<Opened> {
     let channel = handle.channel_open_session().await?;
     channel.request_subsystem(true, "sftp").await?;
     let raw = RawSftpSession::new_with_config(
@@ -59,7 +70,8 @@ pub async fn open(handle: &Handle<Client>) -> Result<(RawSftpSession, u32, Strin
         .map(|f| f.filename)
         .unwrap_or_else(|| "/".into());
     let posix_rename = version.extensions.contains_key("posix-rename@openssh.com");
-    Ok((raw, version.version, home, posix_rename))
+    let in_order = version.extensions.contains_key("limits@openssh.com");
+    Ok(Opened { raw, version: version.version, home, posix_rename, in_order })
 }
 
 fn join(dir: &str, name: &str) -> String {

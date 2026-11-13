@@ -11,7 +11,8 @@ import Wave from './Wave.vue';
 import LogWin from './LogWin.vue';
 import QueueWin from './QueueWin.vue';
 
-const VERSION = __APP_VERSION__, SHORT = 'v' + VERSION.replace(/\.0$/, '');
+// v26.11.0 shows as v26.11; a build not from the tag adds its commit: v26.11 · a1b2c3d.
+const VERSION = __APP_VERSION__, SHORT = 'v' + VERSION.replace(/\.0$/, '') + (__APP_COMMIT__ ? ' · ' + __APP_COMMIT__ : '');
 async function copyVersion() {
   await copyText(`Kite v${VERSION}${__APP_COMMIT__ ? ' (' + __APP_COMMIT__ + ')' : ''} · Windows x64`);
   toast('Версия скопирована', 'ok', null, 1800);

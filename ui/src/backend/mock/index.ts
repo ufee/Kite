@@ -740,6 +740,7 @@ export class MockBackend implements Backend {
   ptyResize(_id: number, _cols: number, _rows: number) { /* the mock shell does not wrap lines itself */ }
   ptyPause(_id: number, _paused: boolean) { /* the mock shell writes little */ }
   ptyClose(id: number) { this.ptys.delete(id); }
+  ptyPrewarm(_cwd: string, _shell: string) { /* the mock shell starts instantly */ }
 
   /* ---------- Demo state on the first launch ---------- */
   seedDemo() {

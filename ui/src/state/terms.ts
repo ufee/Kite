@@ -49,6 +49,10 @@ const HISTORY_LINES = 1000;
 export const terms = reactive<Term[]>([]);
 const views = new Map<number, View>();
 let termId = 0;
+/** A local tab was opened during this run: the next start keeps a shell ready (`prewarmLocal`). */
+let localUsed = false;
+/** Restored tabs count too: one may be closed before the app quits. */
+export const usedLocal = () => localUsed || terms.some(t => isLocal(t.src));
 export const curTerm = computed(() => terms.find(t => t.id === ui.term) || null);
 export const termTitle = (t: Term) => (isLocal(t.src) ? shellName() : `${t.user}@${label(t.src)}`);
 export const shellName = () => (settings.shell === 'cmd' ? 'cmd' : settings.shell === 'powershell' ? 'Windows PowerShell' : 'PowerShell');
@@ -272,7 +276,8 @@ function exited(t: Term, reason: PtyExit, age: number) {
 export async function openTerm(src: Src, user?: string, cwd?: string, quiet = false): Promise<Term | null> {
   if (ui.view === 'files') ui.view = 'both';
   let start = cwd ?? '';
-  if (!isLocal(src)) {
+  if (isLocal(src)) localUsed = true;
+  else {
     const s = srvBy(src);
     if (!s) return null;
     user = user || s.defaultUser;
@@ -295,6 +300,15 @@ export function closeTerm(id: number) {
   if (ui.term === id) ui.term = (terms[k] || terms[k - 1])?.id ?? null;
   if (ui.term) focusTerm();
   pruneHistory();
+}
+/**
+ * pwsh takes a few hundred ms to its first prompt: the core starts the shell the first local tab
+ * would get (the local pane's folder, as in `openTerm`), and that tab takes it ready.
+ */
+export function prewarmLocal() {
+  if (terms.some(t => isLocal(t.src))) return;
+  const p = panes.find(p => isLocal(p.src));
+  backend.ptyPrewarm(p && p.state === 'ok' ? p.path : '', settings.shell);
 }
 export function selectTerm(id: number) { ui.term = id; focusTerm(); }
 export function focusTerm() { nextTick(() => setTimeout(() => { const t = curTerm.value; if (t) views.get(t.id)?.xt.focus(); }, 30)); }
