@@ -49,6 +49,9 @@ const HISTORY_LINES = 1000;
 export const terms = reactive<Term[]>([]);
 const views = new Map<number, View>();
 let termId = 0;
+/** A local tab was open during this run: the next start keeps a shell ready (`prewarmLocal`). */
+let localUsed = false;
+export const usedLocal = () => localUsed;
 export const curTerm = computed(() => terms.find(t => t.id === ui.term) || null);
 export const termTitle = (t: Term) => (isLocal(t.src) ? shellName() : `${t.user}@${label(t.src)}`);
 export const shellName = () => (settings.shell === 'cmd' ? 'cmd' : settings.shell === 'powershell' ? 'Windows PowerShell' : 'PowerShell');
@@ -272,7 +275,8 @@ function exited(t: Term, reason: PtyExit, age: number) {
 export async function openTerm(src: Src, user?: string, cwd?: string, quiet = false): Promise<Term | null> {
   if (ui.view === 'files') ui.view = 'both';
   let start = cwd ?? '';
-  if (!isLocal(src)) {
+  if (isLocal(src)) localUsed = true;
+  else {
     const s = srvBy(src);
     if (!s) return null;
     user = user || s.defaultUser;

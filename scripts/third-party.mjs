@@ -57,6 +57,13 @@ function npmPackages() {
     }
   };
   const found = new Map();
+  // Old packages write `license: { type }` or `licenses: [{ type }]` instead of an SPDX string.
+  const npmLicense = pkg => {
+    const l = pkg.license ?? pkg.licenses;
+    if (typeof l === 'string') return l;
+    const types = [l].flat().map(x => x?.type).filter(t => typeof t === 'string');
+    return types.length ? types.join(' OR ') : 'unknown';
+  };
   const visit = (deps, from) => {
     for (const name of Object.keys(deps ?? {})) {
       const dir = find(name, from);
@@ -64,7 +71,7 @@ function npmPackages() {
       if (found.has(dir)) continue;
       const pkg = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8'));
       const repo = typeof pkg.repository === 'string' ? pkg.repository : pkg.repository?.url ?? '';
-      found.set(dir, { name: pkg.name, version: pkg.version, license: pkg.license ?? 'unknown', url: repo, texts: licenseTexts(dir) });
+      found.set(dir, { name: pkg.name, version: pkg.version, license: npmLicense(pkg), url: repo, texts: licenseTexts(dir) });
       visit(pkg.dependencies, dir);
     }
   };

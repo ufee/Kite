@@ -17,7 +17,7 @@ import { log } from './log';
 import { paneMemory, panes, setPaneMemory, setSource, type PaneMem } from './panes';
 import { queue } from './queue';
 import { recentSnapshot, restoreRecent, srvBy, type RecentState } from './servers';
-import { restoreTerms, saveHistory, termsSnapshot, type SavedTerm } from './terms';
+import { restoreTerms, saveHistory, termsSnapshot, usedLocal, type SavedTerm } from './terms';
 import { isLocal } from '../util/paths';
 import { sleep } from '../util/format';
 
@@ -35,6 +35,8 @@ export interface SessionFile extends RecentState {
   open: { queue: boolean; log: boolean; logOnlyErr: boolean };
   terms: SavedTerm[];
   term: number | null;
+  /** A local tab was open during that run. */
+  localTabs?: boolean;
   queue: TransferItem[];
   log: LogRow[];
 }
@@ -87,6 +89,7 @@ function sessionFile(): SessionFile {
     open: { queue: ui.queueOpen, log: ui.logOpen, logOnlyErr: ui.logOnlyErr },
     terms: termsSnapshot(),
     term: ui.term,
+    localTabs: usedLocal(),
     // The core keeps its queue in transfers.json; only the mock's lives here.
     queue: backend.kind === 'mock' ? queue.value.filter(q => q.state !== 'done') : [],
     log: log.slice(-LOG_KEEP).map(r => ({ ...r })),

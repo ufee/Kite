@@ -72,7 +72,10 @@ export async function initApp(session: SessionFile | null) {
     await initTerms(demo); // the demo terminals open next to the demo panes
   }
   startPersist();
+  // Only for someone who opened local tabs last time: a waiting pwsh holds ~30 MB.
   // Well after the start and when the page is idle: a starting pwsh takes a core for about a second
   // and must not compete with the first frames, the restored panes or the first clicks.
-  setTimeout(() => requestIdleCallback(prewarmLocal, { timeout: 2000 }), 4000);
+  // WebKitGTK has no requestIdleCallback.
+  const idle = window.requestIdleCallback ?? ((f: () => void) => setTimeout(f, 0));
+  if (session?.localTabs) setTimeout(() => idle(prewarmLocal, { timeout: 2000 }), 4000);
 }

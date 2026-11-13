@@ -24,6 +24,11 @@ use tauri_plugin_window_state::StateFlags;
 
 pub fn run() {
     let portable = portable::dir();
+    if let Some(dir) = &portable
+        && let Err(e) = portable::writable(dir)
+    {
+        portable::fail(dir, &e);
+    }
     // The plugin joins this name onto the config folder; an absolute path replaces that folder.
     let window_state = match &portable {
         Some(dir) => dir.join("window-state.json").to_string_lossy().into_owned(),

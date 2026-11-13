@@ -226,11 +226,15 @@ impl Terms {
         let spare = self.spare_slot().take()?;
         let fits = match &spare.dir {
             Some(d) => d == dir,
-            None => true,
+            // Before `WAIT_DIR` runs, keys would go to the profile (a `Read-Host` in it, say).
+            None => spare.tap.ready(),
         };
         if spare.shell == shell && fits && !spare.tap.exited() {
             if spare.dir.is_none() {
-                let _ = spare.open.handle.send(Command::Input(format!("{dir}\r").into_bytes()));
+                // Base64: one ASCII line whatever the folder holds (a CR, characters outside the
+                // console code page).
+                let line = format!("{}\r", data_encoding::BASE64.encode(dir.as_bytes()));
+                let _ = spare.open.handle.send(Command::Input(line.into_bytes()));
             }
             Some((spare.open, spare.tap))
         } else {
@@ -244,6 +248,17 @@ impl Terms {
         let mut slot = self.spare_slot();
         if slot.as_ref().is_some_and(|s| Arc::ptr_eq(&s.tap, tap)) {
             slot.take();
+        }
+    }
+
+    /// The spare shell printed too much to be handed out: it is ended, not kept running.
+    fn drop_spare(&self, tap: &Arc<Tap>) {
+        let spare = {
+            let mut slot = self.spare_slot();
+            if slot.as_ref().is_some_and(|s| Arc::ptr_eq(&s.tap, tap)) { slot.take() } else { None }
+        };
+        if let Some(spare) = spare {
+            close(spare.open);
         }
     }
 
@@ -273,12 +288,16 @@ struct Spare {
 struct Tap(Mutex<TapState>);
 
 enum TapState {
-    Held { output: Vec<u8>, exited: bool, input: Option<Handle>, answered: bool },
+    /// `ready`: a `WAIT_DIR` shell has reached its folder question.
+    Held { output: Vec<u8>, exited: bool, input: Option<Handle>, answered: bool, ready: bool },
     Live { output: Output, on_exit: Option<OnExit> },
 }
 
 /// A prompt is a few hundred bytes; a spare that prints more is not idle and is not handed out.
 const SPARE_HOLD: usize = 64 * 1024;
+/// The window title `WAIT_DIR` sets while it waits: ConPTY passes a title on as OSC 0 and does not
+/// repeat it in a redraw, so it marks the moment without leaving anything on the screen.
+const READY_TITLE: &str = "kite-spare-ready";
 /// ConPTY starts with the cursor inherited: it asks the terminal where the cursor is and renders
 /// nothing until it hears back. A spare has no terminal yet, so the core answers for the empty one
 /// a new tab has, and drops the question so that tab does not answer it a second time.
@@ -294,6 +313,24 @@ impl TapState {
             *answered = true;
         }
     }
+
+    /// Cuts the `READY_TITLE` sequence out of the held output and notes it.
+    fn find_ready(&mut self) {
+        let TapState::Held { output, ready: ready @ false, .. } = self else { return };
+        let mark = READY_TITLE.as_bytes();
+        let Some(at) = output.windows(mark.len()).position(|w| w == mark) else { return };
+        let Some(start) = output[..at].windows(2).rposition(|w| w == b"\x1b]") else { return };
+        // BEL or ST ends it; not here yet means the rest is still coming.
+        let tail = &output[at + mark.len()..];
+        let end = match (tail.iter().position(|&b| b == 0x07), tail.windows(2).position(|w| w == b"\x1b\\")) {
+            (Some(b), Some(s)) if s < b => s + 2,
+            (Some(b), _) => b + 1,
+            (None, Some(s)) => s + 2,
+            (None, None) => return,
+        };
+        output.drain(start..at + mark.len() + end);
+        *ready = true;
+    }
 }
 
 impl Tap {
@@ -305,6 +342,10 @@ impl Tap {
         matches!(*self.lock(), TapState::Held { exited: true, .. })
     }
 
+    fn ready(&self) -> bool {
+        matches!(*self.lock(), TapState::Held { ready: true, .. })
+    }
+
     /// The shell's input queue, known once it has started; the cursor question may already be held.
     fn set_input(&self, handle: Handle) {
         let mut state = self.lock();
@@ -314,18 +355,27 @@ impl Tap {
         state.answer_cursor();
     }
 
-    fn output(&self, bytes: Vec<u8>) {
+    /// True once the held output overflows: the shell is not idle, and the caller ends it.
+    fn output(&self, bytes: Vec<u8>) -> bool {
         let mut state = self.lock();
         match &mut *state {
+            TapState::Held { exited: true, .. } => false,
             TapState::Held { output, exited, .. } => {
                 output.extend_from_slice(&bytes);
                 if output.len() > SPARE_HOLD {
                     // Treated as gone: the next tab starts its own shell.
                     *exited = true;
+                    output.clear();
+                    return true;
                 }
                 state.answer_cursor();
+                state.find_ready();
+                false
             }
-            TapState::Live { output, .. } => output(bytes),
+            TapState::Live { output, .. } => {
+                output(bytes);
+                false
+            }
         }
     }
 
@@ -374,16 +424,24 @@ pub fn take_spare(terms: &Terms, shell: &str, dir: &str, cols: u16, rows: u16, o
 /// Starts the spare shell. Its output is held until a tab attaches; if it ends first,
 /// it leaves the registry by itself.
 pub fn open_spare(terms: Arc<Terms>, shell: &str, cwd: &str) -> Result<()> {
-    let tap = Arc::new(Tap(Mutex::new(TapState::Held { output: Vec::new(), exited: false, input: None, answered: false })));
-    let sink = tap.clone();
-    let output: Output = Arc::new(move |bytes| sink.output(bytes));
+    let tap = Arc::new(Tap(Mutex::new(TapState::Held { output: Vec::new(), exited: false, input: None, answered: false, ready: false })));
+    let (sink, owner) = (tap.clone(), Arc::downgrade(&terms));
+    let output: Output = Arc::new(move |bytes| {
+        if sink.output(bytes)
+            && let Some(terms) = owner.upgrade()
+        {
+            terms.drop_spare(&sink);
+        }
+    });
     let (t, ended) = (terms.clone(), tap.clone());
     let on_exit: OnExit = Box::new(move |reason| match ended.exit() {
         Some(tab) => tab(reason),
         None => t.spare_ended(&ended),
     });
-    let dir = local_dir(cwd);
     let wait = waits_for_dir(shell);
+    // A waiting shell starts in home: a process keeps the folder it started in open (Set-Location
+    // does not move it), and the panel's folder could then be neither deleted nor renamed.
+    let dir = if wait { local_dir("") } else { local_dir(cwd) };
     // The tab resizes it on attach; until then the size only shapes the first prompt.
     let open = spawn_local(shell, &dir, wait, 120, 30, Arc::new(Flow::default()), output, on_exit)?;
     tap.set_input(open.handle.clone());
@@ -602,9 +660,12 @@ async fn wait_closed(session: &Session) -> bool {
 
 /* ---------- This PC ---------- */
 
-/// After its profile, a spare PowerShell reads the tab's folder from its input without echo and
-/// goes there; the first prompt comes after that. A script block keeps its variables out of the session.
-const WAIT_DIR: &str = "& { $d = ''; while (($k = [Console]::ReadKey($true)).Key -ne 'Enter') { $d += $k.KeyChar }; Set-Location -LiteralPath $d }";
+/// After its profile, a spare PowerShell says it is ready (`READY_TITLE`), reads the tab's folder
+/// in base64 from its input without echo, puts its title back and goes there, the process too;
+/// the first prompt comes after that. A script block keeps its variables out of the session.
+const WAIT_DIR: &str = "& { $t = $Host.UI.RawUI.WindowTitle; $Host.UI.RawUI.WindowTitle = 'kite-spare-ready'; \
+$d = ''; while (($k = [Console]::ReadKey($true)).Key -ne 'Enter') { $d += $k.KeyChar }; $Host.UI.RawUI.WindowTitle = $t; \
+$p = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($d)); Set-Location -LiteralPath $p; [Environment]::CurrentDirectory = (Get-Location -PSProvider FileSystem).ProviderPath }";
 
 /// Shells that can start as a spare for any folder (`WAIT_DIR`); others start in the folder itself.
 fn waits_for_dir(shell: &str) -> bool {
@@ -769,10 +830,22 @@ mod tests {
     #[test]
     fn spare_powershell_goes_to_the_folder_of_the_tab() {
         let terms = Arc::new(Terms::default());
-        let start = local_dir(&std::env::temp_dir().to_string_lossy());
-        let home = local_dir("");
-        assert_ne!(start, home);
-        open_spare(terms.clone(), "powershell", &start).unwrap();
+        let tmp = std::env::temp_dir();
+        let start = tmp.join(format!("kite-spare-start-{}", std::process::id()));
+        // A space and characters outside the console code page.
+        let target = tmp.join(format!("kite spare №1 — тест {}", std::process::id()));
+        std::fs::create_dir_all(&start).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        let home = target.to_string_lossy().into_owned();
+        open_spare(terms.clone(), "powershell", &start.to_string_lossy()).unwrap();
+        // Handed out only once it waits for the folder; a profile's own questions come before that.
+        let until = std::time::Instant::now() + Duration::from_secs(20);
+        while !terms.spare_slot().as_ref().is_some_and(|s| s.tap.ready()) {
+            assert!(std::time::Instant::now() < until, "the spare never got ready");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // The waiting shell does not hold the panel's folder.
+        std::fs::remove_dir(&start).expect("the panel's folder is free");
         let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
         let (etx, erx) = std::sync::mpsc::channel();
         let output: Output = Arc::new(move |b| {
@@ -795,8 +868,30 @@ mod tests {
             seen.push_str(&String::from_utf8_lossy(&chunk));
         }
         assert_eq!(seen.matches(home.as_str()).count(), 1, "{seen:?}");
+        assert!(!seen.contains(READY_TITLE), "{seen:?}");
         let _ = open.handle.send(Command::Input(b"exit\r".to_vec()));
         assert_eq!(erx.recv_timeout(Duration::from_secs(10)).unwrap(), Exit::Exited);
+        let _ = std::fs::remove_dir(&target);
+    }
+
+    #[test]
+    fn ready_title_is_cut_out_of_the_held_output() {
+        let mut state = TapState::Held { output: Vec::new(), exited: false, input: None, answered: false, ready: false };
+        let feed = |s: &mut TapState, b: &[u8]| {
+            if let TapState::Held { output, .. } = s {
+                output.extend_from_slice(b);
+            }
+            s.find_ready();
+        };
+        feed(&mut state, b"banner\r\n\x1b]0;kite-spare-");
+        assert!(matches!(state, TapState::Held { ready: false, .. }));
+        feed(&mut state, b"ready");
+        // The end of the sequence has not come yet.
+        assert!(matches!(state, TapState::Held { ready: false, .. }));
+        feed(&mut state, b"\x07\x1b[?25h");
+        let TapState::Held { output, ready, .. } = &state else { unreachable!() };
+        assert!(*ready);
+        assert_eq!(output.as_slice(), b"banner\r\n\x1b[?25h");
     }
 
     #[test]

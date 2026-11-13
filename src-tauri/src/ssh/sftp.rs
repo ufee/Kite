@@ -45,9 +45,9 @@ pub struct Opened {
     pub home: String,
     /// `posix-rename@openssh.com` was announced.
     pub posix_rename: bool,
-    /// OpenSSH's sftp-server: it handles requests one by one in the order they came, so several
-    /// READDIR on one handle return disjoint batches. Known by `limits@openssh.com`, which only
-    /// it announces.
+    /// `limits@openssh.com` was announced: with OpenSSH in the server's version line, this is its
+    /// sftp-server, which handles requests one by one in the order they came, so several READDIR
+    /// on one handle return disjoint batches.
     pub in_order: bool,
 }
 
