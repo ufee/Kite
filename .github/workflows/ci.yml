@@ -50,6 +50,10 @@ jobs:
         with:
           workspaces: src-tauri
 
+      # The installer ships it as a resource, and tauri-build checks resources at compile time.
+      - name: Third-party licenses
+        run: node scripts/third-party.mjs
+
       - name: Clippy
         working-directory: src-tauri
         run: cargo clippy --all-targets --locked -- -D warnings

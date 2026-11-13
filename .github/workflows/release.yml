@@ -1,0 +1,84 @@
+name: Release
+
+# A tag v<version> builds the Windows files and opens a draft GitHub Release with them.
+# A manual run builds the same files from any branch as an artifact, without a release.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Windows x64
+    runs-on: windows-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Version
+        id: version
+        shell: pwsh
+        run: |
+          $v = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$v") {
+            throw "Tag $env:GITHUB_REF_NAME does not match v$v in src-tauri/tauri.conf.json"
+          }
+          "version=$v" >> $env:GITHUB_OUTPUT
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      # Third-party licenses, the UI and the core, then the NSIS installer.
+      - name: Build
+        run: npx tauri build --ci
+
+      - name: Package
+        shell: pwsh
+        run: scripts/package.ps1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Kite-v${{ steps.version.outputs.version }}-windows-x64
+          path: release/*
+          if-no-files-found: error
+
+  release:
+    name: Draft release
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: Kite-v${{ needs.build.outputs.version }}-windows-x64
+          path: release
+
+      # The notes are the CHANGELOG.md section of this version: "## v26.11 ..." up to the next "## ".
+      - name: Draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          short="v${VERSION%.0}"
+          awk -v h="## $short" 'index($0, h) == 1 && (length($0) == length(h) || substr($0, length(h) + 1, 1) == " ") { on = 1; next } /^## / { on = 0 } on' CHANGELOG.md > notes.md
+          if ! grep -q '[^[:space:]]' notes.md; then echo "::error::CHANGELOG.md has no section '## $short'"; exit 1; fi
+          gh release create "$GITHUB_REF_NAME" release/* --draft --verify-tag --title "Kite $short" --notes-file notes.md

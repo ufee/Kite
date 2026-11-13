@@ -6,14 +6,15 @@
   "build": {
     "frontendDist": "../ui/dist",
     "devUrl": "http://localhost:5174",
-    "beforeDevCommand": "npm --workspace ui run dev",
-    "beforeBuildCommand": "npm --workspace ui run build"
+    "beforeDevCommand": "node scripts/third-party.mjs && npm --workspace ui run dev",
+    "beforeBuildCommand": "node scripts/third-party.mjs && npm --workspace ui run build"
   },
   "app": {
     "withGlobalTauri": false,
     "windows": [
       {
         "label": "main",
+        "create": false,
         "title": "Kite",
         "width": 1280,
         "height": 800,
@@ -46,7 +47,11 @@
     "active": true,
     "targets": ["nsis"],
     "publisher": "Kite",
-    "copyright": "MIT",
+    "copyright": "© 2026 Владислав, MIT License",
+    "resources": {
+      "../LICENSE": "LICENSE.txt",
+      "../THIRD_PARTY_LICENSES.txt": "THIRD_PARTY_LICENSES.txt"
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
