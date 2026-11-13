@@ -34,48 +34,30 @@ pub struct Entry {
 /// and with digit runs as numbers. The UI still sorts with its collator and decides the order; on an
 /// almost sorted input that sort is several times cheaper (10k names: 27 against 2 ms).
 pub fn presort(list: &mut [Entry]) {
-    list.sort_unstable_by(|a, b| b.dir.cmp(&a.dir).then_with(|| natural(&a.name, &b.name)));
+    // One key per entry: comparing them is a plain byte compare, not a walk over both names.
+    list.sort_by_cached_key(|e| (!e.dir, sort_key(&e.name)));
 }
 
-/// Case-insensitive comparison where `file-9` comes before `file-10`.
-fn natural(a: &str, b: &str) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-    let (mut a, mut b) = (a.chars().peekable(), b.chars().peekable());
-    loop {
-        match (a.peek().copied(), b.peek().copied()) {
-            (None, None) => return Ordering::Equal,
-            (None, Some(_)) => return Ordering::Less,
-            (Some(_), None) => return Ordering::Greater,
-            (Some(x), Some(y)) if x.is_ascii_digit() && y.is_ascii_digit() => {
-                let (x, y) = (digits(&mut a), digits(&mut b));
-                // Without leading zeros the longer run is the bigger number.
-                let ord = x.len().cmp(&y.len()).then_with(|| x.cmp(&y));
-                if ord != Ordering::Equal {
-                    return ord;
-                }
+/// The name in lower case with each digit run zero-padded to one width, so `file-9` sorts before
+/// `file-10`. Runs longer than the width keep their length: the hint is rougher there.
+fn sort_key(name: &str) -> String {
+    const WIDTH: usize = 20;
+    let mut key = String::with_capacity(name.len() + WIDTH);
+    let mut chars = name.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c.is_ascii_digit() {
+            let mut run = String::from(c);
+            while let Some(d) = chars.next_if(char::is_ascii_digit) {
+                run.push(d);
             }
-            (Some(x), Some(y)) => {
-                let ord = x.to_lowercase().cmp(y.to_lowercase());
-                if ord != Ordering::Equal {
-                    return ord;
-                }
-                a.next();
-                b.next();
-            }
+            let run = run.trim_start_matches('0');
+            key.extend(std::iter::repeat_n('0', WIDTH.saturating_sub(run.len())));
+            key.push_str(run);
+        } else {
+            key.extend(c.to_lowercase());
         }
     }
-}
-
-/// Takes a run of ASCII digits and returns it without leading zeros.
-fn digits(it: &mut std::iter::Peekable<std::str::Chars>) -> Vec<u8> {
-    let mut run = Vec::new();
-    while let Some(c) = it.peek().copied().filter(char::is_ascii_digit) {
-        if !(run.is_empty() && c == '0') {
-            run.push(c as u8);
-        }
-        it.next();
-    }
-    run
+    key
 }
 
 #[derive(Debug, Serialize)]
