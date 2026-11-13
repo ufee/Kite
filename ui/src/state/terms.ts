@@ -49,9 +49,10 @@ const HISTORY_LINES = 1000;
 export const terms = reactive<Term[]>([]);
 const views = new Map<number, View>();
 let termId = 0;
-/** A local tab was open during this run: the next start keeps a shell ready (`prewarmLocal`). */
+/** A local tab was opened during this run: the next start keeps a shell ready (`prewarmLocal`). */
 let localUsed = false;
-export const usedLocal = () => localUsed;
+/** Restored tabs count too: one may be closed before the app quits. */
+export const usedLocal = () => localUsed || terms.some(t => isLocal(t.src));
 export const curTerm = computed(() => terms.find(t => t.id === ui.term) || null);
 export const termTitle = (t: Term) => (isLocal(t.src) ? shellName() : `${t.user}@${label(t.src)}`);
 export const shellName = () => (settings.shell === 'cmd' ? 'cmd' : settings.shell === 'powershell' ? 'Windows PowerShell' : 'PowerShell');

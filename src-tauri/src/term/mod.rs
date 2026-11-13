@@ -663,7 +663,9 @@ async fn wait_closed(session: &Session) -> bool {
 /// After its profile, a spare PowerShell says it is ready (`READY_TITLE`), reads the tab's folder
 /// in base64 from its input without echo, puts its title back and goes there, the process too;
 /// the first prompt comes after that. A script block keeps its variables out of the session.
-const WAIT_DIR: &str = "& { $t = $Host.UI.RawUI.WindowTitle; $Host.UI.RawUI.WindowTitle = 'kite-spare-ready'; \
+/// Under ConstrainedLanguage (AppLocker, WDAC) `ReadKey` and `Convert` are blocked: the shell
+/// never says it is ready, so no tab takes it and its tab starts a shell of its own.
+const WAIT_DIR: &str = "& { if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') { return }; $t = $Host.UI.RawUI.WindowTitle; $Host.UI.RawUI.WindowTitle = 'kite-spare-ready'; \
 $d = ''; while (($k = [Console]::ReadKey($true)).Key -ne 'Enter') { $d += $k.KeyChar }; $Host.UI.RawUI.WindowTitle = $t; \
 $p = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($d)); Set-Location -LiteralPath $p; [Environment]::CurrentDirectory = (Get-Location -PSProvider FileSystem).ProviderPath }";
 
