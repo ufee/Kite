@@ -73,6 +73,7 @@ export class MockBackend implements Backend {
   private reported = new Set<number>();
   private parallel = 3;
   private keepTime = true;
+  private direct = false;
   private timer = 0;
   private ptys = new Map<number, Pty>();
   private ptyId = 0;
@@ -483,6 +484,7 @@ export class MockBackend implements Backend {
       this.jobs.push({
         id: ++this.jobId, batch, name: e.name, tname, dir: e.dir, size, done: 0, speed: 0,
         from: { ...from }, to: { ...to }, move, state: 'wait', err: '', entry: { ...e }, row: null, connecting: false, countTicks: 0,
+        direct: this.direct && from.src !== 'ext' && !isLocal(from.src) && !isLocal(to.src),
       });
     }
     if (!this.jobs.some(j => j.batch === batch)) return 0;
@@ -634,6 +636,18 @@ export class MockBackend implements Backend {
   }
   transferSetParallel(n: number) { this.parallel = Math.max(1, Math.min(8, n)); }
   transferKeepTime(keep: boolean) { this.keepTime = keep; }
+  /** The demo has no servers to run rsync on: the flag only names the route. */
+  transferDirect(on: boolean) { this.direct = on; }
+  transferRelay(ids: number[]) {
+    for (const j of this.jobs) {
+      if (!ids.includes(j.id) || j.state === 'done') continue;
+      j.relay = true;
+      j.direct = false;
+      if (j.state === 'err') Object.assign(j, { state: 'wait', err: '', code: undefined, done: 0, row: null });
+    }
+    this.push();
+    this.wake();
+  }
   async transferDetach(server: ServerId, user: string | undefined, cancel: boolean) {
     const touches = (e: Endpoint) => e.src === server && (user === undefined || e.user === user);
     for (const j of [...this.jobs]) {

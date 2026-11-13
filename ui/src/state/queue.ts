@@ -27,8 +27,37 @@ export const qStat = computed(() => {
 export const qPct = (q: TransferItem) => (q.size ? Math.floor((q.done / q.size) * 100) : 0);
 export const routeLabel = (q: TransferItem) => {
   const ext = q.from.src === 'ext', relay = !ext && !isLocal(q.from.src) && !isLocal(q.to.src);
-  return `${ext ? tr('Проводник') : label(q.from.src as string)} → ${label(q.to.src as string)}` + (relay ? tr(' · через Kite') : '');
+  // Not started yet: the route the setting will give it.
+  const direct = relay && (q.direct || (q.state === 'wait' && settings.agentFwd && !q.relay));
+  return `${ext ? tr('Проводник') : label(q.from.src as string)} → ${label(q.to.src as string)}` + (direct ? tr(' · напрямую') : relay ? tr(' · через Kite') : '');
 };
+
+/* ---------- A direct run that failed: ask to go through Kite ---------- */
+
+const directFailed = (q: TransferItem) => q.state === 'err' && q.code === 'DIRECT_FAILED';
+/** One question per batch and pair of servers; the answer covers all of its items. */
+const pairKey = (q: TransferItem) => `${q.batch}|${q.from.src}|${q.to.src}`;
+const asked = new Set<string>();
+/** The unfinished items of that batch and pair: the answer moves them all to Kite. */
+const pairIds = (q: TransferItem) =>
+  queue.value.filter(x => pairKey(x) === pairKey(q) && x.state !== 'done' && (x.state !== 'err' || directFailed(x))).map(x => x.id);
+export const relayQ = (q: TransferItem) => backend.transferRelay([q.id]);
+
+async function askRelay(q: TransferItem) {
+  asked.add(pairKey(q));
+  const go = await ask<boolean>('confirm', {
+    title: tr('Напрямую не получилось'),
+    // The reason without the title, which the dialog already shows.
+    text: `${q.err.replace(/^[^.]*\.\s*/, '').replace(/\.?$/, '.')} ${tr('Скопировать {from} → {to} через Kite?', { from: label(q.from.src as string), to: label(q.to.src as string) })}`,
+    ok: tr('Через Kite'),
+    cancel: tr('Оставить'),
+  });
+  if (go) backend.transferRelay(pairIds(q));
+}
+
+function watchDirect(items: TransferItem[]) {
+  for (const q of items) if (directFailed(q) && !asked.has(pairKey(q))) void askRelay(q);
+}
 
 export async function transfer(from: Endpoint, entries: Entry[], to: Endpoint, move: boolean) {
   if (!entries.length) return;
@@ -69,11 +98,19 @@ export const retryQ = (q: TransferItem, asRoot = false) => backend.transferRetry
 export const clearDone = () => backend.transferClearDone();
 
 export async function initQueue() {
-  backend.onTransferState(items => { queue.value = items; });
-  backend.onTransferBatch(b => {
+  backend.onTransferState(items => { queue.value = items; watchDirect(items); });
+  backend.onTransferBatch(async b => {
+    // Failures that are only failed direct runs: the question about Kite says it all. The batch
+    // event may come before the last state, so the items are read as they are now.
+    if (b.bad) {
+      const failed = (await backend.transferList()).filter(q => q.batch === b.batch && q.state === 'err');
+      if (failed.length && failed.every(directFailed)) return;
+    }
     if (b.bad) toast(tr('Передано {ok} из {n}, ошибок: {bad}', { ok: b.ok, n: b.total, bad: b.bad }), 'bad', { label: 'Очередь', run: () => { ui.queueOpen = true; } }, 5000);
     else if (b.ok) toast(tr(b.move ? 'Перемещено: {what} в {to}' : 'Скопировано: {what} в {to}', { what: objs(b.ok), to: label(b.to) }), 'ok');
   });
   queue.value = await backend.transferList();
+  // Failed before this start: the row offers Kite, no question pops up at launch.
+  for (const q of queue.value) if (directFailed(q)) asked.add(pairKey(q));
   waveBusy(() => queue.value.some(q => q.state === 'run'));
 }

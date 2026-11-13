@@ -68,6 +68,18 @@ pub fn transfer_keep_time(q: Queue<'_>, keep: bool) {
     q.set_keep_time(keep);
 }
 
+/// "Copy directly between servers".
+#[tauri::command]
+pub fn transfer_direct(q: Queue<'_>, on: bool) {
+    q.set_direct(on);
+}
+
+/// After a failed direct run: these items go through Kite.
+#[tauri::command]
+pub fn transfer_relay(q: Queue<'_>, ids: Vec<u64>) {
+    q.relay(&ids);
+}
+
 /// Before a server is disconnected or deleted: its transfers pause or go.
 #[tauri::command]
 pub async fn transfer_detach(q: Queue<'_>, server: String, user: Option<String>, cancel: bool) -> Result<()> {

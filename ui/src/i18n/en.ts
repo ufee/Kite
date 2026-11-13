@@ -52,7 +52,9 @@ export const EN: Record<string, string> = {
   'Передачи': 'Transfers', 'В работе: {n}': 'Active: {n}', 'Убрать готовые': 'Clear finished',
   'Продолжить': 'Resume', 'Пауза': 'Pause', 'От root': 'As root', 'Убрать из списка': 'Remove from list', 'Отменить': 'Cancel',
   'готово': 'done', 'в очереди': 'queued', 'Передач нет': 'No transfers',
-  'Проводник': 'Explorer', ' · через Kite': ' · via Kite',
+  'Проводник': 'Explorer', ' · через Kite': ' · via Kite', ' · напрямую': ' · direct',
+  'Напрямую не получилось': 'Direct copy failed', 'Скопировать {from} → {to} через Kite?': 'Copy {from} → {to} through Kite?',
+  'Через Kite': 'Through Kite', 'Оставить': 'Leave it',
 
   // Menus
   'Недавние': 'Recent', 'Все серверы…': 'All servers…', 'Войти как': 'Log in as',

@@ -72,6 +72,8 @@ function words(e: CoreError): [string, string] {
     case 'SERVER_CHANGED': return [tr('Файл на сервере изменился: {p}', { p: e.path }), tr('Правка не загружена: решите, чья версия важнее.')];
     case 'EDIT_WAITS': return [tr('Правка ждёт: {p}', { p: e.path }), tr('Загрузка в этот файл стоит на паузе в очереди; правка уйдёт после неё.')];
     case 'NOT_REGULAR': return [tr('Не обычный файл: {p}', { p: e.path }), tr('Каналы, сокеты и устройства не передаются.')];
+    // The core's reason is a lowercase note, as in the log.
+    case 'DIRECT_FAILED': return [tr('Напрямую не получилось'), (e.reason ?? '').replace(/^./, c => c.toUpperCase())];
     default:
       if (e.code.startsWith('IMPORT_')) return [importWords(e as ImportFail).title, ''];
       return [tr('Ошибка SSH'), e.reason ?? ''];
@@ -100,7 +102,7 @@ type CoreItem = Omit<TransferItem, 'err'> & { err: CoreError | null };
 const item = (i: CoreItem): TransferItem => {
   const [title, text] = i.err ? words(i.err) : ['', ''];
   const twin = i.err?.code === 'NAME_CLASH' && i.err.path === i.name;
-  return { ...i, err: text ? `${title}. ${text}` : title, twin };
+  return { ...i, err: text ? `${title}. ${text}` : title, twin, code: i.err?.code as ErrCode | undefined };
 };
 
 export class TauriBackend extends MockBackend {
@@ -253,6 +255,8 @@ export class TauriBackend extends MockBackend {
   override transferClearDone() { void invoke('transfer_clear_done'); }
   override transferSetParallel(n: number) { void invoke('transfer_set_parallel', { n }); }
   override transferKeepTime(keep: boolean) { void invoke('transfer_keep_time', { keep }); }
+  override transferDirect(on: boolean) { void invoke('transfer_direct', { on }); }
+  override transferRelay(ids: number[]) { void invoke('transfer_relay', { ids }); }
   override transferDetach(server: ServerId, user: string | undefined, cancel: boolean) {
     return call<void>('transfer_detach', { server, user: user ?? null, cancel });
   }

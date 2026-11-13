@@ -32,6 +32,7 @@ function syncSettings() {
   watch(() => settings.strictHost, v => backend.setStrictHost(v), { immediate: true });
   watch(() => settings.parallel, v => backend.transferSetParallel(v), { immediate: true });
   watch(() => settings.keepTime, v => backend.transferKeepTime(v), { immediate: true });
+  watch(() => settings.agentFwd, v => backend.transferDirect(v), { immediate: true });
   watch(() => settings.autosave, v => backend.editAutosave(v), { immediate: true });
 }
 
