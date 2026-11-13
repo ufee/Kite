@@ -676,10 +676,10 @@ impl Transfers {
     }
 
     /// The user's answer to a failed direct run: these items go through Kite. Failed ones start again,
-    /// waiting ones simply take that route; parts a direct run left are deleted first.
+    /// waiting ones simply take that route, running ones take it if their direct run fails too. The
+    /// parts a direct run left go when the item next starts (`attempt`).
     pub fn relay(&self, ids: &[u64]) {
         let mut again = Vec::new();
-        let mut leftovers = Vec::new();
         {
             let mut g = self.inner();
             for r in g.recs.iter_mut().filter(|r| ids.contains(&r.item.id) && r.item.state != St::Done) {
@@ -690,24 +690,12 @@ impl Transfers {
                 if r.item.state == St::Err {
                     again.push(r.item.id);
                 }
-                if r.live.is_none() && r.resume.direct {
-                    r.resume.direct = false;
-                    leftovers.push(r.item.clone());
-                }
             }
             g.dirty = true;
         }
-        let me = self.me.upgrade();
-        tauri::async_runtime::spawn(async move {
-            let Some(me) = me else { return };
-            for it in leftovers {
-                let only = Resume { direct: true, ..Resume::default() };
-                let _ = tokio::time::timeout(CLEAN_WAIT, me.clean(&it, &only)).await;
-            }
-            for id in again {
-                me.retry(id, false);
-            }
-        });
+        for id in again {
+            self.retry(id, false);
+        }
     }
 
     /// Disconnecting or deleting a server: its transfers pause or go, then its connections close.
@@ -822,6 +810,10 @@ impl Transfers {
                 break Err(Error::Stopped);
             };
             let res = self.attempt(id, &item, &resume, &live.prog, &stop, keep_time).await;
+            // The user chose Kite while this direct run was going: no second question, the relay.
+            if matches!(res, Err(Error::DirectFailed { .. })) && !item.relay && self.with(id, |r| r.item.relay) == Some(true) {
+                continue;
+            }
             if !matches!(res, Err(Error::Disconnected)) {
                 break res;
             }
@@ -878,11 +870,25 @@ impl Transfers {
             _ = io::stopped(&mut s) => return Err(Error::Stopped),
             sides = async { Ok::<_, Error>((self.side(&item.from).await?, self.side(&item.to).await?)) } => sides?,
         };
-        // Server to server goes directly when the setting is on, unless the user chose Kite for it.
-        let direct = !from.is_local() && !to.is_local() && !item.relay && !item.is_edit() && self.inner().direct;
+        // Between two servers goes directly when the setting is on, unless the user chose Kite for it.
+        // Within one server the relay stays: a move there is a rename.
+        let direct = !from.is_local() && !to.is_local() && item.from.src != item.to.src && !item.relay && !item.is_edit() && self.inner().direct;
         if self.with(id, |r| std::mem::replace(&mut r.item.direct, direct)) != Some(direct) {
             self.changed();
         }
+        // The route changed since the last run: what the other one left on the target goes first.
+        let stale = if direct { !resume.parts.is_empty() || resume.files > 0 || !resume.made.is_empty() } else { resume.direct };
+        let fresh;
+        let resume = if !stale {
+            resume
+        } else {
+            let left = if direct { Resume { direct: false, ..resume.clone() } } else { Resume { direct: true, ..Resume::default() } };
+            let _ = tokio::time::timeout(CLEAN_WAIT, self.clean(item, &left)).await;
+            fresh = if direct { Resume { direct: resume.direct, ..Resume::default() } } else { Resume { direct: false, ..resume.clone() } };
+            self.with(id, |r| r.resume = fresh.clone());
+            self.inner().dirty = true;
+            &fresh
+        };
         self.open_row(id, item, &from, &to, direct);
         let run = job::Run { q: self, id, item, resume, stop, prog, keep_time };
         // Copies stop by themselves and close their handles; a long walk or a hung request gets a
@@ -910,8 +916,10 @@ impl Transfers {
         if matches!(res, Err(Error::Disconnected)) {
             let conns: Vec<_> = [&from, &to].into_iter().filter_map(|s| s.conn().cloned()).collect();
             let closed: Vec<_> = conns.iter().filter(|c| c.is_closed()).collect();
-            // A dead channel under a live connection: take down what we cannot tell apart.
-            for c in if closed.is_empty() { conns.iter().collect() } else { closed } {
+            // A dead channel under a live connection: take down what we cannot tell apart. A direct
+            // run loses its own connection, not these.
+            let suspects = if !closed.is_empty() { closed } else if direct { Vec::new() } else { conns.iter().collect() };
+            for c in suspects {
                 self.pool.lost(c).await;
             }
         }

@@ -484,7 +484,7 @@ export class MockBackend implements Backend {
       this.jobs.push({
         id: ++this.jobId, batch, name: e.name, tname, dir: e.dir, size, done: 0, speed: 0,
         from: { ...from }, to: { ...to }, move, state: 'wait', err: '', entry: { ...e }, row: null, connecting: false, countTicks: 0,
-        direct: this.direct && from.src !== 'ext' && !isLocal(from.src) && !isLocal(to.src),
+        direct: this.direct && from.src !== 'ext' && !isLocal(from.src) && !isLocal(to.src) && from.src !== to.src,
       });
     }
     if (!this.jobs.some(j => j.batch === batch)) return 0;

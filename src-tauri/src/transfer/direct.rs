@@ -19,7 +19,7 @@ use super::{
 };
 use crate::{
     error::{Error, Result},
-    fs::{sh_quote, valid_account},
+    fs::{login_line, sh_quote, valid_account},
     ssh::{Session, keys, known_hosts},
 };
 
@@ -65,7 +65,14 @@ impl Run<'_> {
         let it = self.item;
         let src = from.join(&it.from.path, &it.name);
         let dst = to.join(&it.to.path, &it.tname);
-        let meta = from.stat(&src).await?.ok_or_else(|| Error::Enoent { path: src.clone() })?;
+        let Some(meta) = from.stat(&src).await? else {
+            // A move paused as it ended: rsync had already sent and deleted the source.
+            if it.mv && self.resume.direct && to.lstat(&dst).await?.is_some() {
+                self.done().store(self.item_size(), Ordering::Relaxed);
+                return Ok(());
+            }
+            return Err(Error::Enoent { path: src });
+        };
         if meta.kind == Kind::Other {
             return Err(Error::NotRegular { path: src });
         }
@@ -74,6 +81,12 @@ impl Run<'_> {
         let is_link = from.lstat(&src).await?.is_some_and(|m| m.kind == Kind::Link);
         let link = it.mv && is_link;
         let dir = meta.kind == Kind::Dir;
+        // rsync would put a file inside a folder of its name, or fail to make a folder over a file.
+        if let Some(t) = to.stat(&dst).await?
+            && (t.kind == Kind::Dir) != dir
+        {
+            return Err(Error::Eexist { path: dst });
+        }
         let mut dirs: Vec<String> = Vec::new();
         if dir {
             self.q.set_state(self.id, super::St::Count);
@@ -101,7 +114,7 @@ impl Run<'_> {
                 let (s, d) = if dir { (format!("{src}/"), format!("{dst}/")) } else { (src.clone(), dst.clone()) };
                 // A folder's link is followed by the trailing slash; a file's needs -L.
                 let cmd = rsync_cmd(&reach, &s, &d, self.keep_time, mv, is_link && !dir);
-                self.exec(&cmd, &reach, &dst).await?;
+                self.exec(&cmd, &reach, &src, &dst).await?;
                 if mv && dir {
                     // rsync deleted the files it sent; the emptied folders go, deepest first.
                     for rel in &dirs {
@@ -112,9 +125,14 @@ impl Run<'_> {
             }
             Tool::Scp => {
                 let part = to.part_of(&dst);
+                // scp has no resume: the file goes again from its start.
+                self.done().store(0, Ordering::Relaxed);
                 self.q.part_started(self.id, "", meta.size, meta.mtime);
-                let cmd = scp_cmd(&reach, &src, &part, self.keep_time);
-                self.exec(&cmd, &reach, &dst).await?;
+                let cmd = scp_cmd(&reach, &src, &part);
+                self.exec(&cmd, &reach, &src, &dst).await?;
+                if self.keep_time {
+                    to.set_mtime(&part, meta.mtime).await?;
+                }
                 to.rename_over(&part, &dst).await?;
                 self.q.part_done(self.id, "");
                 if it.mv && !link {
@@ -157,10 +175,13 @@ impl Run<'_> {
     }
 
     /// Runs the copy on the source, with the agent forwarded for as long as it runs.
-    async fn exec(&self, cmd: &str, reach: &Reach, dst: &str) -> Result<()> {
+    async fn exec(&self, cmd: &str, reach: &Reach, src: &str, dst: &str) -> Result<()> {
         // sshd forwards the agent once per connection and keeps its socket until the connection
         // ends: each run gets a connection of its own, so the socket lives as long as the run.
-        let (s, _) = self.q.ssh.open_xfer(&self.item.from.src, &self.item.from.user).await?;
+        let (s, _) = self.q.ssh.open_xfer(&self.item.from.src, &self.item.from.user).await.map_err(|e| match e {
+            Error::Stopped | Error::ServerGone => e,
+            e => failed(format!("второе подключение к серверу-источнику не открылось: {e}")),
+        })?;
         let _bye = Bye(s.clone());
         let _fwd = s.fwd.hold();
         let mut ch = Closing(Some(s.handle.channel_open_session().await?));
@@ -180,6 +201,7 @@ impl Run<'_> {
         let mut out = Output::default();
         let mut stop = self.stop.clone();
         let mut code: Option<u32> = None;
+        let mut started = false;
         loop {
             let c = ch.get()?;
             let msg = tokio::select! {
@@ -194,6 +216,7 @@ impl Run<'_> {
             match msg {
                 Some(ChannelMsg::Data { data }) | Some(ChannelMsg::ExtendedData { data, .. }) => {
                     for p in out.feed(&data) {
+                        started |= p.0 > 0 || p.1 > 0;
                         let now = progress(p, size);
                         if now > self.done().load(Ordering::Relaxed) {
                             self.done().store(now, Ordering::Relaxed);
@@ -210,7 +233,7 @@ impl Run<'_> {
             Some(0) => Ok(()),
             // The channel ended without a status: the connection went.
             None => Err(Error::Disconnected),
-            Some(n) => Err(explain(n, &out.tail(), reach, dst)),
+            Some(n) => Err(explain(n, &out.tail(), reach, src, dst, started)),
         }
     }
 }
@@ -281,7 +304,11 @@ async fn probe(src: &Session, dst: &Session, dir: bool) -> Result<Tool> {
 
 /// Which of rsync and scp a server has, one per line.
 async fn tools(s: &Session) -> Result<Option<String>> {
-    let cmd = sh_line("command -v rsync >/dev/null 2>&1 && echo rsync; command -v scp >/dev/null 2>&1 && echo scp; echo kite-probe");
+    // scp counts only with -s (OpenSSH 8.7+): without it the remote path goes through a shell there.
+    let cmd = login_line(
+        "command -v rsync >/dev/null 2>&1 && echo rsync; \
+         command -v scp >/dev/null 2>&1 && { LC_ALL=C scp -s 2>&1 | grep -q 'unknown option' || echo scp; }; echo kite-probe",
+    );
     tokio::time::timeout(PROBE_WAIT, capture(&s.handle, &cmd)).await.map_err(|_| failed(format!("{} не ответил на проверку rsync", s.code)))?
 }
 
@@ -315,10 +342,14 @@ fn remote(r: &Reach, path: &str) -> String {
 
 /// The ssh that rsync or scp starts on the source: our known keys only, no prompts, no config of
 /// the source user, nothing forwarded further.
-fn ssh_opts() -> &'static str {
-    "-F /dev/null -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=\"$k\" -o GlobalKnownHostsFile=/dev/null \
-     -o PreferredAuthentications=publickey -o ForwardAgent=no -o ClearAllForwardings=yes -o ConnectTimeout=15 \
-     -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o LogLevel=ERROR"
+/// `k` is how the known_hosts path is written: `"$k"` as a word of sh, `'$k'` inside rsync's
+/// `-e "…"`, where sh expands it and rsync splits by the single quotes.
+fn ssh_opts(k: &str) -> String {
+    format!(
+        "-F /dev/null -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile={k} -o GlobalKnownHostsFile=/dev/null \
+         -o PreferredAuthentications=publickey -o ForwardAgent=no -o ClearAllForwardings=yes -o ConnectTimeout=15 \
+         -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o LogLevel=ERROR"
+    )
 }
 
 /// The script around a copy: a private temporary known_hosts that goes on any exit, the user's own
@@ -341,7 +372,9 @@ fn rsync_cmd(r: &Reach, src: &str, dst: &str, keep_time: bool, mv: bool, follow:
     flags.push_str(" -s --no-inc-recursive --info=progress2");
     flags.push_str(&format!(" --partial-dir={PART_DIR}"));
     if mv {
-        flags.push_str(" --remove-source-files");
+        // -I: a target file of the same size and date is sent anyway. rsync would skip it and still
+        // delete the source; the relay replaces it.
+        flags.push_str(" --remove-source-files -I");
     }
     if follow {
         flags.push_str(" -L");
@@ -349,29 +382,18 @@ fn rsync_cmd(r: &Reach, src: &str, dst: &str, keep_time: bool, mv: bool, follow:
     let body = format!(
         "env LC_ALL=C rsync {flags} -e \"ssh -p {} {}\" {} {}",
         r.port,
-        ssh_opts(),
+        ssh_opts("'$k'"),
         sh_quote(src),
         sh_quote(&remote(r, dst))
     );
-    sh_line(&script(r, &body))
+    login_line(&script(r, &body))
 }
 
-fn scp_cmd(r: &Reach, src: &str, part: &str, keep_time: bool) -> String {
-    // -s: the SFTP protocol, so the remote path is taken as it is, not by a shell there.
-    let body = format!(
-        "env LC_ALL=C scp -s{} -P {} {} {} {}",
-        if keep_time { " -p" } else { "" },
-        r.port,
-        ssh_opts(),
-        sh_quote(src),
-        sh_quote(&remote(r, part))
-    );
-    sh_line(&script(r, &body))
-}
-
-/// Any login shell (bash, fish, tcsh) hands this to `sh` as one argument.
-fn sh_line(script: &str) -> String {
-    format!("exec sh -c {}", sh_quote(script))
+fn scp_cmd(r: &Reach, src: &str, part: &str) -> String {
+    // -s: the SFTP protocol, so the remote path is taken as it is, not by a shell there. No -p: the
+    // mode follows the target's umask as with rsync; the date is set over SFTP afterwards.
+    let body = format!("env LC_ALL=C scp -s -P {} {} {} {}", r.port, ssh_opts("\"$k\""), sh_quote(src), sh_quote(&remote(r, part)));
+    login_line(&script(r, &body))
 }
 
 /// The command's output, split at `\r` and `\n`: progress lines and the tail for an error.
@@ -439,14 +461,25 @@ fn progress((bytes, pct): (u64, u8), size: u64) -> u64 {
     bytes.max(share).min(size)
 }
 
-/// A failed run in the user's words. Rights on the target are EACCES (the queue offers root);
-/// everything else asks for the relay.
-fn explain(code: u32, tail: &[String], r: &Reach, dst: &str) -> Error {
+/// rsync's exit codes for a link that broke: protocol stream, timeouts, the ssh under it.
+const LINK_CODES: [u32; 4] = [12, 30, 35, 255];
+
+/// A failed run in the user's words. Rights are EACCES on the side rsync names (the queue offers
+/// root); a link that broke after the copy began is a drop, retried by the same route; everything
+/// else asks for the relay.
+fn explain(code: u32, tail: &[String], r: &Reach, src: &str, dst: &str, started: bool) -> Error {
     let has = |s: &str| tail.iter().any(|l| l.contains(s));
-    if has("Permission denied (13)") || has("mkstemp") && has("Permission denied") {
-        return Error::Eacces { path: dst.into() };
+    let denied: Vec<&String> = tail.iter().filter(|l| l.contains("Permission denied (13)") || l.contains("mkstemp") && l.contains("Permission denied")).collect();
+    if !denied.is_empty() {
+        // rsync 3.2+ tags the side; older ones say `send_files failed to open` for a source file.
+        let source = denied.iter().all(|l| l.contains("[sender]") || l.contains("send_files"));
+        return Error::Eacces { path: if source { src } else { dst }.into() };
     }
     let target = format!("{}:{}", r.host, r.port);
+    let refused = has("Host key verification failed") || has("REMOTE HOST IDENTIFICATION HAS CHANGED") || has("Permission denied (publickey");
+    if started && !refused && LINK_CODES.contains(&code) {
+        return Error::Disconnected;
+    }
     let reason = if has("Host key verification failed") || has("REMOTE HOST IDENTIFICATION HAS CHANGED") {
         format!("ключ хоста {target} не совпал с сохранённым")
     } else if has("Permission denied (publickey") || has("Permission denied, please try again") {
@@ -471,14 +504,17 @@ fn explain(code: u32, tail: &[String], r: &Reach, dst: &str) -> Error {
 /// Removes what interrupted direct runs left on the target: rsync's part folders under the item,
 /// or the one next to a single file.
 pub async fn clean(s: &Session, root: &str, name: &str, dir: bool) {
-    let cmd = if dir {
-        format!("find {} -type d -name {PART_DIR} -prune -exec rm -rf -- {{}} + 2>/dev/null; echo kite-probe", sh_quote(root))
+    let rm = if dir {
+        format!("find {} -type d -name {PART_DIR} -prune -exec rm -rf -- {{}} + 2>/dev/null", sh_quote(root))
     } else {
         let (parent, _) = root.rsplit_once('/').unwrap_or(("", root));
         let pd = format!("{}/{PART_DIR}", if parent.is_empty() { "" } else { parent });
-        format!("rm -f -- {} 2>/dev/null; rmdir -- {} 2>/dev/null; echo kite-probe", sh_quote(&format!("{pd}/{name}")), sh_quote(&pd))
+        format!("rm -f -- {} 2>/dev/null; rmdir -- {} 2>/dev/null", sh_quote(&format!("{pd}/{name}")), sh_quote(&pd))
     };
-    let _ = tokio::time::timeout(PROBE_WAIT, capture(&s.handle, &sh_line(&cmd))).await;
+    // A receiver that is still dying moves its temporary file into the part folder only when it hears
+    // of the end: a second pass takes what it put there after the first.
+    let cmd = format!("{rm}; sleep 2; {rm}; echo kite-probe");
+    let _ = tokio::time::timeout(PROBE_WAIT, capture(&s.handle, &login_line(&cmd))).await;
 }
 
 #[cfg(test)]
@@ -516,30 +552,53 @@ mod tests {
     #[test]
     fn errors_are_worded() {
         let r = reach();
-        let e = |lines: &[&str], code| match explain(code, &lines.iter().map(|s| s.to_string()).collect::<Vec<_>>(), &r, "/d/x") {
+        let e = |lines: &[&str], code, started| match explain(code, &lines.iter().map(|s| s.to_string()).collect::<Vec<_>>(), &r, "/s/x", "/d/x", started) {
             Error::DirectFailed { reason } => reason,
             Error::Eacces { path } => format!("EACCES {path}"),
             other => format!("{other:?}"),
         };
-        assert!(e(&["Host key verification failed."], 255).contains("не совпал"));
-        assert!(e(&["key@10.0.0.2: Permission denied (publickey)."], 255).contains("не принят"));
-        assert!(e(&["ssh: connect to host 10.0.0.2 port 2222: Connection refused"], 255).contains("не видит"));
-        assert_eq!(e(&["rsync: mkstemp \"/d/.x.Ab\" failed: Permission denied (13)"], 23), "EACCES /d/x");
-        assert_eq!(e(&[], 5), "код выхода 5");
+        assert!(e(&["Host key verification failed."], 255, false).contains("не совпал"));
+        assert!(e(&["key@10.0.0.2: Permission denied (publickey)."], 255, false).contains("не принят"));
+        assert!(e(&["ssh: connect to host 10.0.0.2 port 2222: Connection refused"], 255, false).contains("не видит"));
+        assert_eq!(e(&["rsync: [receiver] mkstemp \"/d/.x.Ab\" failed: Permission denied (13)"], 23, true), "EACCES /d/x");
+        assert_eq!(e(&["rsync: [sender] send_files failed to open \"/s/x\": Permission denied (13)"], 23, true), "EACCES /s/x");
+        assert_eq!(e(&["rsync: send_files failed to open \"/s/x\": Permission denied (13)"], 23, true), "EACCES /s/x");
+        // A link that broke midway is a drop; before the copy began it is a reason.
+        assert_eq!(e(&["rsync: connection unexpectedly closed"], 12, true), "Disconnected");
+        assert!(!e(&["rsync: connection unexpectedly closed"], 12, false).contains("Disconnected"));
+        assert!(e(&["Host key verification failed."], 255, true).contains("не совпал"));
+        assert_eq!(e(&[], 5, false), "код выхода 5");
+    }
+
+    /// The script a login line carries, as sh gets it.
+    fn decode(line: &str) -> String {
+        let body = line.strip_prefix("exec sh -c 'eval \"$(printf \"").and_then(|r| r.strip_suffix("\")\"'")).unwrap();
+        let mut out = Vec::new();
+        let mut it = body.bytes();
+        while let Some(b) = it.next() {
+            if b == b'\\' {
+                let d: String = (0..3).map(|_| it.next().unwrap() as char).collect();
+                out.push(u8::from_str_radix(&d, 8).unwrap());
+            } else {
+                out.push(b);
+            }
+        }
+        String::from_utf8(out).unwrap()
     }
 
     #[test]
     fn commands_quote_paths() {
         let r = reach();
-        let c = rsync_cmd(&r, "/src/it's here/", "/dst/a b/", true, false, false);
-        assert!(c.starts_with("exec sh -c '"));
-        // The path is quoted for the inner sh, and that again for the login shell.
-        assert!(c.contains(r"it'\''\'\'''\''s here"), "{c}");
+        let c = decode(&rsync_cmd(&r, "/src/it's here/", "/dst/a b/", true, false, false));
+        assert!(c.contains(r"'/src/it'\''s here/'"), "{c}");
         assert!(c.contains("--partial-dir=.kite-rsync-part"));
+        assert!(c.contains("UserKnownHostsFile='$k'"));
         assert!(!c.contains("--remove-source-files"));
-        assert!(rsync_cmd(&r, "/a", "/b", false, true, false).contains("-rlE -s"));
-        let s = scp_cmd(&r, "/a", "/b/.x.kite-part", false);
+        assert!(decode(&rsync_cmd(&r, "/a", "/b", false, true, false)).contains("-rlE -s --no-inc-recursive --info=progress2 --partial-dir=.kite-rsync-part --remove-source-files -I"));
+        assert!(decode(&rsync_cmd(&r, "/a", "/b", false, false, true)).contains(" -L"));
+        let s = decode(&scp_cmd(&r, "/a", "/b/.x.kite-part"));
         assert!(s.contains("scp -s -P 2222"));
+        assert!(s.contains("UserKnownHostsFile=\"$k\""));
         assert!(remote(&Reach { host: "::1".into(), ..reach() }, "/p").starts_with("key@[::1]:"));
     }
 

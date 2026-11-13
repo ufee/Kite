@@ -38,6 +38,28 @@ const stamp = (ms: number) => {
 };
 const row = (r: CoreRow): LogRow => ({ id: r.id, time: stamp(r.ts), src: r.src === 'local' ? tr('Этот ПК') : r.src, tag: r.tag, text: msg(r.text), note: msg(r.note), state: r.state });
 
+/** Why a direct run failed, as the core words it; `{x}` parts carry names and addresses. */
+const DIRECT_REASONS = [
+  'агент OpenSSH не запущен', 'в агенте OpenSSH нет ключей', 'сервер-источник не разрешает проброс агента',
+  'на сервере-источнике нельзя запускать команды', 'на сервере-источнике не создаётся временный файл', 'rsync не запустился',
+  'имя пользователя {u} не подходит для ssh', 'адрес {h} не подходит для ssh', 'ключ хоста {c} не сохранён в known_hosts',
+  'второе подключение к серверу-источнику не открылось: {e}', 'на {c} нельзя запускать команды', 'нет rsync на {c}',
+  '{c} не ответил на проверку rsync', 'ключ хоста {t} не совпал с сохранённым', 'ключ из агента не принят на {t} для {u}',
+  'сервер-источник не видит {t}',
+].map(s => {
+  const names = [...s.matchAll(/\{(\w+)\}/g)].map(m => m[1]);
+  const re = new RegExp(`^${s.replace(/[.*+?^$()|[\]\\]/g, '\\$&').replace(/\{\w+\}/g, '(.+?)')}$`);
+  return { s, names, re };
+});
+/** Known reasons in the UI's language; tool output (rsync, ssh) stays as it is. */
+function directReason(r: string): string {
+  for (const { s, names, re } of DIRECT_REASONS) {
+    const m = re.exec(r);
+    if (m) return tr(s, Object.fromEntries(names.map((n, i) => [n, m[i + 1]])));
+  }
+  return r;
+}
+
 /** Words for the core's error codes; the table of spec section 5 where it has one. */
 function words(e: CoreError): [string, string] {
   switch (e.code) {
@@ -73,7 +95,7 @@ function words(e: CoreError): [string, string] {
     case 'EDIT_WAITS': return [tr('Правка ждёт: {p}', { p: e.path }), tr('Загрузка в этот файл стоит на паузе в очереди; правка уйдёт после неё.')];
     case 'NOT_REGULAR': return [tr('Не обычный файл: {p}', { p: e.path }), tr('Каналы, сокеты и устройства не передаются.')];
     // The core's reason is a lowercase note, as in the log.
-    case 'DIRECT_FAILED': return [tr('Напрямую не получилось'), (e.reason ?? '').replace(/^./, c => c.toUpperCase())];
+    case 'DIRECT_FAILED': return [tr('Напрямую не получилось'), directReason(e.reason ?? '').replace(/^./, c => c.toUpperCase())];
     default:
       if (e.code.startsWith('IMPORT_')) return [importWords(e as ImportFail).title, ''];
       return [tr('Ошибка SSH'), e.reason ?? ''];

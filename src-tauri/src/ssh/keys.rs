@@ -180,8 +180,21 @@ const AGENT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The OpenSSH agent: the Windows service pipe, `SSH_AUTH_SOCK` elsewhere. `None` when it is not running.
 pub async fn agent() -> Option<Agent> {
+    // A refusal may be a busy pipe (other connections at the same moment): a few more tries.
     #[cfg(windows)]
-    let client = tokio::time::timeout(AGENT_TIMEOUT, AgentClient::connect_named_pipe(r"\\.\pipe\openssh-ssh-agent")).await.ok()?.ok()?;
+    let client = {
+        let mut tries = 0;
+        loop {
+            match tokio::time::timeout(AGENT_TIMEOUT, AgentClient::connect_named_pipe(r"\\.\pipe\openssh-ssh-agent")).await {
+                Ok(Ok(c)) => break c,
+                Ok(Err(_)) if tries < 5 => {
+                    tries += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                _ => return None,
+            }
+        }
+    };
     #[cfg(unix)]
     let client = tokio::time::timeout(AGENT_TIMEOUT, AgentClient::connect_env()).await.ok()?.ok()?;
     Some(client.dynamic())

@@ -101,8 +101,21 @@ trait Stream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Stream for T {}
 
 async fn connect() -> std::io::Result<Box<dyn Stream>> {
+    // All instances of the agent's pipe busy (several signatures at once): wait for a free one.
     #[cfg(windows)]
-    let s = tokio::net::windows::named_pipe::ClientOptions::new().open(r"\\.\pipe\openssh-ssh-agent")?;
+    let s = {
+        const PIPE_BUSY: i32 = 231;
+        let mut tries = 0;
+        loop {
+            match tokio::net::windows::named_pipe::ClientOptions::new().open(r"\\.\pipe\openssh-ssh-agent") {
+                Err(e) if e.raw_os_error() == Some(PIPE_BUSY) && tries < 50 => {
+                    tries += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                r => break r?,
+            }
+        }
+    };
     #[cfg(unix)]
     let s = tokio::net::UnixStream::connect(std::env::var("SSH_AUTH_SOCK").map_err(std::io::Error::other)?).await?;
     Ok(Box::new(s))

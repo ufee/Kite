@@ -27,8 +27,10 @@ export const qStat = computed(() => {
 export const qPct = (q: TransferItem) => (q.size ? Math.floor((q.done / q.size) * 100) : 0);
 export const routeLabel = (q: TransferItem) => {
   const ext = q.from.src === 'ext', relay = !ext && !isLocal(q.from.src) && !isLocal(q.to.src);
-  // Not started yet: the route the setting will give it.
-  const direct = relay && (q.direct || (q.state === 'wait' && settings.agentFwd && !q.relay));
+  // Running or done: the route it took. Otherwise the one its next start takes; one server
+  // copies within itself through Kite.
+  const live = q.state === 'run' || q.state === 'done';
+  const direct = relay && (live ? !!q.direct : settings.agentFwd && !q.relay && q.from.src !== q.to.src);
   return `${ext ? tr('Проводник') : label(q.from.src as string)} → ${label(q.to.src as string)}` + (direct ? tr(' · напрямую') : relay ? tr(' · через Kite') : '');
 };
 
@@ -37,14 +39,16 @@ export const routeLabel = (q: TransferItem) => {
 const directFailed = (q: TransferItem) => q.state === 'err' && q.code === 'DIRECT_FAILED';
 /** One question per batch and pair of servers; the answer covers all of its items. */
 const pairKey = (q: TransferItem) => `${q.batch}|${q.from.src}|${q.to.src}`;
-const asked = new Set<string>();
+/** Items a question already covered. A covered item that is retried and fails again is a new failure. */
+const covered = new Set<number>();
+let failedBefore = new Set<number>();
 /** The unfinished items of that batch and pair: the answer moves them all to Kite. */
-const pairIds = (q: TransferItem) =>
-  queue.value.filter(x => pairKey(x) === pairKey(q) && x.state !== 'done' && (x.state !== 'err' || directFailed(x))).map(x => x.id);
+const pairIds = (q: TransferItem, items = queue.value) =>
+  items.filter(x => pairKey(x) === pairKey(q) && x.state !== 'done' && (x.state !== 'err' || directFailed(x))).map(x => x.id);
 export const relayQ = (q: TransferItem) => backend.transferRelay([q.id]);
 
-async function askRelay(q: TransferItem) {
-  asked.add(pairKey(q));
+async function askRelay(q: TransferItem, items: TransferItem[]) {
+  for (const id of pairIds(q, items)) covered.add(id);
   const go = await ask<boolean>('confirm', {
     title: tr('Напрямую не получилось'),
     // The reason without the title, which the dialog already shows.
@@ -56,7 +60,10 @@ async function askRelay(q: TransferItem) {
 }
 
 function watchDirect(items: TransferItem[]) {
-  for (const q of items) if (directFailed(q) && !asked.has(pairKey(q))) void askRelay(q);
+  const now = new Set(items.filter(directFailed).map(x => x.id));
+  for (const id of failedBefore) if (!now.has(id)) covered.delete(id);
+  failedBefore = now;
+  for (const q of items) if (directFailed(q) && !covered.has(q.id)) void askRelay(q, items);
 }
 
 export async function transfer(from: Endpoint, entries: Entry[], to: Endpoint, move: boolean) {
@@ -101,16 +108,21 @@ export async function initQueue() {
   backend.onTransferState(items => { queue.value = items; watchDirect(items); });
   backend.onTransferBatch(async b => {
     // Failures that are only failed direct runs: the question about Kite says it all. The batch
-    // event may come before the last state, so the items are read as they are now.
+    // event may come before the last state, so the items are read as they are now and asked here.
     if (b.bad) {
-      const failed = (await backend.transferList()).filter(q => q.batch === b.batch && q.state === 'err');
-      if (failed.length && failed.every(directFailed)) return;
+      const list = await backend.transferList();
+      const failed = list.filter(q => q.batch === b.batch && q.state === 'err');
+      if (failed.length && failed.every(directFailed)) {
+        for (const q of failed) if (!covered.has(q.id)) void askRelay(q, list);
+        return;
+      }
     }
     if (b.bad) toast(tr('Передано {ok} из {n}, ошибок: {bad}', { ok: b.ok, n: b.total, bad: b.bad }), 'bad', { label: 'Очередь', run: () => { ui.queueOpen = true; } }, 5000);
     else if (b.ok) toast(tr(b.move ? 'Перемещено: {what} в {to}' : 'Скопировано: {what} в {to}', { what: objs(b.ok), to: label(b.to) }), 'ok');
   });
   queue.value = await backend.transferList();
   // Failed before this start: the row offers Kite, no question pops up at launch.
-  for (const q of queue.value) if (directFailed(q)) asked.add(pairKey(q));
+  for (const q of queue.value) if (directFailed(q)) covered.add(q.id);
+  failedBefore = new Set(covered);
   waveBusy(() => queue.value.some(q => q.state === 'run'));
 }

@@ -15,7 +15,7 @@ use russh_sftp::{
     protocol::{File, FileAttributes, OpenFlags, StatusCode},
 };
 
-use super::{Entry, MAX_TEXT, TextFile, join, normalize, perm_text, sh_quote, valid_account};
+use super::{Entry, MAX_TEXT, TextFile, join, login_line, normalize, perm_text, sh_quote, valid_account};
 use crate::{
     error::{Error, Result},
     ssh::{Session, sftp::fs_error},
@@ -322,7 +322,7 @@ pub async fn delete(s: &Session, path: &str) -> Result<usize> {
 async fn exec(s: &Session, cmd: &str) -> Result<std::result::Result<(), String>> {
     const MARK: &str = "kite-ok";
     let mut ch = s.handle.channel_open_session().await?;
-    ch.exec(true, format!("{cmd} && echo {MARK}")).await?;
+    ch.exec(true, login_line(&format!("{cmd} && echo {MARK}"))).await?;
     ch.eof().await?;
     let (mut out, mut err) = (Vec::new(), Vec::new());
     while let Some(m) = ch.wait().await {
