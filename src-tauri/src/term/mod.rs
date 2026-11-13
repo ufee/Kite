@@ -833,7 +833,8 @@ mod tests {
         let tmp = std::env::temp_dir();
         let start = tmp.join(format!("kite-spare-start-{}", std::process::id()));
         // A space and characters outside the console code page.
-        let target = tmp.join(format!("kite spare №1 — тест {}", std::process::id()));
+        let name = format!("kite spare №1 — тест {}", std::process::id());
+        let target = tmp.join(&name);
         std::fs::create_dir_all(&start).unwrap();
         std::fs::create_dir_all(&target).unwrap();
         let home = target.to_string_lossy().into_owned();
@@ -856,9 +857,11 @@ mod tests {
         });
         let open = take_spare(&terms, "powershell", &home, 100, 30, output, on_exit).ok().expect("the spare is taken");
         // The first prompt is in the tab's folder, and the folder was not echoed as typed text.
+        // By name only: the temp folder may be given in its 8.3 form (`RUNNER~1`), the prompt
+        // shows the long one.
         let mut seen = String::new();
         let until = std::time::Instant::now() + Duration::from_secs(20);
-        while !seen.contains(&format!("PS {home}>")) {
+        while !seen.contains(&format!("\\{name}> ")) {
             let left = until.saturating_duration_since(std::time::Instant::now());
             let chunk = rx.recv_timeout(left).unwrap_or_else(|_| panic!("no prompt in {home}: {seen:?}"));
             // Taken this early, the cursor question reaches the tab: answer it as xterm does.
@@ -867,7 +870,7 @@ mod tests {
             }
             seen.push_str(&String::from_utf8_lossy(&chunk));
         }
-        assert_eq!(seen.matches(home.as_str()).count(), 1, "{seen:?}");
+        assert_eq!(seen.matches(name.as_str()).count(), 1, "{seen:?}");
         assert!(!seen.contains(READY_TITLE), "{seen:?}");
         let _ = open.handle.send(Command::Input(b"exit\r".to_vec()));
         assert_eq!(erx.recv_timeout(Duration::from_secs(10)).unwrap(), Exit::Exited);
