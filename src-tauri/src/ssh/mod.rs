@@ -183,6 +183,8 @@ struct Shake {
     /// The login waited for a passphrase dialog, its own or another connection's.
     waited: AtomicBool,
     first_kex: AtomicBool,
+    /// The server's version line names OpenSSH.
+    openssh: AtomicBool,
     dropped: watch::Sender<bool>,
     /// Direct copies that want the agent on this connection.
     fwd: agent_fwd::Forwards,
@@ -215,10 +217,13 @@ impl client::Handler for Client {
         names: &russh::Names,
         session: &mut client::Session,
     ) -> std::result::Result<(), Self::Error> {
+        let id = String::from_utf8_lossy(session.remote_sshid()).trim().to_owned();
+        // "SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13": the software part follows the second dash.
+        let software = id.splitn(3, '-').nth(2).unwrap_or("");
+        self.shake.openssh.store(software.starts_with("OpenSSH"), Ordering::Relaxed);
         if self.shake.first_kex.swap(false, Ordering::Relaxed)
             && let Some(ssh) = self.shake.ssh.upgrade()
         {
-            let id = String::from_utf8_lossy(session.remote_sshid()).trim().to_owned();
             ssh.log.ok(&self.shake.code, "SSH", msg!("Сервер {v}", v = id));
             ssh.log.ok(&self.shake.code, "KEX", format!("{} · {}", names.kex.as_ref(), names.cipher.as_ref()));
         }
@@ -265,6 +270,8 @@ struct Shaken {
     /// Turns true when the connection drops.
     dropped: watch::Receiver<bool>,
     fwd: agent_fwd::Forwards,
+    /// See `Shake::openssh`.
+    openssh: bool,
 }
 
 /// A live connection after login with its SFTP channel.
@@ -281,6 +288,8 @@ pub struct Session {
     pub code: String,
     /// The server announced `posix-rename@openssh.com` at init.
     pub posix_rename: bool,
+    /// Several READDIR on one handle are safe here: see `sftp::Opened::in_order`.
+    pub in_order: bool,
     closing: AtomicBool,
 }
 
@@ -530,6 +539,7 @@ impl Ssh {
             asked: AtomicBool::new(false),
             waited: AtomicBool::new(false),
             first_kex: AtomicBool::new(true),
+            openssh: AtomicBool::new(false),
             dropped,
             fwd: agent_fwd::Forwards::default(),
         });
@@ -555,13 +565,13 @@ impl Ssh {
         let dropped = shake.dropped.subscribe();
         // Report mode never sends a password to a host it could not verify.
         if let (HostSeen::Unverified(_), Method::Password(_)) = (&seen, method) {
-            return Ok(Shaken { handle, seen, dropped, fwd: shake.fwd.clone() });
+            return Ok(Shaken { handle, seen, dropped, fwd: shake.fwd.clone(), openssh: shake.openssh.load(Ordering::Relaxed) });
         }
         let who = auth::Who { permit: Some(&shake.permit), waited: Some(&shake.waited), ..t.who() };
         let res = auth::login(self, &mut handle, &who, method).await;
         drop(shake.permit.lock().await.take());
         match res {
-            Ok(()) => Ok(Shaken { handle, seen, dropped, fwd: shake.fwd.clone() }),
+            Ok(()) => Ok(Shaken { handle, seen, dropped, fwd: shake.fwd.clone(), openssh: shake.openssh.load(Ordering::Relaxed) }),
             Err(e) => {
                 // A passphrase dialog took longer than LoginGraceTime: the key is open now,
                 // try once more. A password is never sent twice. `is_closed` covers the moment
@@ -578,8 +588,8 @@ impl Ssh {
     }
 
     async fn open_session(self: &Arc<Self>, t: &Target, method: &Method, mode: HostMode) -> Result<(Arc<Session>, watch::Receiver<bool>)> {
-        let Shaken { handle, dropped, fwd, .. } = self.handshake(t, method, mode).await?;
-        let (sftp, version, home, posix_rename) = match sftp::open(&handle).await {
+        let Shaken { handle, dropped, fwd, openssh, .. } = self.handshake(t, method, mode).await?;
+        let sftp::Opened { raw: sftp, version, home, posix_rename, in_order } = match sftp::open(&handle).await {
             Ok(v) => v,
             Err(e) => {
                 self.log.err(&t.code, "SFTP", "Подсистема SFTP не запустилась", e.to_string());
@@ -588,7 +598,10 @@ impl Ssh {
             }
         };
         self.log.ok(&t.code, "SFTP", msg!("Подсистема запущена, протокол v{v}", v = version));
-        let s = Session { handle, host: t.host.clone(), port: t.port, fwd, sftp, home, code: t.code.clone(), posix_rename, closing: AtomicBool::new(false) };
+        // Other servers announce `limits@openssh.com` too (Apache MINA SSHD), and may answer READDIR
+        // out of order: the version line has to agree.
+        let in_order = in_order && openssh;
+        let s = Session { handle, host: t.host.clone(), port: t.port, fwd, sftp, home, code: t.code.clone(), posix_rename, in_order, closing: AtomicBool::new(false) };
         Ok((Arc::new(s), dropped))
     }
 

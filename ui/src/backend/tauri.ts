@@ -321,4 +321,6 @@ export class TauriBackend extends MockBackend {
   override ptyResize(id: number, cols: number, rows: number) { void invoke('pty_resize', { id, cols, rows }); }
   override ptyPause(id: number, paused: boolean) { void invoke('pty_pause', { id, paused }); }
   override ptyClose(id: number) { this.bigWrite.delete(id); void invoke('pty_close', { id }); }
+  // A shell that fails to start here fails again, with its reason, in the tab that asks for it.
+  override ptyPrewarm(cwd: string, shell: string) { invoke('pty_prewarm', { cwd, shell }).catch(() => undefined); }
 }
