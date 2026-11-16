@@ -8,7 +8,7 @@ import { openMenu } from '../state/overlay';
 import { label, srvBy, srvTitle } from '../state/servers';
 import {
   cancelEdit, clickRow, clickUp, commitEdit, copyPath, dragEnd, dragLeave, dragOver, dragStart, drop, dropHint, gridOf, goUp,
-  hasUp, listApi, openRow, paneFoot, panes, paneW, pathBlur, pathKey, refresh, retry, rowMenu, rows, selSet, setSource, sortBy, vis,
+  hasUp, inDrives, listApi, openRow, paneFoot, panes, paneW, pathBlur, pathKey, refresh, retry, rowMenu, rows, selSet, setSource, sortBy, vis,
 } from '../state/panes';
 import { termHere } from '../state/terms';
 import { startSplitDrag } from '../state/layout';
@@ -77,7 +77,7 @@ const isGhost = (name: string) => !!ui.dnd && ui.dnd.from === props.i && ui.dnd.
         <Icon n="user" s="s" />{{ p.user }}<Icon n="chev" s="xs" class="faint" />
       </button>
       <div class="pathbox" :class="{ err: p.pathErr }">
-        <input v-model="p.input" class="path-in" spellcheck="false" :title="p.pathErr || tr('Путь') + ' · Ctrl L'" @keydown="pathKey(i, $event)" @blur="pathBlur(i)" @focus="focusSel">
+        <input v-model="p.input" class="path-in" spellcheck="false" :placeholder="inDrives(i) ? tr('Этот ПК') : undefined" :title="p.pathErr || tr('Путь') + ' · Ctrl L'" @keydown="pathKey(i, $event)" @blur="pathBlur(i)" @focus="focusSel">
         <button class="copy" :class="{ done: ui.copied === i }" :title="tr(ui.copied === i ? 'Скопировано' : 'Копировать путь')" @click="copyPath(i)"><Icon :n="ui.copied === i ? 'check' : 'copy'" s="s" /></button>
       </div>
       <button class="ibtn" :title="tr('Обновить') + ' · Ctrl R'" @click="refresh(i)"><Icon n="refresh" :class="{ 'spin-once': p.spin }" /></button>
@@ -114,14 +114,14 @@ const isGhost = (name: string) => !!ui.dnd && ui.dnd.from === props.i && ui.dnd.
            @click="clickRow(i, e, $event)" @dblclick="openRow(i, e)" @contextmenu.prevent="rowMenu(i, e, $event)"
            @dragstart="dragStart(i, e, $event)" @dragend="dragEnd">
         <div class="fname">
-          <Icon :n="e.dir ? 'folder' : 'file'" :class="e.dir ? 'fdir' : 'ffile'" />
+          <Icon :n="inDrives(i) ? 'drive' : e.dir ? 'folder' : 'file'" :class="inDrives(i) ? 'ffile' : e.dir ? 'fdir' : 'ffile'" />
           <input v-if="p.edit && !p.edit.isNew && p.edit.name === e.name" v-model="p.edit.value" class="edit-in" spellcheck="false"
                  @keydown.enter.stop="commitEdit(i)" @keydown.esc.stop="cancelEdit(i)" @blur="commitEdit(i)" @click.stop @dblclick.stop>
           <span v-else :title="e.name.length > 28 ? e.name : undefined">{{ e.name }}</span>
           <Icon v-if="e.link" n="link" s="xs" class="flink" />
         </div>
         <div v-if="vis[i].size" class="num">{{ e.dir ? '' : fmtSize(e.size) }}</div>
-        <div v-if="vis[i].date" class="cell">{{ fmtDate(e.mtime) }}</div>
+        <div v-if="vis[i].date" class="cell">{{ e.mtime ? fmtDate(e.mtime) : '' }}</div>
         <template v-if="!isLocal(p.src)">
           <div v-if="vis[i].perm" class="perm">{{ e.perm }}</div>
           <div v-if="vis[i].owner" class="cell" :title="e.owner">{{ e.owner }}</div>
@@ -129,7 +129,7 @@ const isGhost = (name: string) => !!ui.dnd && ui.dnd.from === props.i && ui.dnd.
         </template>
       </div>
       <div :style="{ height: (list.length - range.end) * ROW_H + 'px' }"></div>
-      <div v-if="p.state === 'ok' && !list.length && !(p.edit && p.edit.isNew)" class="empty-note">{{ tr('Папка пуста') }}</div>
+      <div v-if="p.state === 'ok' && !list.length && !(p.edit && p.edit.isNew)" class="empty-note">{{ tr(inDrives(i) ? 'Дисков нет' : 'Папка пуста') }}</div>
     </div>
     <div class="pane-foot"><span>{{ paneFoot(i) }}</span><span v-if="p.dropping || p.dropRow" style="color:var(--ac)">{{ dropHint(i) }}</span></div>
 

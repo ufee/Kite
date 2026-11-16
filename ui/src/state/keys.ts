@@ -12,7 +12,7 @@ export const HOTKEYS: Record<string, string> = {
   'Серверы, папки, команды': 'Ctrl K', 'Поиск серверов': 'Ctrl P', 'Свернуть панель серверов': 'Ctrl B',
   'Только файлы · оба · только терминал': 'Ctrl 1 / 2 / 3', 'Показать или скрыть терминал': 'Ctrl `',
   'Другая панель': 'Tab', 'Открыть': 'Enter', 'Просмотр': 'F3', 'Редактировать': 'F4', 'Наверх': 'Backspace', 'Назад': 'Alt ←',
-  'Копировать в другую панель': 'F5', 'Переместить в другую панель': 'F6', 'Переименовать': 'F2', 'Новая папка': 'F7', 'Удалить': 'Del',
+  'Передать в другую панель': 'F5', 'Переместить в другую панель': 'F6', 'Переименовать': 'F2', 'Новая папка': 'F7', 'Удалить': 'Del',
   'Выделить всё': 'Ctrl A', 'Править путь': 'Ctrl L', 'Обновить': 'Ctrl R', 'Поменять панели местами': 'Ctrl U', 'Скрытые файлы': 'Ctrl H',
   'Открыть сервер в другой панели': 'Ctrl + щелчок', 'Переместить перетаскиванием': 'Shift + перетащить', 'Настройки': 'Ctrl ,',
 };
@@ -35,6 +35,7 @@ export function onKey(e: KeyboardEvent) {
   if (top?.kind === 'file') {
     if (k === 'Escape') { e.preventDefault(); closeDlg(null); }
     else if (k === 'F4') { e.preventDefault(); fileEdit(top.data); }
+    else if (e.altKey && e.code === 'KeyZ') { e.preventDefault(); ui.wrap = !ui.wrap; }
     return;
   }
   if (top) { if (k === 'Escape') { e.preventDefault(); closeDlg(null); } return; }

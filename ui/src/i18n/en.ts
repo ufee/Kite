@@ -137,7 +137,7 @@ export const EN: Record<string, string> = {
   'Одновременно': 'At once', 'Если имя занято': 'If the name is taken',
   'Спрашивать': 'Ask', 'Заменять': 'Replace', 'Оставлять оба': 'Keep both', 'Пропускать': 'Skip',
   'Не менять дату файлов при копировании': 'Keep file dates when copying', 'Редактор': 'Editor', 'Программа': 'App', 'Системный': 'System default',
-  'Сразу загружать правки на сервер': 'Upload edits right away', 'Локальная оболочка': 'Local shell', 'Командная строка': 'Command Prompt',
+  'Загружать правки на сервер при сохранении': 'Upload edits to the server on save', 'Локальная оболочка': 'Local shell', 'Командная строка': 'Command Prompt',
   'Копировать выделенное': 'Copy on select', 'Горячие клавиши': 'Keyboard shortcuts', 'Готово': 'Done',
   'Сохранять историю терминала': 'Save terminal history',
   'Последние 1000 строк каждой вкладки, только на этом ПК': 'The last 1000 lines of each tab, on this PC only',
@@ -157,7 +157,7 @@ export const EN: Record<string, string> = {
   // Hotkeys
   'Только файлы · оба · только терминал': 'Files · both · terminal', 'Показать или скрыть терминал': 'Show or hide terminal',
   'Свернуть панель серверов': 'Hide servers', 'Другая панель': 'Other pane', 'Назад': 'Back',
-  'Копировать в другую панель': 'Copy to the other pane', 'Переместить в другую панель': 'Move to the other pane',
+  'Передать в другую панель': 'Send to the other pane', 'Передать': 'Send', 'Переместить в другую панель': 'Move to the other pane',
   'Выделить всё': 'Select all', 'Править путь': 'Edit path', 'Открыть сервер в другой панели': 'Open server in the other pane',
   'Переместить перетаскиванием': 'Move by dragging', 'Ctrl + щелчок': 'Ctrl + click', 'Shift + перетащить': 'Shift + drag',
 
@@ -309,4 +309,12 @@ export const EN: Record<string, string> = {
   'Не найдено: {p}': 'Not found: {p}', 'Операция не выполнена': 'Operation failed',
   'Владелец не изменён': 'Owner not changed', 'Сервер не выполняет команды: только SFTP.': 'The server runs no commands: SFTP only.',
   'больше 10 МБ': 'over 10 MB', 'двоичный': 'binary', '{n} байт': '{n} bytes',
+
+  // Drives, viewer, send
+  'Выберите диск': 'Pick a drive', 'Дисков нет': 'No drives', 'Диск целиком не копируется': 'A whole drive is not copied',
+  'Откройте папку в другой панели': 'Open a folder in the other pane',
+  'Перенос строк': 'Wrap lines', 'Переносить длинные строки': 'Wrap long lines', 'Встроенный': 'Built-in',
+  'Файл с сервера открывается копией только для чтения': 'A server file opens as a read-only copy',
+  '{n} открыт в {app} только для чтения': '{n} opened in {app}, read-only',
+  'копия для просмотра': 'copy to view', 'Только просмотр {n} · {app}': 'View only {n} · {app}',
 };

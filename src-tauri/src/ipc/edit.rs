@@ -20,6 +20,15 @@ pub async fn edit_open(edits: EditState<'_>, src: Src, path: String, editor: Str
     }
 }
 
+/// Opens a file in an external program to look at; a server file goes there as a read-only copy.
+#[tauri::command]
+pub async fn view_open(edits: EditState<'_>, src: Src, path: String, viewer: String) -> Result<()> {
+    match src {
+        Src::Local(_) => edits.view_local(path, viewer).await,
+        Src::Server { server, user } => edits.view(&server, &user, &path, &viewer).await,
+    }
+}
+
 /// `force`: the user chose his version over a change on the server.
 #[tauri::command]
 pub async fn edit_upload(edits: EditState<'_>, src: Src, path: String, force: bool) -> Result<()> {

@@ -6,6 +6,7 @@ export const ICONS: Record<string, string> = {
   folder: '<path d="M3 7.5A1.5 1.5 0 0 1 4.5 6h4.4l2 2h8.6A1.5 1.5 0 0 1 21 9.5v8a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 17.5z"/>',
   file: '<path d="M6.5 3h7l4.5 4.5V20a1 1 0 0 1-1 1H6.5a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z"/><path d="M13.5 3v4.5H18"/>',
   pc: '<rect x="3" y="4" width="18" height="12" rx="1.5"/><path d="M8 20h8M12 16v4"/>',
+  drive: '<rect x="3" y="13" width="18" height="7" rx="1.5"/><path d="M5 13 7.5 5h9l2.5 8M16.5 16.5h.01"/>',
   server: '<rect x="4" y="4" width="16" height="7" rx="1.5"/><rect x="4" y="13" width="16" height="7" rx="1.5"/><path d="M8 7.5h.01M8 16.5h.01"/>',
   chev: '<path d="m7 10 5 5 5-5"/>',
   up: '<path d="M12 19V5M6 11l6-6 6 6"/>',

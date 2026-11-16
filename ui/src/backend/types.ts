@@ -256,6 +256,8 @@ export interface Backend {
 
   // Editing in an external program
   editOpen(src: Src, user: string, path: string, editor: string, autosave: boolean): Promise<void>;
+  /** Opens the file in an external program to look at: a server file as a read-only copy that is never uploaded. */
+  viewOpen(src: Src, user: string, path: string, viewer: string): Promise<void>;
   /** A save goes up; `force` overrides a change on the server the core reported with onEditConflict. */
   editUpload(src: Src, user: string, path: string, force?: boolean): Promise<void>;
   /** The server's version replaces the copy in the editor. */

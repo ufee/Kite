@@ -3,7 +3,7 @@ import { computed, markRaw, nextTick, reactive } from 'vue';
 import { backend, isBackendError, type BackendError, type Entry, type Src } from '../backend';
 import { tr } from '../i18n';
 import { collator, copyText, fmtSize, objs } from '../util/format';
-import { baseName, childOf, homeOf, isLocal, parentOf, rootOf, within } from '../util/paths';
+import { baseName, childOf, homeOf, isDrives, isLocal, rootOf, upOf, within } from '../util/paths';
 import { settings, ui, type ColKey } from './prefs';
 import { ask, choiceBox, closeDlg, confirmBox, dlg, openMenu, toast } from './overlay';
 import { label, srvBy, touchDir, touchRecent } from './servers';
@@ -97,7 +97,7 @@ export function paneFoot(i: number) {
 }
 export function idleInfo() {
   const p = panes[ui.focus];
-  if (isLocal(p.src)) return label('local') + ' · ' + p.path;
+  if (isLocal(p.src)) return p.path ? label('local') + ' · ' + p.path : label('local');
   const s = srvBy(p.src);
   if (!s) return '';
   const u = s.users.find(x => x.name === p.user);
@@ -105,7 +105,21 @@ export function idleInfo() {
   const key = s.authPass ? tr('вход по паролю') : file ? tr('ключ {k}', { k: file }) : tr('ключ из агента');
   return `${p.user}@${s.code} · ${s.host}${s.port !== 22 ? ':' + s.port : ''} · ${key}`;
 }
-export const hasUp = (i: number) => panes[i].state === 'ok' && !!parentOf(panes[i].src, panes[i].path);
+export const hasUp = (i: number) => panes[i].state === 'ok' && upOf(panes[i].src, panes[i].path) !== null;
+/** The pane shows the list of drives: nothing in it can be copied, renamed or deleted. */
+export const inDrives = (i: number) => isDrives(panes[i].src, panes[i].path);
+
+/** A folder's entries; on Windows the empty path is the list of drives. */
+async function listDir(src: Src, user: string, path: string): Promise<Entry[]> {
+  if (!isDrives(src, path)) return backend.fsList(src, user, path);
+  const drives = await backend.fsDrives();
+  return drives.map(d => ({ name: d.replace(/\\$/, ''), dir: true, size: 0, mtime: 0, perm: '', owner: '', group: '' }));
+}
+
+/** The pane a server opens in: the focused one, but while both panes show This PC the right one, as in a commander. */
+export function paneFor(src: Src, base = ui.focus) {
+  return !isLocal(src) && panes.every(p => isLocal(p.src)) ? 1 : base;
+}
 
 /* ---------- Memory per source and user ---------- */
 function paneSave(i: number) {
@@ -194,8 +208,8 @@ export async function go(i: number, raw: string, push = true, quiet = false): Pr
   let path: string, list: Entry[];
   try {
     // A relative path is taken from the folder on screen.
-    path = await backend.fsResolve(src, user, raw, p.path || undefined);
-    list = await backend.fsList(src, user, path);
+    path = isDrives(src, raw.trim()) ? '' : await backend.fsResolve(src, user, raw, p.path || undefined);
+    list = await listDir(src, user, path);
   } catch (e) {
     if (p.nav !== nav) return false;
     const err = errOf(e);
@@ -207,10 +221,11 @@ export async function go(i: number, raw: string, push = true, quiet = false): Pr
   if (push && path !== p.path) { p.back.push(p.path); if (p.back.length > 50) p.back.shift(); }
   const prev = p.path;
   Object.assign(p, { path, input: path, pathErr: '', edit: null, list: markRaw(list) });
-  const fromChild = prev && parentOf(src, prev) === path ? baseName(src, prev) : null;
+  // Up from a drive root the cursor stands on that drive.
+  const fromChild = prev && upOf(src, prev) === path ? (isDrives(src, path) ? rootOf(src, prev).replace(/\\$/, '') : baseName(src, prev)) : null;
   const first = rows(i)[0]?.name || null;
   p.sel = fromChild ? [fromChild] : []; p.cur = fromChild || first; p.anchor = p.cur;
-  touchDir(src, user, path);
+  if (path) touchDir(src, user, path);
   nextTick(() => scrollCur(i));
   return true;
 }
@@ -220,7 +235,7 @@ export async function reload(i: number) {
   if (p.state !== 'ok') return;
   const nav = ++p.nav, { src, user, path } = p;
   try {
-    const list = await backend.fsList(src, user, path);
+    const list = await listDir(src, user, path);
     if (p.nav !== nav || p.path !== path || p.src !== src) return;
     p.list = markRaw(list);
     const has = (n: string) => list.some(e => e.name === n);
@@ -228,7 +243,7 @@ export async function reload(i: number) {
     if (p.cur && p.cur !== '..' && !has(p.cur)) p.cur = rows(i)[0]?.name ?? null;
   } catch (e) { errToast(e); }
 }
-export const goUp = (i: number) => { const par = parentOf(panes[i].src, panes[i].path); if (par) go(i, par); };
+export const goUp = (i: number) => { const par = upOf(panes[i].src, panes[i].path); if (par !== null) go(i, par); };
 export const goBack = (i: number) => { const b = panes[i].back.pop(); if (b) go(i, b, false); };
 export function refresh(i: number) {
   const p = panes[i];
@@ -255,8 +270,17 @@ export function swapPanes() {
 }
 
 /* ---------- Selection and cursor ---------- */
+/** A click on the name of the only selected row, not followed by a second one, starts renaming it (as in Explorer). */
+let renameTimer = 0;
+const RENAME_WAIT = 500;
 export function clickRow(i: number, e: Entry, ev: MouseEvent) {
   const p = panes[i], names = rows(i).map(r => r.name);
+  clearTimeout(renameTimer);
+  const plain = !ev.shiftKey && !ev.ctrlKey && !ev.metaKey && ev.detail === 1;
+  if (plain && ui.focus === i && p.cur === e.name && p.sel.length === 1 && p.sel[0] === e.name && !p.edit
+      && (ev.target as HTMLElement).closest('.fname span')) {
+    renameTimer = window.setTimeout(() => { if (p.cur === e.name && p.sel.length === 1 && !p.edit) startRename(i); }, RENAME_WAIT);
+  }
   ui.focus = i;
   if (ev.shiftKey && p.anchor && names.includes(p.anchor)) {
     const a = names.indexOf(p.anchor), b = names.indexOf(e.name);
@@ -267,6 +291,7 @@ export function clickRow(i: number, e: Entry, ev: MouseEvent) {
   p.cur = e.name;
 }
 export function openRow(i: number, e: Entry | undefined) {
+  clearTimeout(renameTimer);
   if (!e) return;
   const p = panes[i];
   if (e.dir) { go(i, childOf(p.src, p.path, e.name)); return; }
@@ -298,7 +323,7 @@ export function rowMenu(i: number, e: Entry, ev: MouseEvent) {
   ui.focus = i;
   if (!p.sel.includes(e.name)) { p.sel = [e.name]; p.anchor = e.name; }
   p.cur = e.name;
-  openMenu('row', ev, { i, name: e.name, dir: e.dir });
+  openMenu('row', ev, { i, name: e.name, dir: e.dir, drive: inDrives(i) });
 }
 
 /* ---------- Viewing and editing ---------- */
@@ -311,6 +336,7 @@ export async function openFile(i: number, e: Entry | undefined, mode: 'view' | '
   if (!isText(e.name)) { toast(tr('Для {n} нет просмотра', { n: e.name }), 'info'); return; }
   if (mode === 'edit') { editExternal(p.src, p.user, p.path, e.name); return; }
   const { src, user, path } = p;
+  if (settings.viewer !== 'builtin') { viewExternal(src, user, path, e.name); return; }
   try {
     const f = await backend.fsReadText(src, user, childOf(src, path, e.name));
     if (f.binary) { toast(tr('Для {n} нет просмотра', { n: e.name }), 'info'); return; }
@@ -337,7 +363,13 @@ async function editExternal(src: Src, user: string, path: string, name: string) 
   const where = label(src);
   toast(`${tr('{n} открыт в {app}', { n: name, app })}. ${tr(settings.autosave ? 'Правки загрузятся на {src}' : 'Загрузка на {src} после подтверждения', { src: where })}`, 'info', null, 4000);
 }
-/** Files with an upload question open: a second save asks nothing, the answer sends the copy as it is then. */
+/** Viewing in an external program: a server file goes there as a read-only copy that nothing uploads. */
+async function viewExternal(src: Src, user: string, path: string, name: string) {
+  const app = tr(EDITORS[settings.viewer] ?? EDITORS.system);
+  try { await backend.viewOpen(src, user, childOf(src, path, name), settings.viewer); } catch (e) { errToast(e); return; }
+  toast(tr(isLocal(src) ? '{n} открыт в {app}' : '{n} открыт в {app} только для чтения', { n: name, app }), 'info');
+}
+/** Files with an upload question open:a second save asks nothing, the answer sends the copy as it is then. */
 const asking = new Set<string>();
 async function editChanged(src: Src, user: string, path: string, uploaded: boolean) {
   const name = baseName(src, path), where = label(src);
@@ -373,18 +405,17 @@ async function editConflict(src: Src, user: string, path: string) {
 
 /* ---------- "Copy to…" / "Move to…" destination picker ---------- */
 export function pickDest(i: number, move = false) {
-  const p = panes[i], q = panes[other(i)], list = selEntries(i);
-  if (p.state !== 'ok' || !list.length) { toast('Ничего не выбрано', 'info'); return; }
-  // Move starts from the active pane's folder, copy from whatever the other pane shows.
-  const t = move || q.state !== 'ok' ? p : q;
-  const d = { i, move, names: list.map(e => e.name), src: t.src, user: t.user, path: t.path, input: t.path, err: '', dirs: markRaw([] as Entry[]), loading: false };
+  const p = panes[i], list = selEntries(i);
+  if (noSource(i, list)) return;
+  // Both start from the active pane's folder.
+  const d = { i, move, names: list.map(e => e.name), src: p.src, user: p.user, path: p.path, input: p.path, err: '', dirs: markRaw([] as Entry[]), loading: false };
   ask('dest', d);
   destList(dlg.value!.data);
 }
 async function destList(d: Record<string, any>) {
   d.loading = true;
   try {
-    const list: Entry[] = await backend.fsList(d.src, d.user, d.path);
+    const list: Entry[] = await listDir(d.src, d.user, d.path);
     d.dirs = markRaw(list.filter(e => e.dir && (ui.hidden || !e.name.startsWith('.'))).sort((a, b) => collator.compare(a.name, b.name)));
   } catch (e) { d.err = errOf(e).title; d.dirs = markRaw([]); }
   d.loading = false;
@@ -393,12 +424,15 @@ export function destBlocked(d: Record<string, any>) {
   const p = panes[d.i];
   if (d.err) return d.err;
   if (d.loading) return '';
+  if (isDrives(d.src, d.path)) return tr('Выберите диск');
   if (d.src === p.src && d.path === p.path) return tr('Это исходная папка');
   if (d.src === p.src && d.names.some((n: string) => within(p.src, childOf(p.src, p.path, n), d.path))) return tr('Нельзя поместить папку в саму себя');
   return '';
 }
 export async function destGo(d: Record<string, any>, raw: string) {
-  try { d.path = await backend.fsResolve(d.src, d.user, raw, d.path || undefined); } catch (e) { d.err = errOf(e).title; return; }
+  try {
+    d.path = isDrives(d.src, raw.trim()) ? '' : await backend.fsResolve(d.src, d.user, raw, d.path || undefined);
+  } catch (e) { d.err = errOf(e).title; return; }
   d.input = d.path; d.err = '';
   destList(d);
 }
@@ -424,28 +458,39 @@ export function destApply(d: Record<string, any>) {
 }
 
 /* ---------- File operations ---------- */
+/** Nothing to copy: nothing selected, or drives, which are not copied whole. */
+function noSource(i: number, list: Entry[]) {
+  if (panes[i].state !== 'ok' || !list.length) { toast('Ничего не выбрано', 'info'); return true; }
+  if (inDrives(i)) { toast('Диск целиком не копируется', 'info'); return true; }
+  return false;
+}
+/** "Send": copy (or move) the selection to the folder the other pane shows. */
 export function copyTo(i: number, move = false) {
   const p = panes[i], q = panes[other(i)], list = selEntries(i);
-  if (p.state !== 'ok' || !list.length) { toast('Ничего не выбрано', 'info'); return; }
+  if (noSource(i, list)) return;
   if (q.state !== 'ok') { toast('Другая панель не подключена', 'bad'); return; }
+  if (inDrives(other(i))) { toast('Откройте папку в другой панели', 'info'); return; }
   transfer({ src: p.src, user: p.user, path: p.path }, list, { src: q.src, user: q.user, path: q.path }, move);
 }
 const editInput = (i: number) => document.querySelector<HTMLInputElement>(`[data-pane="${i}"] .edit-in`);
 export function startRename(i: number) {
   const p = panes[i];
-  if (!p.cur || p.cur === '..' || p.state !== 'ok') return;
+  if (!p.cur || p.cur === '..' || p.state !== 'ok' || inDrives(i)) return;
+  clearTimeout(renameTimer);
   p.edit = { name: p.cur, value: p.cur, isNew: false };
+  // The row may be out of the virtual list's slice: scroll it in first, then the caret goes to the end of the name.
+  scrollCur(i);
   nextTick(() => {
     const el = editInput(i);
     if (!el) return;
     el.focus();
-    const dot = p.cur!.lastIndexOf('.');
-    el.setSelectionRange(0, dot > 0 ? dot : p.cur!.length);
+    el.setSelectionRange(el.value.length, el.value.length);
+    el.scrollLeft = el.scrollWidth;
   });
 }
 export function newFolder(i: number) {
   const p = panes[i];
-  if (p.state !== 'ok') return;
+  if (p.state !== 'ok' || inDrives(i)) return;
   // Rights are checked by the server when the folder is created, not guessed here.
   p.edit = { name: null, value: tr('Новая папка'), isNew: true };
   nextTick(() => { listApi[i].scrollTop?.(0); const el = editInput(i); el?.focus(); el?.select(); });
@@ -477,7 +522,7 @@ export function cancelEdit(i: number) { panes[i].edit = null; focusList(i); }
 
 export async function removeSel(i: number) {
   const p = panes[i], list = selEntries(i);
-  if (!list.length) return;
+  if (!list.length || inDrives(i)) return;
   // The pane may move on while the dialog is open: delete exactly what the dialog named.
   const { src, user, path } = p, local = isLocal(src);
   const what = list.length === 1 ? list[0].name : objs(list.length), where = label(src);
@@ -549,6 +594,8 @@ export function copyEntryPath(i: number, name?: string) {
 /* ---------- Drag & drop ---------- */
 export function dragStart(i: number, e: Entry, ev: DragEvent) {
   const p = panes[i];
+  clearTimeout(renameTimer);
+  if (inDrives(i)) { ev.preventDefault(); return; }
   if (!p.sel.includes(e.name)) { p.sel = [e.name]; p.anchor = e.name; p.cur = e.name; }
   ui.dnd = { from: i, names: [...p.sel] };
   ev.dataTransfer!.effectAllowed = 'copyMove';
@@ -561,8 +608,10 @@ export function dragOver(i: number, ev: DragEvent) {
   const rowEl = (ev.target as HTMLElement).closest<HTMLElement>('.row');
   const name = rowEl?.dataset.name, e = name ? rowByName(i, name) : undefined;
   const own = !!ui.dnd && ui.dnd.from === i;
-  const intoDir = name === '..' ? '..' : e && e.dir && !(own && ui.dnd!.names.includes(name!)) ? name! : null;
-  if (own && !intoDir) { p.dropping = false; p.dropRow = null; ev.dataTransfer!.dropEffect = 'none'; return; }
+  // ".." up to the list of drives is no folder to drop into, nor is the list itself.
+  const up = upOf(p.src, p.path);
+  const intoDir = name === '..' ? (up ? '..' : null) : e && e.dir && !(own && ui.dnd!.names.includes(name!)) ? name! : null;
+  if ((own || inDrives(i)) && !intoDir) { p.dropping = false; p.dropRow = null; ev.dataTransfer!.dropEffect = 'none'; return; }
   ev.preventDefault();
   ev.dataTransfer!.dropEffect = own || ev.shiftKey ? 'move' : 'copy';
   p.dropRow = intoDir; p.dropping = !intoDir;
@@ -572,7 +621,8 @@ export function dragLeave(i: number, ev: DragEvent) {
 }
 export function drop(i: number, ev: DragEvent) {
   const p = panes[i];
-  const target = p.dropRow === '..' ? parentOf(p.src, p.path)! : p.dropRow ? childOf(p.src, p.path, p.dropRow) : p.path;
+  if (!p.dropping && !p.dropRow) return; // dragOver refused this place
+  const target = p.dropRow === '..' ? upOf(p.src, p.path)! : p.dropRow ? childOf(p.src, p.path, p.dropRow) : p.path;
   const to = { src: p.src, user: p.user, path: target };
   p.dropping = false; p.dropRow = null;
   if (ui.dnd) {

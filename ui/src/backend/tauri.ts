@@ -232,6 +232,7 @@ export class TauriBackend extends MockBackend {
   override editOpen(src: Src, user: string, path: string, editor: string, autosave: boolean) {
     return call<void>('edit_open', { src: where(src, user), path, editor, autosave });
   }
+  override viewOpen(src: Src, user: string, path: string, viewer: string) { return call<void>('view_open', { src: where(src, user), path, viewer }); }
   override editUpload(src: Src, user: string, path: string, force = false) { return call<void>('edit_upload', { src: where(src, user), path, force }); }
   override editReload(src: Src, user: string, path: string) { return call<void>('edit_reload', { src: where(src, user), path }); }
   override editEditors() { return call<string[]>('edit_editors'); }

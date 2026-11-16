@@ -258,6 +258,11 @@ impl Edits {
     /* ---------- commands ---------- */
 
     pub async fn open_local(&self, path: String, editor: String) -> Result<()> {
+        self.local_in(path, editor, "EDIT").await
+    }
+
+    /// A local file opens in the program as it is, to edit (`EDIT`) or to look at (`VIEW`).
+    async fn local_in(&self, path: String, editor: String, tag: &'static str) -> Result<()> {
         let file = path.clone();
         let app = tauri::async_runtime::spawn_blocking(move || {
             std::fs::metadata(&file).map_err(|e| io_error(&e, &file))?;
@@ -265,7 +270,61 @@ impl Edits {
         })
         .await
         .map_err(einval)??;
-        self.log.add("local", "EDIT", format!("{path} · {app}"), "", Row::Ok);
+        self.log.add("local", tag, format!("{path} · {app}"), "", Row::Ok);
+        Ok(())
+    }
+
+    pub async fn view_local(&self, path: String, viewer: String) -> Result<()> {
+        self.local_in(path, viewer, "VIEW").await
+    }
+
+    /// A server file to look at in an external program: a read-only copy of its own under `<root>/view`,
+    /// never watched (its folder is no number) and never uploaded. It goes with the other copies.
+    pub async fn view(&self, server: &str, user: &str, path: &str, viewer: &str) -> Result<()> {
+        let s = self.ssh.session_live(server, user)?;
+        let real = match s.sftp.realpath(path).await {
+            Ok(n) => n.files.into_iter().next().map(|f| f.filename).unwrap_or_else(|| path.to_owned()),
+            Err(_) => path.to_owned(),
+        };
+        let a = s.sftp.stat(real.as_str()).await.map_err(|e| fs_error(e, &real))?.attrs;
+        if a.is_dir() {
+            return Err(Error::Einval { reason: format!("{real}: is a folder") });
+        }
+        if a.permissions.is_some() && !a.file_type().is_file() {
+            return Err(Error::NotRegular { path: real });
+        }
+        let name = split(&real).1.to_owned();
+        if !local_name_ok(&name) {
+            return Err(Error::BadName { path: name });
+        }
+        let id = {
+            let mut g = self.inner();
+            g.next += 1;
+            g.next
+        };
+        let dir = self.root.join("view").join(id.to_string());
+        std::fs::create_dir_all(&dir).map_err(|e| io_error(&e, &dir.display().to_string()))?;
+        let file = dir.join(&name);
+        let row = self.log.run(&s.code, "SFTP", format!("READ {real}"));
+        if let Err(e) = remote::download(&s, &real, &file).await {
+            self.log.done(row, e.to_string(), Row::Err);
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(e);
+        }
+        self.log.done(row, msg!("копия для просмотра"), Row::Ok);
+        let (f, ed) = (file.clone(), viewer.to_owned());
+        let app = tauri::async_runtime::spawn_blocking(move || {
+            // Read-only: the program says so, and a save cannot pass for an edit that goes to the server.
+            if let Ok(m) = std::fs::metadata(&f) {
+                let mut perm = m.permissions();
+                perm.set_readonly(true);
+                let _ = std::fs::set_permissions(&f, perm);
+            }
+            editor::open(&ed, &f)
+        })
+        .await
+        .map_err(einval)??;
+        self.log.add(&s.code, "VIEW", msg!("Только просмотр {n} · {app}", n = name, app = app), "", Row::Ok);
         Ok(())
     }
 

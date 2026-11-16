@@ -678,6 +678,13 @@ export class MockBackend implements Backend {
     }, 5000);
   }
   private autosave = true;
+  async viewOpen(src: Src, user: string, path: string, viewer: string) {
+    this.live(src, user);
+    const name = baseName(src, path), app = tr(EDITORS[viewer] ?? EDITORS.system);
+    if (isLocal(src)) { this.add(src, 'VIEW', `${path} · ${app}`); return; }
+    await this.op(src, 'SFTP', `READ ${path}`, () => null, () => tr('копия для просмотра'));
+    this.add(src, 'VIEW', tr('Только просмотр {n} · {app}', { n: name, app }));
+  }
   editAutosave(on: boolean) { this.autosave = on; }
 
   async editUpload(src: Src, user: string, path: string) {

@@ -6,7 +6,7 @@ import { collator } from '../util/format';
 import { theme, toggleTheme, ui } from './prefs';
 import { ask, closeMenu } from './overlay';
 import { label, recent, recentDirs, servers, srvState } from './servers';
-import { other, setSource, swapPanes } from './panes';
+import { other, paneFor, setSource, swapPanes } from './panes';
 import { newTermHere } from './terms';
 import { setView } from './layout';
 import { openServer } from './serverCard';
@@ -75,7 +75,7 @@ export const palItems = computed<PalItem[]>(() => {
 
 /** Alt+Enter opens the server or folder in the other pane. */
 function openFrom(src: Src, user: string | undefined, alt: boolean, path?: string) {
-  const base = pal.target ?? ui.focus, i = alt ? other(base) : base;
+  const base = pal.target ?? paneFor(src), i = alt ? other(base) : base;
   ui.focus = i;
   setSource(i, src, user, path);
 }

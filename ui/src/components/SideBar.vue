@@ -5,7 +5,7 @@ import { lang, tr } from '../i18n';
 import { ui } from '../state/prefs';
 import { openMenu } from '../state/overlay';
 import { servers, sideGroups, srvState, srvTitle, toggleGroup } from '../state/servers';
-import { other, panes, setSource } from '../state/panes';
+import { other, paneFor, panes, setSource } from '../state/panes';
 import { openTerm } from '../state/terms';
 import { sideWidth, startSideDrag, toggleSide } from '../state/layout';
 import { openServer } from '../state/serverCard';
@@ -15,7 +15,7 @@ const paneMarks = (id: ServerId) => panes.map((p, i) => (p.src === id ? i : -1))
 
 /** Ctrl+click opens the server in the other pane. */
 function pickServer(id: ServerId, ev?: MouseEvent) {
-  const i = ev && (ev.ctrlKey || ev.metaKey) ? other(ui.focus) : ui.focus;
+  const base = paneFor(id), i = ev && (ev.ctrlKey || ev.metaKey) ? other(base) : base;
   ui.focus = i;
   setSource(i, id);
 }
