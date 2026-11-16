@@ -17,6 +17,8 @@ export const ui = reactive({
   search: '',
   cols: { size: true, date: true, perm: true, owner: true, group: true } as Record<ColKey, boolean>,
   hidden: true,
+  /** Long lines wrap in the viewer. */
+  wrap: false,
   focus: 0,
   drag: null as null | 'side' | 'split' | 'term',
   dnd: null as null | { from: number; names: string[] },
@@ -34,7 +36,7 @@ export const ui = reactive({
 });
 
 /** The part of `ui` that settings.json keeps: look and layout, not what is open right now. */
-export const UI_KEPT = ['theme', 'view', 'sideW', 'split', 'collapsed', 'termH', 'closed', 'sideSort', 'cols', 'hidden'] as const;
+export const UI_KEPT = ['theme', 'view', 'sideW', 'split', 'collapsed', 'termH', 'closed', 'sideSort', 'cols', 'hidden', 'wrap'] as const;
 
 export interface Settings {
   parallel: number;
@@ -50,12 +52,14 @@ export interface Settings {
   saveTermHistory: boolean;
   autosave: boolean;
   editor: 'system' | 'npp' | 'code';
+  /** F3: Kite's own viewer or an external program (a server file goes there as a read-only copy). */
+  viewer: 'builtin' | 'system' | 'npp' | 'code';
   lang: Lang;
 }
 
 export const settings = reactive<Settings>({
   parallel: 3, conflict: 'ask', keepTime: true, keyMode: 'auto', keyFile: '', agentFwd: false,
-  strictHost: true, termFont: 13, shell: 'pwsh', copyOnSelect: true, saveTermHistory: false, autosave: true, editor: 'system',
+  strictHost: true, termFont: 13, shell: 'pwsh', copyOnSelect: true, saveTermHistory: false, autosave: true, editor: 'system', viewer: 'builtin',
   lang: systemLang(),
 });
 

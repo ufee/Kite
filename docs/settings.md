@@ -18,8 +18,9 @@ Open with **Ctrl ,** or the gear in the title bar.
 | Transfers | At once (1–5) | 3 |
 | | If the name is taken: ask, replace, keep both, skip | Ask |
 | | Keep file dates when copying | On |
+| View | App: built-in, system default, Notepad++, VS Code. A server file opens as a read-only copy | Built-in |
 | Editor | App: system default, Notepad++, VS Code | System default |
-| | Upload edits right away | On |
+| | Upload edits to the server on save | On |
 | Terminal | Local shell: PowerShell 7, Windows PowerShell, Command Prompt | PowerShell 7 |
 | | Copy on select | On |
 | | Save terminal history | Off |

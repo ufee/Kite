@@ -68,12 +68,20 @@ const VIEW_SHORT = { files: 'Файлы', both: 'Оба', term: 'Термина�
         <label class="chk" style="margin-top:12px"><input v-model="settings.keepTime" type="checkbox" class="cb">{{ tr('Не менять дату файлов при копировании') }}</label>
       </div>
       <div>
+        <h3 class="h3">{{ tr('Просмотр') }}</h3>
+        <div class="set-grid">
+          <span class="muted">{{ tr('Программа') }}</span>
+          <div><select v-model="settings.viewer" class="fld" style="width:220px"><option value="builtin">{{ tr('Встроенный') }}</option><option value="system">{{ tr('Системный') }}</option><option value="npp" :disabled="!editors.includes('npp')">Notepad++</option><option value="code" :disabled="!editors.includes('code')">VS Code</option></select></div>
+        </div>
+        <div v-if="settings.viewer !== 'builtin'" class="faint" style="font-size:12px;margin-top:8px">{{ tr('Файл с сервера открывается копией только для чтения') }}</div>
+      </div>
+      <div>
         <h3 class="h3">{{ tr('Редактор') }}</h3>
         <div class="set-grid">
           <span class="muted">{{ tr('Программа') }}</span>
           <div><select v-model="settings.editor" class="fld" style="width:220px"><option value="system">{{ tr('Системный') }}</option><option value="npp" :disabled="!editors.includes('npp')">Notepad++</option><option value="code" :disabled="!editors.includes('code')">VS Code</option></select></div>
         </div>
-        <label class="chk" style="margin-top:12px"><input v-model="settings.autosave" type="checkbox" class="cb">{{ tr('Сразу загружать правки на сервер') }}</label>
+        <label class="chk" style="margin-top:12px"><input v-model="settings.autosave" type="checkbox" class="cb">{{ tr('Загружать правки на сервер при сохранении') }}</label>
       </div>
       <div>
         <h3 class="h3">{{ tr('Терминал') }}</h3>

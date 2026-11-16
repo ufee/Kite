@@ -25,7 +25,7 @@
 | Alt ← | Back |
 | F3 | View |
 | F4 | Edit in an external editor |
-| F5 | Copy to the other pane |
+| F5 | Send (copy) to the other pane |
 | F6 | Move to the other pane |
 | F2 | Rename |
 | F7 | New folder |

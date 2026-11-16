@@ -18,6 +18,7 @@ export const joinPath = (src: Src, root: string, parts: string[]) =>
   winStyle(src) ? root + parts.join('\\') : '/' + parts.join('/');
 
 export function childOf(src: Src, path: string, name: string): string {
+  if (isDrives(src, path)) return name.replace(/\\?$/, '\\'); // a drive in the list of drives: its root
   const { root, parts } = splitPath(src, path);
   return joinPath(src, root, [...parts, name]);
 }
@@ -28,6 +29,13 @@ export function parentOf(src: Src, path: string): string | null {
 export function baseName(src: Src, path: string): string {
   const { root, parts } = splitPath(src, path);
   return parts.length ? parts[parts.length - 1] : root;
+}
+/** "This PC" on Windows: the list of drives, above the drive roots. Its path is empty. */
+export const isDrives = (src: Src, path: string) => winStyle(src) && path === '';
+/** Where ".." leads in a pane: on Windows a drive root leads to the list of drives (''); null at the top. */
+export function upOf(src: Src, path: string): string | null {
+  if (isDrives(src, path)) return null;
+  return parentOf(src, path) ?? (winStyle(src) ? '' : null);
 }
 /** True if `inner` is `outer` itself or lies inside it. */
 export function within(src: Src, outer: string, inner: string): boolean {

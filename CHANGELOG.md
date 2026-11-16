@@ -1,5 +1,19 @@
 # Changelog
 
+## v26.11.1
+
+Fixes after the first install.
+
+- The first server opens in the right pane.
+- Up from a drive root on This PC shows the list of drives.
+- Click the name of the selected file again to rename it; the caret goes to the end of the name.
+- Line wrap in the viewer (**Alt Z**).
+- **View** setting: the built-in viewer or an external app; a server file opens as a read-only copy.
+- **Send** is the first item of the file menu: copy to the other pane.
+- **Copy to…** opens the folder picker like **Move to…**.
+- The setting is now called **Upload edits to the server on save**.
+- The bird in the logo and the shortcut icon is white.
+
 ## v26.11
 
 First release, Windows x64.

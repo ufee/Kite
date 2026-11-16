@@ -1,6 +1,6 @@
 [package]
 name = "kite"
-version = "26.11.0"
+version = "26.11.1"
 description = "SSH and SFTP in one window"
 license = "MIT"
 repository = "https://github.com/ufee/Kite"

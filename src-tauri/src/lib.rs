@@ -151,6 +151,7 @@ pub fn run() {
             ipc::transfer::transfer_relay,
             ipc::transfer::transfer_detach,
             ipc::edit::edit_open,
+            ipc::edit::view_open,
             ipc::edit::edit_upload,
             ipc::edit::edit_reload,
             ipc::edit::edit_editors,

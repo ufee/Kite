@@ -8,7 +8,7 @@ import { ui } from '../state/prefs';
 import { act, menu, toast } from '../state/overlay';
 import { collapseAllGroups, disconnect, recent, srvBy, srvState } from '../state/servers';
 import {
-  COLS, copyEntryPath, isText, newFolder, openChmod, openFile, openRow, panes, pickDest, refresh, removeSel, rowByName, setSource, startRename,
+  COLS, copyEntryPath, copyTo, inDrives, isText, newFolder, openChmod, openFile, openRow, panes, pickDest, refresh, removeSel, rowByName, setSource, startRename,
 } from '../state/panes';
 import { openTerm, termHere } from '../state/terms';
 import { openPalette } from '../state/palette';
@@ -62,27 +62,37 @@ function copyHost() {
     </template>
 
     <template v-else-if="menu.key === 'row' && pane">
+      <template v-if="!d.drive">
+        <button class="mi" :disabled="panes[1 - d.i].state !== 'ok'" @click="act(() => copyTo(d.i))"><span class="mi-check"></span>{{ tr('Передать') }}<span class="mi-note">F5</span></button>
+        <div class="sep"></div>
+      </template>
       <button v-if="d.dir" class="mi" @click="act(() => openRow(d.i, entry()))"><span class="mi-check"></span>{{ tr('Открыть') }}<span class="mi-note">Enter</span></button>
       <template v-else>
         <button class="mi" :disabled="!isText(d.name)" @click="act(() => openFile(d.i, entry(), 'view'))"><span class="mi-check"></span>{{ tr('Просмотр') }}<span class="mi-note">F3</span></button>
         <button class="mi" :disabled="!isText(d.name)" @click="act(() => openFile(d.i, entry(), 'edit'))"><span class="mi-check"></span>{{ tr('Редактировать') }}<span class="mi-note">F4</span></button>
       </template>
-      <button class="mi" @click="act(() => pickDest(d.i))"><span class="mi-check"></span>{{ tr('Копировать в…') }}</button>
-      <button class="mi" @click="act(() => pickDest(d.i, true))"><span class="mi-check"></span>{{ tr('Переместить в…') }}</button>
-      <div class="sep"></div>
-      <button class="mi" @click="act(() => startRename(d.i))"><span class="mi-check"></span>{{ tr('Переименовать') }}<span class="mi-note">F2</span></button>
+      <template v-if="!d.drive">
+        <button class="mi" @click="act(() => pickDest(d.i))"><span class="mi-check"></span>{{ tr('Копировать в…') }}</button>
+        <button class="mi" @click="act(() => pickDest(d.i, true))"><span class="mi-check"></span>{{ tr('Переместить в…') }}</button>
+        <div class="sep"></div>
+        <button class="mi" @click="act(() => startRename(d.i))"><span class="mi-check"></span>{{ tr('Переименовать') }}<span class="mi-note">F2</span></button>
+      </template>
       <button v-if="!isLocal(pane.src)" class="mi" @click="act(() => openChmod(d.i))"><span class="mi-check"></span>{{ tr('Права и владелец…') }}</button>
       <button class="mi" @click="act(() => copyEntryPath(d.i, d.name))"><span class="mi-check"></span>{{ tr('Копировать путь') }}</button>
       <button v-if="d.dir" class="mi" @click="act(() => termHere(d.i, d.name))"><span class="mi-check"></span>{{ tr('Терминал здесь') }}</button>
-      <div class="sep"></div>
-      <button class="mi danger" @click="act(() => removeSel(d.i))"><span class="mi-check"></span>{{ tr('Удалить') }}<span class="mi-note">Del</span></button>
+      <template v-if="!d.drive">
+        <div class="sep"></div>
+        <button class="mi danger" @click="act(() => removeSel(d.i))"><span class="mi-check"></span>{{ tr('Удалить') }}<span class="mi-note">Del</span></button>
+      </template>
     </template>
 
     <template v-else-if="menu.key === 'blank'">
-      <button class="mi" @click="act(() => newFolder(d.i))"><span class="mi-check"></span>{{ tr('Новая папка') }}<span class="mi-note">F7</span></button>
+      <button v-if="!inDrives(d.i)" class="mi" @click="act(() => newFolder(d.i))"><span class="mi-check"></span>{{ tr('Новая папка') }}<span class="mi-note">F7</span></button>
       <button class="mi" @click="act(() => refresh(d.i))"><span class="mi-check"></span>{{ tr('Обновить') }}<span class="mi-note">Ctrl R</span></button>
-      <button class="mi" @click="act(() => termHere(d.i))"><span class="mi-check"></span>{{ tr('Терминал здесь') }}</button>
-      <button class="mi" @click="act(() => copyEntryPath(d.i))"><span class="mi-check"></span>{{ tr('Копировать путь') }}</button>
+      <template v-if="!inDrives(d.i)">
+        <button class="mi" @click="act(() => termHere(d.i))"><span class="mi-check"></span>{{ tr('Терминал здесь') }}</button>
+        <button class="mi" @click="act(() => copyEntryPath(d.i))"><span class="mi-check"></span>{{ tr('Копировать путь') }}</button>
+      </template>
     </template>
 
     <template v-else-if="menu.key === 'srv' && menuSrv">

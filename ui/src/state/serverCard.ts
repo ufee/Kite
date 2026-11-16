@@ -4,7 +4,7 @@ import { backend, isBackendError, type Server, type ServerDraft, type ServerId }
 import { tr } from '../i18n';
 import { ask, closeDlg, confirmBox, dlg, dlgOf, toast } from './overlay';
 import { groupOrder, newServerId, recent, saveServers, servers, sessions, srvBy } from './servers';
-import { panes, setSource } from './panes';
+import { paneFor, panes, setSource } from './panes';
 import { terms } from './terms';
 import { transfersOn } from './queue';
 import { ui } from './prefs';
@@ -144,7 +144,7 @@ async function save(d: Card) {
     toast(tr('{c} сохранён', { c: d.code }), 'ok');
   } else {
     servers.push({ id, ...fields });
-    toast(tr('{c} добавлен в {g}', { c: d.code, g: fields.group }), 'ok', { label: 'Открыть', run: () => setSource(ui.focus, id) });
+    toast(tr('{c} добавлен в {g}', { c: d.code, g: fields.group }), 'ok', { label: 'Открыть', run: () => { const i = paneFor(id); ui.focus = i; setSource(i, id); } });
   }
   if (was?.authPass && (!authPass || wasUser !== d.defUser)) await backend.secretDelete(id, wasUser).catch(() => undefined);
   d.pass = '';
