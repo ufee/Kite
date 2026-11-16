@@ -2531,7 +2531,7 @@ dependencies = [
 
 [[package]]
 name = "kite"
-version = "26.11.0"
+version = "26.11.1"
 dependencies = [
  "bytes",
  "data-encoding",

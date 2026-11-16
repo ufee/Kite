@@ -42,9 +42,10 @@ Many servers at once? Import them from a file, see [servers.json](servers-json.m
 
 Each pane shows **This PC** or a server. Click a server to open it in the focused pane, **Ctrl + click** to open it in the other one. **Tab** moves focus between panes.
 
-- **Ctrl L** edits the path: `D:\folder` locally, `/path` or `~` on a server.
+- **Ctrl L** edits the path: `D:\folder` locally, `/path` or `~` on a server. Up from a drive root shows the list of drives.
 - The pane menu sets visible columns (size, modified, rights, owner, group) and hidden files (**Ctrl H**).
-- Right-click a file: open, view, edit, copy or move to…, rename, permissions, terminal here, delete.
+- Right-click a file: send to the other pane, open, view, edit, copy or move to…, rename, permissions, terminal here, delete.
+- Click the name of the selected file again to rename it.
 - **Permissions…** sets mode bits or an octal code, optionally recursive. Other users' files need root.
 - Local deletes go to the Recycle Bin; server deletes are permanent and ask first.
 
@@ -73,10 +74,10 @@ The forwarded agent only lists keys and signs, and only while the copy runs. Dur
 
 ## Viewing and editing
 
-- **F3** views a text file up to 10 MB right in the app.
+- **F3** views a text file up to 10 MB right in the app; **Alt Z** turns line wrap on and off. In settings you can pick an external app instead; a server file then opens as a read-only copy.
 - **F4** opens the file in your editor (system default, Notepad++ or VS Code, see settings). A server file is downloaded to a temporary copy; each save uploads it back through the queue.
 - If the server file changed while you were editing, Kite asks whose version wins.
-- With **Upload edits right away** off, each upload asks first.
+- With **Upload edits to the server on save** off, each upload asks first.
 - On exit Kite warns about edits not yet uploaded.
 
 ## Terminal
