@@ -9,6 +9,7 @@ import { other, paneFor, panes, setSource } from '../state/panes';
 import { openTerm } from '../state/terms';
 import { sideWidth, startSideDrag, toggleSide } from '../state/layout';
 import { openServer } from '../state/serverCard';
+import { openImport } from '../state/importExport';
 import Icon from './Icon.vue';
 
 const paneMarks = (id: ServerId) => panes.map((p, i) => (p.src === id ? i : -1)).filter(i => i >= 0);
@@ -125,6 +126,7 @@ function startThumbDrag(e: MouseEvent) {
         <div class="side-empty-t">{{ tr('Серверов пока нет') }}</div>
         <div class="faint">{{ tr('Добавь первый, чтобы подключиться') }}</div>
         <button class="btn pri" @click="openServer(null)"><Icon n="plus" s="s" />{{ tr('Добавить сервер') }}</button>
+        <button class="btn ghost" @click="openImport()"><Icon n="swap" s="s" />{{ tr('Импортировать') }}</button>
       </div>
       <div v-else :ref="listRef" class="side-list scroll" @scroll.passive="showThumb">
         <template v-for="g in sideGroups" :key="g.name">
