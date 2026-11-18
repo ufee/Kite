@@ -20,6 +20,8 @@ Kite is one window with three parts: the server list on the left, two file panes
 
 **Test** checks the address and key login before saving; a password is checked on save.
 
+While the list is empty, **Import** under **Add server** brings in a [servers.json](servers-json.md) from another machine.
+
 ### Logging in
 
 - **Key** (recommended). Kite uses the OpenSSH agent and the keys in `~/.ssh`. An encrypted key asks for its passphrase once; tick **Add to the OpenSSH agent** and ssh, git and Kite stop asking. Kite never stores passphrases.
