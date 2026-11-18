@@ -195,6 +195,7 @@ svg { flex: none; display: block; }
 .side-empty-ico { width: 22px; height: 22px; color: var(--tx3); }
 .side-empty-t { font-weight: 600; color: var(--tx); }
 .side-empty .btn { height: 30px; padding: 0 14px 0 12px; gap: 6px; margin-top: 6px; }
+.side-empty .btn.ghost { margin-top: -4px; }
 .srv.mini.srv-add { justify-content: center; padding: 0; }
 /* Bottom row: lift text 1px so the x-height sits on the strip's centre; icons stay put. */
 .status > span, .status > .textbtn { padding-bottom: 2px; }
