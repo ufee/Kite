@@ -1,5 +1,11 @@
 # Changelog
 
+## v26.11.2
+
+Import from the empty server list.
+
+- **Import** under **Add server** while there are no servers: opens the import dialog for `servers.json`.
+
 ## v26.11.1
 
 Fixes after the first install.
