@@ -9,7 +9,7 @@ SSH and SFTP in one window: two file panes and a terminal side by side, for peop
   <img alt="Kite: local files and a server side by side, terminal below" src="docs/screenshot-en-light.png">
 </picture>
 
-> **Status:** before the first release. Windows only for now; Linux comes next.
+> **Status:** Windows only for now; Linux comes next.
 
 ## Install
 
@@ -46,7 +46,7 @@ npm run build   # release build
 
 In the browser the app runs on the mock backend, so everything except window controls works without a server.
 
-A tag `v<version>` (the version lives in `src-tauri/tauri.conf.json` only) builds the installer and the portable archive in GitHub Actions and opens a draft release. See [CONTRIBUTING.md](CONTRIBUTING.md) before sending a change and [SECURITY.md](SECURITY.md) to report a vulnerability.
+A tag `v<version>` (it must match the version in `src-tauri/tauri.conf.json`) builds the installer and the portable archive in GitHub Actions and opens a draft release; the steps are in [docs/development.md](docs/development.md#release). See [CONTRIBUTING.md](CONTRIBUTING.md) before sending a change and [SECURITY.md](SECURITY.md) to report a vulnerability.
 
 ## License
 
