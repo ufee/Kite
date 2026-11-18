@@ -9,7 +9,7 @@ SSH и SFTP в одном окне: две файловые панели и те
   <img alt="Kite: локальные файлы и сервер рядом, терминал снизу" src="docs/screenshot-ru-light.png">
 </picture>
 
-> **Статус:** до первого выпуска. Пока только Windows, следующим будет Linux.
+> **Статус:** пока только Windows, следующим будет Linux.
 
 ## Установка
 
@@ -46,7 +46,7 @@ npm run build   # релизная сборка
 
 В браузере приложение работает на mock-бэкенде, поэтому без сервера работает всё, кроме управления окном.
 
-Тег `v<версия>` (версия задаётся только в `src-tauri/tauri.conf.json`) собирает установщик и portable-архив в GitHub Actions и открывает черновик выпуска. Перед правкой прочитайте [CONTRIBUTING.md](CONTRIBUTING.md), об уязвимости сообщайте по [SECURITY.md](SECURITY.md).
+Тег `v<версия>` (должен совпадать с версией в `src-tauri/tauri.conf.json`) собирает установщик и portable-архив в GitHub Actions и открывает черновик выпуска; порядок шагов — в [docs/development.ru.md](docs/development.ru.md#релиз). Перед правкой прочитайте [CONTRIBUTING.md](CONTRIBUTING.md), об уязвимости сообщайте по [SECURITY.md](SECURITY.md).
 
 ## Лицензия
 

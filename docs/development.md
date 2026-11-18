@@ -42,7 +42,7 @@ Every push to `main` and every pull request runs:
 
 ## Release
 
-1. Set the version in `src-tauri/tauri.conf.json`, the only place it lives.
+1. Set the version in `src-tauri/tauri.conf.json` (the tag is checked against it) and the same in `src-tauri/Cargo.toml`, then run `cargo check` in `src-tauri` to update `Cargo.lock`.
 2. Add a `## v<version>` section to `CHANGELOG.md` (a trailing `.0` is dropped: `## v26.11`). It becomes the release notes; without it the build fails.
 3. Push a tag `v<version>`. A tag that does not match the version fails the build.
 4. GitHub Actions builds from a clean state (no caches) and opens a draft release with:
