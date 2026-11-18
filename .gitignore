@@ -7,6 +7,8 @@ src-tauri/gen/
 Thumbs.db
 
 # Local notes and private references never go public
+AGENTS.md
+CLAUDE.md
 CLAUDE.local.md
 .claude/
 .local/
