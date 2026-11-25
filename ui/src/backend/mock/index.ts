@@ -657,13 +657,17 @@ export class MockBackend implements Backend {
   }
 
   /* ---------- Editing in an external program ---------- */
-  async editOpen(src: Src, user: string, path: string, editor: string, autosave: boolean) {
+  async editOpen(src: Src, user: string, path: string, editor: string, autosave: boolean, agreed: boolean) {
     this.live(src, user);
     const dir = parentOf(src, path)!, name = baseName(src, path), app = tr(EDITORS[editor] ?? EDITORS.system);
     const e = this.fs.find(src, path);
     if (!this.fs.canWrite(src, user, dir) || (e && !isLocal(src) && user !== 'root' && !(e.owner === user ? e.perm[1] === 'w' : e.perm[7] === 'w'))) {
       this.add(src, this.tagOf(src), `OPEN ${path}`, tr('нет прав на запись для {u}', { u: user }), 'err');
       throw fail('EACCES', tr('Нет прав на запись для {u}', { u: user }), path);
+    }
+    // The same line as the core: the copy comes down whole, so a big one is asked about first.
+    if (!isLocal(src) && !agreed && (e?.size ?? 0) > 10 * MB) {
+      throw fail('EDIT_BIG', tr('{n} больше 10 МБ', { n: name }), path);
     }
     if (isLocal(src)) { this.add(src, 'EDIT', `${path} · ${app}`); return; }
     await this.op(src, 'SFTP', `READ ${path}`, () => null, () => tr('временная копия'));

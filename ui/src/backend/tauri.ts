@@ -93,6 +93,7 @@ function words(e: CoreError): [string, string] {
     case 'SOURCE_CHANGED': return [tr('Файл изменился во время передачи: {p}', { p: e.path }), tr('Источник оставлен на месте.')];
     case 'SERVER_CHANGED': return [tr('Файл на сервере изменился: {p}', { p: e.path }), tr('Правка не загружена: решите, чья версия важнее.')];
     case 'EDIT_WAITS': return [tr('Правка ждёт: {p}', { p: e.path }), tr('Загрузка в этот файл стоит на паузе в очереди; правка уйдёт после неё.')];
+    case 'EDIT_BIG': return [tr('{p} больше 10 МБ', { p: e.path }), tr('Копия для правки скачается целиком, без прогресса.')];
     case 'NOT_REGULAR': return [tr('Не обычный файл: {p}', { p: e.path }), tr('Каналы, сокеты и устройства не передаются.')];
     // The core's reason is a lowercase note, as in the log.
     case 'DIRECT_FAILED': return [tr('Напрямую не получилось'), directReason(e.reason ?? '').replace(/^./, c => c.toUpperCase())];
@@ -229,8 +230,8 @@ export class TauriBackend extends MockBackend {
   override fsDrives() { return call<string[]>('fs_drives'); }
 
   /* ---------- Editing in an external program ---------- */
-  override editOpen(src: Src, user: string, path: string, editor: string, autosave: boolean) {
-    return call<void>('edit_open', { src: where(src, user), path, editor, autosave });
+  override editOpen(src: Src, user: string, path: string, editor: string, autosave: boolean, agreed: boolean) {
+    return call<void>('edit_open', { src: where(src, user), path, editor, autosave, agreed });
   }
   override viewOpen(src: Src, user: string, path: string, viewer: string) { return call<void>('view_open', { src: where(src, user), path, viewer }); }
   override editUpload(src: Src, user: string, path: string, force = false) { return call<void>('edit_upload', { src: where(src, user), path, force }); }

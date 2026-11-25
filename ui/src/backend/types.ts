@@ -49,7 +49,7 @@ export type ErrCode =
   | 'ENOENT' | 'ENOTDIR' | 'EACCES' | 'EEXIST' | 'EINVAL' | 'BAD_PATH' | 'NO_EXEC'
   | 'TIMEOUT' | 'NET' | 'DROPPED' |'AUTH_KEY' | 'AUTH_PASS' | 'NO_SECRET' | 'AUTH_MULTI' | 'AUTH_METHODS' | 'HOSTKEY_REJECTED' | 'HOSTKEY_CHANGED'
   | 'KEY_FILE' | 'NO_PUBKEY' | 'KEY_CHECK' | 'PASSPHRASE' | 'KEYCHAIN' | 'SSH' | 'CANCELLED' | 'DISCONNECTED'
-  | 'SERVER_GONE' | 'BAD_NAME' | 'NAME_CLASH' | 'SOURCE_CHANGED' | 'SERVER_CHANGED' | 'EDIT_WAITS' | 'NOT_REGULAR' | 'DIRECT_FAILED'
+  | 'SERVER_GONE' | 'BAD_NAME' | 'NAME_CLASH' | 'SOURCE_CHANGED' | 'SERVER_CHANGED' | 'EDIT_WAITS' | 'EDIT_BIG' | 'NOT_REGULAR' | 'DIRECT_FAILED'
   | 'IMPORT_BIG' | 'IMPORT_JSON' | 'IMPORT_VERSION' | 'IMPORT_NO_GROUPS' | 'IMPORT_CODE' | 'IMPORT_HOST' | 'IMPORT_PORT'
   | 'IMPORT_USER' | 'IMPORT_KEY' | 'IMPORT_DUP'
   /** The operation arrives in a later stage. */
@@ -255,7 +255,7 @@ export interface Backend {
   transferDetach(server: ServerId, user: string | undefined, cancel: boolean): Promise<void>;
 
   // Editing in an external program
-  editOpen(src: Src, user: string, path: string, editor: string, autosave: boolean): Promise<void>;
+  editOpen(src: Src, user: string, path: string, editor: string, autosave: boolean, agreed: boolean): Promise<void>;
   /** Opens the file in an external program to look at: a server file as a read-only copy that is never uploaded. */
   viewOpen(src: Src, user: string, path: string, viewer: string): Promise<void>;
   /** A save goes up; `force` overrides a change on the server the core reported with onEditConflict. */
