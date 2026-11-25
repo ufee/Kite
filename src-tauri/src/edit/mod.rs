@@ -44,6 +44,9 @@ use crate::{
 /// Editors save in steps (temporary file, rename, attributes): the last event of a save comes within this.
 const SETTLE: Duration = Duration::from_millis(300);
 
+/// A copy comes down whole and there is no progress for it: over this the user is asked first.
+const MAX_COPY: u64 = 10 * 1024 * 1024;
+
 /// The file an event is about, as the UI knows it.
 #[derive(Serialize, Clone)]
 struct Event {
@@ -114,6 +117,78 @@ impl Copy {
     /// A step is in flight: a save waits for it.
     fn held(&self) -> bool {
         self.busy || self.settling || self.upload.is_some() || self.after.is_some()
+    }
+
+    /// A save that is neither on the server nor on its way: closing the app would lose it.
+    fn unsent(&self) -> bool {
+        self.dirty && self.upload.is_none() && !self.settling
+    }
+
+    /// Takes an ended queue item off the copy. `None` — another copy's item; `Some(own)` — true when the
+    /// item carried this copy's save, false when it was another upload to the same file the save waits for.
+    fn claim(&mut self, item: u64, st: St) -> Option<bool> {
+        if self.upload == Some(item) || self.failed == Some(item) {
+            self.upload = None;
+            // A failed item stays the one to send again; the copy holds the latest text anyway.
+            self.failed = (st == St::Err).then_some(item);
+            Some(true)
+        } else if self.after == Some(item) {
+            self.after = None;
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    /// A send that never reached the queue: a save made meanwhile is in the copy the user decides
+    /// about. True when "mine" was chosen meanwhile and the copy has to go again now.
+    fn after_send(&mut self, went: bool) -> bool {
+        if went {
+            return false;
+        }
+        self.again = false;
+        std::mem::take(&mut self.force)
+    }
+}
+
+/// What a copy does once a queue item it waited for has ended.
+#[derive(Debug, PartialEq, Eq)]
+struct After {
+    /// The save reached the server: tell the UI, with the new size and date in `Copy.remote`.
+    changed: bool,
+    /// Another version met right before the rename: the same question as before the send.
+    conflict: bool,
+    /// The user chose this copy: send it now, no check.
+    force: bool,
+    /// Saved again while the item was in flight: send that save after it.
+    save: bool,
+}
+
+/// Reads the end of a queue item for a copy. `own` — it carried this copy's save; `st` and `code` — how
+/// it ended; `again` and `force` — what the copy noted while the item was in flight.
+fn after_end(own: bool, st: St, code: Option<&str>, again: bool, force: bool) -> After {
+    let changed = own && st == St::Done;
+    let conflict = own && st == St::Err && code == Some("SERVER_CHANGED");
+    // The question covers the saves made meanwhile: the answer sends the copy as it is then.
+    let again = again && !conflict;
+    After { changed, conflict: conflict && !force, force, save: !force && again }
+}
+
+/// Whether a copy of `size` bytes is worth a question first: the answer, once given, is `agreed`.
+fn big_copy(size: u64, agreed: bool) -> bool {
+    !agreed && size > MAX_COPY
+}
+
+/// Whether an ended item the receiver missed still has something to say to a copy: `None` — nothing (in
+/// flight, or a failure it already knows); `Some(st)` — the copy learns it.
+fn reconcile_of(failed: bool, st: Option<St>) -> Option<St> {
+    match st {
+        Some(st) if st.active() => None,
+        Some(St::Err) if failed => None,
+        Some(st) => Some(st),
+        // Cleared off the list: its end is unknown, the next save goes as a new upload.
+        None if failed => None,
+        None => Some(St::Err),
     }
 }
 
@@ -223,15 +298,15 @@ impl Edits {
     /// A failed save counts as kept only while its item is in the queue: cleared or cancelled, the
     /// copy is all that is left of it. One waiting for another upload (`after`) is not in the queue yet.
     pub fn unsent(&self) -> Vec<Unsent> {
-        let dirty: Vec<(Option<u64>, Unsent)> = {
+        let pending: Vec<(Option<u64>, Unsent)> = {
             let g = self.inner();
             g.copies
                 .values()
-                .filter(|c| c.dirty && c.upload.is_none() && !c.settling)
+                .filter(|c| c.unsent())
                 .map(|c| (c.failed, Unsent { server: c.server.clone(), name: split(&c.real).1.to_owned() }))
                 .collect()
         };
-        dirty.into_iter().filter(|(f, _)| !f.is_some_and(|f| self.q.state(f) == Some(St::Err))).map(|(_, u)| u).collect()
+        pending.into_iter().filter(|(f, _)| !f.is_some_and(|f| self.q.state(f) == Some(St::Err))).map(|(_, u)| u).collect()
     }
 
     pub fn set_autosave(&self, on: bool) {
@@ -328,19 +403,19 @@ impl Edits {
         Ok(())
     }
 
-    pub async fn open(&self, server: &str, user: &str, path: &str, editor: &str, autosave: bool) -> Result<()> {
+    pub async fn open(&self, server: &str, user: &str, path: &str, editor: &str, autosave: bool, agreed: bool) -> Result<()> {
         self.set_autosave(autosave);
         let key = (server.to_owned(), user.to_owned(), path.to_owned());
         // F4 again while the first is still downloading: the first one opens the editor.
         if !self.inner().opening.insert(key.clone()) {
             return Ok(());
         }
-        let res = self.open_now(server, user, path, editor).await;
+        let res = self.open_now(server, user, path, editor, agreed).await;
         self.inner().opening.remove(&key);
         res
     }
 
-    async fn open_now(&self, server: &str, user: &str, path: &str, editor: &str) -> Result<()> {
+    async fn open_now(&self, server: &str, user: &str, path: &str, editor: &str, agreed: bool) -> Result<()> {
         let s = self.ssh.session_live(server, user)?;
         let id = match self.find(server, user, path) {
             Some(id) => {
@@ -355,7 +430,7 @@ impl Edits {
                 }
                 id
             }
-            None => self.take(&s, server, user, path).await?,
+            None => self.take(&s, server, user, path, agreed).await?,
         };
         self.watch()?;
         let (file, name) = {
@@ -370,7 +445,7 @@ impl Edits {
     }
 
     /// A first copy of a server file.
-    async fn take(&self, s: &Session, server: &str, user: &str, path: &str) -> Result<u64> {
+    async fn take(&self, s: &Session, server: &str, user: &str, path: &str, agreed: bool) -> Result<u64> {
         let real = match s.sftp.realpath(path).await {
             Ok(n) => n.files.into_iter().next().map(|f| f.filename).unwrap_or_else(|| path.to_owned()),
             Err(_) => path.to_owned(),
@@ -381,6 +456,11 @@ impl Edits {
         }
         if a.permissions.is_some() && !a.file_type().is_file() {
             return Err(Error::NotRegular { path: real });
+        }
+        // The size of the file the copy would read, the link followed: a link itself is small.
+        let size = a.size.unwrap_or(0);
+        if big_copy(size, agreed) {
+            return Err(Error::EditBig { path: real, size });
         }
         let name = split(&real).1.to_owned();
         if !local_name_ok(&name) {
@@ -519,14 +599,7 @@ impl Edits {
                 let Some(c) = g.copies.get_mut(&id) else { return res.map(drop) };
                 c.busy = false;
                 // Handed to an item: its end takes `again`, even if it came before this.
-                if matches!(res, Ok(true)) {
-                    false
-                } else {
-                    // Nothing went up (a conflict, an error): a save meanwhile is in the copy the user
-                    // decides about; only a choice of "mine" made meanwhile goes now.
-                    c.again = false;
-                    std::mem::take(&mut c.force)
-                }
+                c.after_send(matches!(res, Ok(true)))
             };
             if !retry {
                 return res.map(drop);
@@ -724,14 +797,7 @@ impl Edits {
                 .collect()
         };
         for (item, failed) in items {
-            let st = match self.q.state(item) {
-                Some(st) if st.active() => continue,
-                Some(St::Err) if failed => continue,
-                Some(st) => st,
-                // Cleared off the list: its end is unknown, the next save goes as a new upload.
-                None if failed => continue,
-                None => St::Err,
-            };
+            let Some(st) = reconcile_of(failed, self.q.state(item)) else { continue };
             let me = self.me.clone();
             tauri::async_runtime::spawn(async move {
                 if let Some(e) = me.upgrade() {
@@ -748,16 +814,7 @@ impl Edits {
             let mut g = self.inner();
             let mut ids = Vec::new();
             for (id, c) in g.copies.iter_mut() {
-                let own = if c.upload == Some(item) || c.failed == Some(item) {
-                    c.upload = None;
-                    c.failed = (st == St::Err).then_some(item);
-                    true
-                } else if c.after == Some(item) {
-                    c.after = None;
-                    false
-                } else {
-                    continue;
-                };
+                let Some(own) = c.claim(item, st) else { continue };
                 // Until the new size and date are in, a save meanwhile would be checked against the old ones.
                 c.settling = true;
                 ids.push((*id, own));
@@ -777,8 +834,7 @@ impl Edits {
             return;
         };
         let done = own && st == St::Done;
-        // The queue met another version on the server right before the rename: the same question as before the send.
-        let changed = own && st == St::Err && self.q.err_code(item).as_deref() == Some("SERVER_CHANGED");
+        let code = self.q.err_code(item);
         let mut stamp = None;
         if done
             && let Ok(s) = self.ssh.session_live(&server, &user)
@@ -786,33 +842,186 @@ impl Edits {
         {
             stamp = Some((a.attrs.size.unwrap_or(0), a.attrs.mtime.unwrap_or(0) as u64));
         }
-        let (again, force) = {
+        let after = {
             let mut g = self.inner();
             let Some(c) = g.copies.get_mut(&id) else { return };
             c.settling = false;
-            if done {
+            let after = after_end(own, st, code.as_deref(), c.again, c.force);
+            if after.changed {
                 // Unknown: the next save goes without the check rather than with a false alarm.
                 c.remote = stamp;
                 c.dirty = c.again;
             }
-            if changed {
-                // The question covers the saves made meanwhile: the answer sends the copy as it is then.
-                c.again = false;
-            }
-            (std::mem::take(&mut c.again), std::mem::take(&mut c.force))
+            c.again = false;
+            c.force = false;
+            after
         };
-        if done {
+        if after.changed {
             self.emit_at("edit://changed", id, |at| Changed { at, uploaded: true });
         }
-        if changed && !force {
+        if after.conflict {
             self.emit_at("edit://conflict", id, |at| at);
         }
-        if force {
+        if after.force {
             if let Err(err) = self.send(id, true).await {
                 self.emit_at("edit://failed", id, |at| Failed { at, err });
             }
-        } else if again {
+        } else if after.save {
             self.saved(id, self.autosave()).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A copy with nothing in flight.
+    fn copy() -> Copy {
+        Copy {
+            server: "srv".into(),
+            user: "root".into(),
+            shown: "/srv/conf".into(),
+            real: "/srv/conf".into(),
+            file: PathBuf::from("copy"),
+            remote: Some((10, 100)),
+            keep: None,
+            seen: None,
+            dirty: false,
+            upload: None,
+            after: None,
+            failed: None,
+            again: false,
+            force: false,
+            fetching: false,
+            busy: false,
+            settling: false,
+            tick: 0,
+        }
+    }
+
+    fn want(changed: bool, conflict: bool, force: bool, save: bool) -> After {
+        After { changed, conflict, force, save }
+    }
+
+    #[test]
+    fn paths_split_at_the_last_slash() {
+        assert_eq!(split("/srv/app/conf"), ("/srv/app", "conf"));
+        assert_eq!(split("/conf"), ("/", "conf"));
+        assert_eq!(split("/"), ("/", ""));
+        // A local path has no folder above it: the pane's folder is the one it shows.
+        assert_eq!(split("C:\\x\\a.txt"), (".", "C:\\x\\a.txt"));
+    }
+
+    #[test]
+    fn a_step_in_flight_holds_a_save() {
+        assert!(!copy().held());
+        for held in [
+            Copy { busy: true, ..copy() },
+            Copy { settling: true, ..copy() },
+            Copy { upload: Some(3), ..copy() },
+            Copy { after: Some(3), ..copy() },
+        ] {
+            assert!(held.held());
+        }
+        // A download writes the copy itself: what the watcher sees is ours, not a save.
+        assert!(!Copy { fetching: true, ..copy() }.held());
+    }
+
+    #[test]
+    fn a_save_is_unsent_until_an_item_takes_it() {
+        let mut c = copy();
+        assert!(!c.unsent(), "nothing saved yet");
+        c.dirty = true;
+        assert!(c.unsent());
+        // Its own upload is on its way.
+        c.upload = Some(3);
+        assert!(!c.unsent());
+        // A save waiting for another upload is in no item yet: closing would lose it.
+        c.upload = None;
+        c.after = Some(4);
+        assert!(c.unsent());
+        // The server's new size and date are on their way: the save is decided about.
+        c.after = None;
+        c.settling = true;
+        assert!(!c.unsent());
+    }
+
+    #[test]
+    fn a_send_takes_its_own_item() {
+        // Its own upload reached the server.
+        let mut c = copy();
+        c.upload = Some(4);
+        assert_eq!(c.claim(4, St::Done), Some(true));
+        assert_eq!((c.upload, c.failed), (None, None));
+        // It failed: the copy keeps it as the one to send again.
+        let mut c = copy();
+        c.upload = Some(4);
+        assert_eq!(c.claim(4, St::Err), Some(true));
+        assert_eq!((c.upload, c.failed), (None, Some(4)));
+        // Another upload to the same file is not the copy's own: nothing of it is sent again.
+        let mut c = copy();
+        c.after = Some(4);
+        assert_eq!(c.claim(4, St::Done), Some(false));
+        assert_eq!((c.after, c.failed), (None, None));
+        // Another copy's item is left alone.
+        let mut c = copy();
+        c.upload = Some(5);
+        assert_eq!(c.claim(4, St::Done), None);
+        assert_eq!(c.upload, Some(5));
+    }
+
+    #[test]
+    fn a_send_that_went_keeps_the_save_for_its_item() {
+        let mut c = copy();
+        c.again = true;
+        assert!(!c.after_send(true));
+        assert!(c.again, "the item's end takes the save");
+        // Nothing went up (a conflict, an error): the copy the user sees decides, not a queued save.
+        let mut c = copy();
+        c.again = true;
+        assert!(!c.after_send(false));
+        assert!(!c.again);
+        // "Mine" chosen meanwhile goes now, and only once.
+        let mut c = copy();
+        c.again = true;
+        c.force = true;
+        assert!(c.after_send(false));
+        assert!(!c.again && !c.force);
+    }
+
+    #[test]
+    fn the_end_of_a_save() {
+        // It reached the server.
+        assert_eq!(after_end(true, St::Done, None, false, false), want(true, false, false, false));
+        // Saved again meanwhile: that save goes after it.
+        assert_eq!(after_end(true, St::Done, None, true, false), want(true, false, false, true));
+        // Another version met right before the rename: one question, the saves meanwhile are in it.
+        assert_eq!(after_end(true, St::Err, Some("SERVER_CHANGED"), true, false), want(false, true, false, false));
+        // "Mine" chosen meanwhile: no question, the copy goes as it is.
+        assert_eq!(after_end(true, St::Err, Some("SERVER_CHANGED"), false, true), want(false, false, true, false));
+        // A plain failure: the save made meanwhile goes again with its item.
+        assert_eq!(after_end(true, St::Err, Some("NET"), true, false), want(false, false, false, true));
+        // Another upload to the same file ended: only a save waiting behind it moves.
+        assert_eq!(after_end(false, St::Done, None, false, false), want(false, false, false, false));
+        assert_eq!(after_end(false, St::Done, None, true, false), want(false, false, false, true));
+        assert_eq!(after_end(false, St::Err, Some("SERVER_CHANGED"), false, false), want(false, false, false, false));
+    }
+
+    #[test]
+    fn a_big_copy_asks_first() {
+        assert!(!big_copy(MAX_COPY, false), "the line itself is not over it");
+        assert!(big_copy(MAX_COPY + 1, false));
+        assert!(!big_copy(MAX_COPY + 1, true), "the question was answered");
+    }
+
+    #[test]
+    fn missed_ends_come_from_the_queue() {
+        assert_eq!(reconcile_of(false, Some(St::Run)), None, "still in flight");
+        assert_eq!(reconcile_of(false, Some(St::Done)), Some(St::Done));
+        assert_eq!(reconcile_of(true, Some(St::Err)), None, "the copy knows the failure");
+        assert_eq!(reconcile_of(true, Some(St::Done)), Some(St::Done));
+        assert_eq!(reconcile_of(true, None), None, "cleared off the list");
+        assert_eq!(reconcile_of(false, None), Some(St::Err), "gone: the next save goes as a new upload");
     }
 }

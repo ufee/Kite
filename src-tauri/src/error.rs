@@ -71,6 +71,9 @@ pub enum Error {
     ServerChanged { path: String },
     /// An edit waits for another upload to the same file, and that one is paused.
     EditWaits { path: String },
+    /// An edit would download a big file whole, with no progress: the user is asked first. `size` is
+    /// the file it would read, a link's target already followed.
+    EditBig { path: String, size: u64 },
     /// A FIFO, socket or device: never transferred.
     NotRegular { path: String },
     /// A direct server-to-server copy could not run (no agent, no rsync, the target refused the
@@ -134,6 +137,7 @@ impl std::fmt::Display for Error {
             Self::SourceChanged { .. } => f.write_str("источник изменился во время передачи"),
             Self::ServerChanged { .. } => f.write_str("файл на сервере изменился, правка не загружена"),
             Self::EditWaits { .. } => f.write_str("правка ждёт загрузку на паузе"),
+            Self::EditBig { size, .. } => write!(f, "файл {} МБ, копия скачается целиком", size / (1024 * 1024)),
             Self::NotRegular { .. } => f.write_str("не обычный файл, пропущен"),
             Self::Net { reason, .. } | Self::Ssh { reason } | Self::Keychain { reason } | Self::Einval { reason } | Self::DirectFailed { reason } => {
                 f.write_str(reason)

@@ -241,6 +241,7 @@ export const EN: Record<string, string> = {
 
   // Status, settings, terminal
   'подсчёт…': 'counting…', 'Загрузка…': 'Loading…', '{n} больше 10 МБ: откройте в редакторе': '{n} is over 10 MB: open it in an editor',
+  '{n} больше 10 МБ: всё равно открыть?': '{n} is over 10 MB: open it anyway?',
   'Проверяем агент OpenSSH…': 'Checking the OpenSSH agent…', 'Агент OpenSSH не запущен': 'OpenSSH agent is not running', 'Агент OpenSSH не ответил': 'OpenSSH agent did not respond',
   'Соединение с {c} закрыто': 'Connection to {c} closed',
   'Сервер отказал в терминале': 'The server refused a terminal',

@@ -37,6 +37,8 @@ export const REMOTE_SEED: Record<string, Entry[]> = {
   '/srv': [rd('data', 3 * DAY)],
   '/srv/data': [rd('archive-10k', 3 * DAY), rf('README', 420, 30 * DAY)],
   '/var': [rd('cache', 2 * DAY), rd('lib', 10 * DAY), rd('log', 5 * MIN, 'root', 'syslog', 'rwxrwxr-x'), { ...rd('www', 40 * DAY), link: true }],
+  // A file over the copy limit: F4 asks before it comes down whole.
+  '/var/log': [rf('auth.log', 2.4 * MB, HOUR, 'root', 'syslog', 'rw-r-----'), rf('nginx-access.log', 34 * MB, 10 * MIN, 'root', 'syslog', 'rw-r-----')],
 };
 
 /** A folder of 10 000 files: the virtual list must scroll it without jank. */

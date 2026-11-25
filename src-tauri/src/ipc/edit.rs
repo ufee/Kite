@@ -13,10 +13,10 @@ use crate::{
 type EditState<'a> = State<'a, Arc<Edits>>;
 
 #[tauri::command]
-pub async fn edit_open(edits: EditState<'_>, src: Src, path: String, editor: String, autosave: bool) -> Result<()> {
+pub async fn edit_open(edits: EditState<'_>, src: Src, path: String, editor: String, autosave: bool, agreed: bool) -> Result<()> {
     match src {
         Src::Local(_) => edits.open_local(path, editor).await,
-        Src::Server { server, user } => edits.open(&server, &user, &path, &editor, autosave).await,
+        Src::Server { server, user } => edits.open(&server, &user, &path, &editor, autosave, agreed).await,
     }
 }
 

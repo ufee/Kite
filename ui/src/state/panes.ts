@@ -334,8 +334,9 @@ export async function openFile(i: number, e: Entry | undefined, mode: 'view' | '
   const p = panes[i];
   if (!e || e.dir) return;
   if (!isText(e.name)) { toast(tr('Для {n} нет просмотра', { n: e.name }), 'info'); return; }
-  if (mode === 'edit') { editExternal(p.src, p.user, p.path, e.name); return; }
+  // Fixed here: the answer to a question may come when the pane shows another folder.
   const { src, user, path } = p;
+  if (mode === 'edit') { editExternal(src, user, path, e.name); return; }
   if (settings.viewer !== 'builtin') { viewExternal(src, user, path, e.name); return; }
   try {
     const f = await backend.fsReadText(src, user, childOf(src, path, e.name));
@@ -354,9 +355,15 @@ export function fileEdit(d: Record<string, any>) {
   editExternal(src, user, path, name);
 }
 // Remote files are downloaded to a temp copy and watched; a save in the editor triggers the upload.
-async function editExternal(src: Src, user: string, path: string, name: string) {
+async function editExternal(src: Src, user: string, path: string, name: string, agreed = false) {
   const app = tr(EDITORS[settings.editor]);
-  try { await backend.editOpen(src, user, childOf(src, path, name), settings.editor, settings.autosave); } catch (e) {
+  try { await backend.editOpen(src, user, childOf(src, path, name), settings.editor, settings.autosave, agreed); } catch (e) {
+    // The copy comes down whole, with no progress: the core refuses a big one until it is agreed to, and
+    // its size is the resolved file's — a link to a big file asks too, though the link itself is small.
+    if (errOf(e).code === 'EDIT_BIG') {
+      toast(tr('{n} больше 10 МБ: всё равно открыть?', { n: name }), 'info', { label: 'Открыть', run: () => editExternal(src, user, path, name, true) }, 6000);
+      return;
+    }
     errToast(e); return;
   }
   if (isLocal(src)) { toast(tr('{n} открыт в {app}', { n: name, app }), 'info'); return; }
